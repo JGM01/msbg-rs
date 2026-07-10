@@ -49,8 +49,19 @@ pub struct BlockCoord {
 
 struct SparseGrid<T, const BSX_LOG2: u32> {
     _marker: PhantomData<T>,
+
+    // Dimensions of the grid in BLOCKS.
     blocks_x: usize,
     blocks_y: usize,
+    blocks_z: usize,
+
+    // If block is empty, None.
+    // Length is blocks_x * blocks_y * blocks_z
+    blockmap: Vec<Option<BlockId>>,
+
+    // For PDE solvers needing "padding" for
+    // possible out-of-bounds in derivative calculation.
+    pub border_offset: GridCoord,
 }
 
 impl<T, const BSX_LOG2: u32> SparseGrid<T, BSX_LOG2> {
