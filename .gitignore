@@ -9,6 +9,7 @@ target
 
 rustc-ice-*.txt
 
-.DS_Store/
-.zed/
-.vscode/
+.DS_Store
+.DS_Store
+.zed
+.vscode
