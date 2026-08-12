@@ -116,7 +116,7 @@ fn bench_laplacian_halo_mocked(c: &mut Criterion) {
                 let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
 
                 b.iter(|| {
-                    // Using zip so we can iterate both arrays together
+                    // Using zip so it can iterate both arrays together
                     output_blocks
                         .par_iter_mut()
                         .zip(flags_blocks.par_iter())
@@ -197,9 +197,9 @@ fn bench_laplacian_halo_real_fill(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    //bench_hot_path_scaling,
-    //bench_multithreaded_contention,
-    //bench_cold_extension,
+    bench_hot_path_scaling,
+    bench_multithreaded_contention,
+    bench_cold_extension,
     bench_laplacian_halo_mocked,
     bench_laplacian_halo_real_fill
 );
