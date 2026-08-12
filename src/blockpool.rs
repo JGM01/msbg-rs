@@ -1,4 +1,5 @@
 use std::{
+    alloc::{Layout, alloc_zeroed, dealloc},
     ptr::NonNull,
     sync::{
         Arc, Mutex,
@@ -128,20 +129,20 @@ where
     fn extend_pool(&self, seg_idx: usize) -> *mut Block<D, BSX, N> {
         let _guard = self.extend_lock.lock().unwrap();
 
-        // Re-check after acquiring lock to prevent double allocation race
         let existing_ptr = self.segments[seg_idx].load(Ordering::Acquire);
         if !existing_ptr.is_null() {
             return existing_ptr;
         }
 
-        // Allocate a new contiguous segment
-        let mut chunk: Vec<Block<D, BSX, N>> = Vec::with_capacity(self.blocks_per_seg);
-        for _ in 0..self.blocks_per_seg {
-            chunk.push(Block::new());
-        }
+        // Create a memory layout for `blocks_per_seg` contiguous blocks
+        let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg).unwrap();
 
-        let boxed_slice = chunk.into_boxed_slice();
-        let raw_ptr = Box::into_raw(boxed_slice) as *mut Block<D, BSX, N>;
+        // Ask OS for zeroed memory
+        let raw_ptr = unsafe { alloc_zeroed(layout) } as *mut Block<D, BSX, N>;
+
+        if raw_ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         self.segments[seg_idx].store(raw_ptr, Ordering::Release);
         raw_ptr
@@ -157,17 +158,16 @@ impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> Drop
     for BlockPool<D, BSX, N>
 {
     fn drop(&mut self) {
+        // Reconstruct the memory layout used during extend_pool
+        let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg)
+            .expect("Failed to create memory layout for deallocation");
+
         for atomic_ptr in &self.segments {
             let ptr = atomic_ptr.load(Ordering::Relaxed);
-
             if !ptr.is_null() {
                 unsafe {
-                    // extend_pool converted the Box<[Block]> into
-                    // a *mut Block, losing the slice length. Need to reconstruct it.
-                    let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, self.blocks_per_seg);
-
-                    // Reconstruct ownership and deallocate
-                    drop(Box::from_raw(slice_ptr));
+                    // Deallocate the memory
+                    dealloc(ptr as *mut u8, layout);
                 }
             }
         }
