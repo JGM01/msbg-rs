@@ -1,6 +1,14 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use msbg_rs::blockpool::BlockPool;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use msbg_rs::{
+    blockpool::{Block, BlockPool},
+    math::laplacian::kernel_laplacian_simd_16,
+    multires::halo::HaloBlockPool,
+    sparse_grid::{BlockPtr, SparseGrid},
+};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
+};
 use std::{hint::black_box, sync::Arc};
 
 // 1 Block = ~16.06 KB
@@ -93,10 +101,106 @@ fn bench_cold_extension(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_laplacian_halo_mocked(c: &mut Criterion) {
+    let mut group = c.benchmark_group("laplacian_compute_throughput_mocked_fill");
+
+    for block_count in [1_000, 10_000, 50_000] {
+        group.bench_with_input(
+            BenchmarkId::new("rayon_sweep", block_count),
+            &block_count,
+            |b, &count| {
+                let num_threads = rayon::current_num_threads();
+                let halo_pool = HaloBlockPool::<f32, BSX, 18>::new(num_threads);
+
+                let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
+                let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
+
+                b.iter(|| {
+                    // Using zip so we can iterate both arrays together
+                    output_blocks
+                        .par_iter_mut()
+                        .zip(flags_blocks.par_iter())
+                        .for_each(|(out_block, flags_block)| {
+                            let halo = unsafe { halo_pool.get_mut() };
+
+                            // Mocking the memory bandwidth of gathering the neighborhood via memset
+                            halo.mock_fill_for_bench();
+
+                            kernel_laplacian_simd_16(halo, flags_block, out_block);
+                        });
+                    black_box(&mut output_blocks);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_laplacian_halo_real_fill(c: &mut Criterion) {
+    let mut group = c.benchmark_group("laplacian_compute_throughput_real_fill");
+
+    // Up to 400k blocks tests ~24GB of total RAM footprint.
+    for block_count in [50_000, 250_000, 400_000] {
+        group.bench_with_input(
+            BenchmarkId::new("rayon_sweep", block_count),
+            &block_count,
+            |b, &count| {
+                let num_threads = rayon::current_num_threads();
+                let halo_pool = HaloBlockPool::<f32, BSX, 18>::new(num_threads);
+
+                // Formulate grid dimensions based on the block count
+                let blocks_per_dim = (count as f64).cbrt().ceil() as usize;
+                let sx = blocks_per_dim * BSX;
+                let sy = blocks_per_dim * BSX;
+                let sz = blocks_per_dim * BSX;
+
+                // Allocate enough segments for our max testing payload
+                let pool = Arc::new(BlockPool::<f32, BSX, N>::new(1024, 4096));
+                let mut grid =
+                    SparseGrid::new("bench_grid".to_string(), sx, sy, sz, 0.0, 1.0, pool);
+
+                // Force allocation of the blocks in the grid to simulate a dense fluid region
+                for bid in 0..count {
+                    if bid < grid.n_blocks {
+                        let new_block = BlockPtr(grid.block_pool.alloc_block());
+                        grid.blockmap[bid] = Some(new_block);
+                    }
+                }
+
+                let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
+                let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
+
+                b.iter(|| {
+                    grid.blockmap
+                        .par_iter()
+                        .take(count)
+                        .zip(flags_blocks.par_iter())
+                        .zip(output_blocks.par_iter_mut())
+                        .enumerate()
+                        .for_each(|(bid, ((block_opt, flags_block), out_block))| {
+                            if block_opt.is_some() {
+                                let halo = unsafe { halo_pool.get_mut() };
+
+                                // True gather latency from 6 spatial boundaries across RAM
+                                halo.fill(&grid, bid);
+
+                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                            }
+                        });
+                    black_box(&mut output_blocks);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
-    bench_hot_path_scaling,
-    bench_multithreaded_contention,
-    bench_cold_extension
+    //bench_hot_path_scaling,
+    //bench_multithreaded_contention,
+    //bench_cold_extension,
+    bench_laplacian_halo_mocked,
+    bench_laplacian_halo_real_fill
 );
 criterion_main!(benches);

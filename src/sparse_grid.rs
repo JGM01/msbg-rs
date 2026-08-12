@@ -2,6 +2,40 @@ use std::{ptr::NonNull, sync::Arc};
 
 use crate::blockpool::{Block, BlockPool};
 
+/// Thread-safe wrapper.
+/// Sharing these pointers across threads is safe because
+/// BlockPool + general architecture handle the synchronization.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockPtr<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize>(
+    pub NonNull<Block<D, BSX, N>>,
+);
+
+impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> PartialEq
+    for BlockPtr<D, BSX, N>
+{
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 // Just compare the memory addresses...
+    }
+}
+
+unsafe impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> Send
+    for BlockPtr<D, BSX, N>
+{
+}
+unsafe impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> Sync
+    for BlockPtr<D, BSX, N>
+{
+}
+
+impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> BlockPtr<D, BSX, N> {
+    #[inline(always)]
+    pub fn as_ptr(self) -> *mut Block<D, BSX, N> {
+        self.0.as_ptr()
+    }
+}
+
 /// Prevents accidental mutation of the shared `empty` or `full` dummy blocks.
 pub enum BlockRef<'a, D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> {
     /// An allocated block containing mutable data
@@ -36,14 +70,14 @@ where
 
     /// Flat array mapping a 1D Block ID (bid) to an allocated memory block.
     /// `Option<NonNull>` is guaranteed by Rust to have the exact same 8-byte footprint as a C++ pointer.
-    pub blockmap: Vec<Option<NonNull<Block<D, BSX, N>>>>,
+    pub blockmap: Vec<Option<BlockPtr<D, BSX, N>>>,
 
     /// Memory pool for spatial regions.
     pub block_pool: Arc<BlockPool<D, BSX, N>>,
 
     /// Shared dummy block handles
-    pub empty_block: NonNull<Block<D, BSX, N>>,
-    pub full_block: NonNull<Block<D, BSX, N>>,
+    pub empty_block: BlockPtr<D, BSX, N>,
+    pub full_block: BlockPtr<D, BSX, N>,
 
     pub empty_value: D,
     pub full_value: D,
@@ -72,8 +106,8 @@ where
 
         // Internalize dummy block allocations to guarantee they live
         // as long as this SparseGrid instance
-        let empty_block = block_pool.alloc_block();
-        let full_block = block_pool.alloc_block();
+        let empty_block = BlockPtr(block_pool.alloc_block());
+        let full_block = BlockPtr(block_pool.alloc_block());
 
         // Populate the dummy blocks with their respective constant values
         unsafe {
@@ -133,7 +167,7 @@ where
         match self.blockmap[bid] {
             Some(ptr) if ptr == self.empty_block => BlockRef::Empty,
             Some(ptr) if ptr == self.full_block => BlockRef::Full,
-            Some(mut ptr) => unsafe { BlockRef::Allocated(ptr.as_mut()) },
+            Some(mut ptr) => unsafe { BlockRef::Allocated(ptr.0.as_mut()) },
             None => BlockRef::Empty,
         }
     }
@@ -166,7 +200,7 @@ where
             Some(ptr) if ptr != self.empty_block && ptr != self.full_block => ptr,
             // Lazy allocation trigger
             _ => {
-                let new_block = self.block_pool.alloc_block();
+                let new_block = BlockPtr(self.block_pool.alloc_block());
                 self.blockmap[bid] = Some(new_block);
                 new_block
             }
@@ -178,7 +212,6 @@ where
     }
 }
 
-// SparseGrid Tests
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,7 +220,6 @@ mod tests {
     const BSX: usize = 16;
     const N: usize = 4096;
 
-    /// Helper to instantiate a grid for testing
     fn setup_grid(sx: usize, sy: usize, sz: usize) -> SparseGrid<f32, BSX, N> {
         let pool = Arc::new(BlockPool::new(16, 16));
 
@@ -198,7 +230,7 @@ mod tests {
     fn test_grd_01_normal_api_usage() {
         let mut grid = setup_grid(64, 64, 64);
 
-        // Write to a few different blocks
+        // Write to some blocks
         grid.set_voxel(0, 0, 0, 42.0);
         grid.set_voxel(32, 10, 5, 7.5);
         grid.set_voxel(63, 63, 63, 99.9);
@@ -215,7 +247,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "BSX must be a power of two")]
     fn test_grd_02_panic_non_pow2_bsx() {
-        // Capacity bumped to 2 blocks to safely house internal dummy blocks
         let pool = Arc::new(BlockPool::new(1, 2));
 
         // BSX = 15 is not a power of 2
@@ -226,7 +257,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "N must equal BSX^3")]
     fn test_grd_03_panic_mismatched_n() {
-        // Capacity bumped to 2 blocks to safely house internal dummy blocks
         let pool = Arc::new(BlockPool::new(1, 2));
 
         // BSX = 16, but N = 100 instead of 4096
@@ -255,14 +285,14 @@ mod tests {
 
         let bid = grid.get_block_id(5, 5, 5);
 
-        // State 1: Initially empty
+        // Initially empty
         assert!(matches!(grid.get_block(bid), BlockRef::Empty));
         assert_eq!(grid.get_voxel(5, 5, 5), 0.0);
 
-        // State Change: Write triggers lazy alloc
+        // Write triggers lazy alloc
         grid.set_voxel(5, 5, 5, 123.4);
 
-        // State 2: Now allocated
+        // Now allocated
         assert!(matches!(grid.get_block(bid), BlockRef::Allocated(_)));
         assert_eq!(grid.get_voxel(5, 5, 5), 123.4);
     }
@@ -272,7 +302,7 @@ mod tests {
         let mut grid = setup_grid(32, 32, 32);
         let bid = grid.get_block_id(20, 20, 20); // Belongs to block (1,1,1)
 
-        // Inject a full block marker manually (e.g., simulating a solid obstacle region)
+        // Inject a full block marker (e.g., simulating a solid obstacle region)
         grid.blockmap[bid] = Some(grid.full_block);
 
         // Verify state resolution
@@ -285,8 +315,8 @@ mod tests {
 
     #[test]
     fn test_grd_08_coordinate_mapping() {
-        // Create a 32x32x32 voxel grid.
-        // With BSX=16, this is a 2x2x2 block grid (nx=2, ny=2, nz=2).
+        // Create a 32^3 voxel grid.
+        // With BSX=16, this is a 2^3 block grid (nx=2, ny=2, nz=2).
         let grid = setup_grid(32, 32, 32);
 
         assert_eq!(grid.nx, 2);
@@ -316,5 +346,147 @@ mod tests {
         // vx = 1, vy = 0, vz = 15
         // vid = 1 | (0<<4) | (15<<8) = 1 | 0 | 3840 = 3841
         assert_eq!(SparseGrid::<f32, BSX, N>::get_voxel_id(17, 0, 31), 3841);
+    }
+
+    #[test]
+    fn test_grd_09_partial_last_block() {
+        // 17 voxels → 2 blocks in X (last block only has 1 valid voxel column)
+        let mut grid = setup_grid(17, 16, 16);
+
+        assert_eq!(grid.nx, 2);
+        assert_eq!(grid.ny, 1);
+        assert_eq!(grid.nz, 1);
+        assert_eq!(grid.n_blocks, 2);
+
+        // Write / read the single valid voxel that lives in the partial block
+        grid.set_voxel(16, 0, 0, 42.0);
+        assert_eq!(grid.get_voxel(16, 0, 0), 42.0);
+
+        // Voxel that belongs to the first (full) block still works
+        grid.set_voxel(15, 0, 0, 7.0);
+        assert_eq!(grid.get_voxel(15, 0, 0), 7.0);
+
+        // Unwritten voxel inside the partial block returns empty_value
+        assert_eq!(grid.get_voxel(16, 5, 5), 0.0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_grd_10_zero_size_grid_get() {
+        let mut grid = setup_grid(0, 0, 0);
+        // n_blocks == 0 → any access is out-of-bounds
+        let _ = grid.get_voxel(0, 0, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_grd_11_zero_size_grid_set() {
+        let mut grid = setup_grid(0, 16, 16);
+        grid.set_voxel(0, 0, 0, 1.0);
+    }
+
+    #[test]
+    fn test_grd_12_ceiling_division_asymmetric() {
+        // Dimensions that are not multiples of BSX and are different on each axis
+        let grid = setup_grid(17, 33, 1);
+
+        assert_eq!(grid.nx, 2); // ceil(17/16)
+        assert_eq!(grid.ny, 3); // ceil(33/16)
+        assert_eq!(grid.nz, 1); // ceil(1/16)
+        assert_eq!(grid.nxy, 6);
+        assert_eq!(grid.n_blocks, 6);
+
+        // Spot-check a few block IDs near the edges
+        assert_eq!(grid.get_block_id(0, 0, 0), 0);
+        assert_eq!(grid.get_block_id(16, 0, 0), 1); // second X block
+        assert_eq!(grid.get_block_id(0, 16, 0), 2); // second Y block
+        assert_eq!(grid.get_block_id(0, 32, 0), 4); // third Y block
+        assert_eq!(grid.get_block_id(16, 32, 0), 5); // last block
+    }
+
+    #[test]
+    fn test_grd_13_set_voxel_replaces_dummy_empty() {
+        let mut grid = setup_grid(32, 32, 32);
+        let bid = grid.get_block_id(5, 5, 5);
+
+        // Force the empty dummy into the map
+        grid.blockmap[bid] = Some(grid.empty_block);
+        assert!(matches!(grid.get_block(bid), BlockRef::Empty));
+        assert_eq!(grid.get_voxel(5, 5, 5), 0.0);
+
+        // A write must allocate a real block and replace the dummy
+        grid.set_voxel(5, 5, 5, 123.4);
+        assert!(matches!(grid.get_block(bid), BlockRef::Allocated(_)));
+        assert_eq!(grid.get_voxel(5, 5, 5), 123.4);
+
+        // The dummy pointer itself must no longer be present
+        assert_ne!(grid.blockmap[bid], Some(grid.empty_block));
+    }
+
+    #[test]
+    fn test_grd_14_set_voxel_replaces_dummy_full() {
+        let mut grid = setup_grid(32, 32, 32);
+        let bid = grid.get_block_id(20, 20, 20);
+
+        grid.blockmap[bid] = Some(grid.full_block);
+        assert!(matches!(grid.get_block(bid), BlockRef::Full));
+        assert_eq!(grid.get_voxel(20, 20, 20), 1.0);
+
+        grid.set_voxel(20, 20, 20, 55.5);
+        assert!(matches!(grid.get_block(bid), BlockRef::Allocated(_)));
+        assert_eq!(grid.get_voxel(20, 20, 20), 55.5);
+        assert_ne!(grid.blockmap[bid], Some(grid.full_block));
+    }
+
+    #[test]
+    fn test_grd_15_dummy_block_identity_and_alignment() {
+        let grid = setup_grid(16, 16, 16);
+
+        // Dummy blocks are distinct from each other
+        assert_ne!(grid.empty_block, grid.full_block);
+
+        // They are 64-byte aligned (inherited from the pool)
+        let empty_addr = grid.empty_block.as_ptr() as usize;
+        let full_addr = grid.full_block.as_ptr() as usize;
+        assert_eq!(empty_addr % 64, 0);
+        assert_eq!(full_addr % 64, 0);
+
+        // And they are not null
+        assert_ne!(empty_addr, 0);
+        assert_ne!(full_addr, 0);
+    }
+
+    #[test]
+    fn test_grd_16_partial_block_coordinate_mapping() {
+        // 20^3 voxels → 2^3 blocks, last block on each axis is partial
+        let grid = setup_grid(20, 20, 20);
+
+        // Global (19,19,19) lives in block (1,1,1) with local (3,3,3)
+        assert_eq!(grid.get_block_id(19, 19, 19), 7);
+        assert_eq!(
+            SparseGrid::<f32, BSX, N>::get_voxel_id(19, 19, 19),
+            3 | (3 << 4) | (3 << 8) // 3 + 48 + 768 = 819
+        );
+
+        // Global (16,0,0) → block (1,0,0), local (0,0,0)
+        assert_eq!(grid.get_block_id(16, 0, 0), 1);
+        assert_eq!(SparseGrid::<f32, BSX, N>::get_voxel_id(16, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_grd_17_blockmap_length_matches_n_blocks() {
+        // Awkward sizes
+        for &(sx, sy, sz) in &[(1, 1, 1), (16, 16, 16), (17, 1, 33), (100, 50, 7)] {
+            let grid = setup_grid(sx, sy, sz);
+            assert_eq!(
+                grid.blockmap.len(),
+                grid.n_blocks,
+                "blockmap length mismatch for {}×{}×{}",
+                sx,
+                sy,
+                sz
+            );
+            assert_eq!(grid.n_blocks, grid.nx * grid.ny * grid.nz);
+        }
     }
 }
