@@ -24,6 +24,9 @@ fn bench_hot_path_scaling(c: &mut Criterion) {
                 b.iter(|| {
                     for _ in 0..count {
                         let ptr = pool.alloc_block();
+                        unsafe {
+                            (*ptr.as_ptr()).flags = 0; // Force a RAM touch
+                        }
                         black_box(ptr);
                     }
                     pool.reset();
@@ -55,6 +58,9 @@ fn bench_multithreaded_contention(c: &mut Criterion) {
                     let pool_clone = Arc::clone(&pool);
                     for _ in 0..blocks_per_thread {
                         let ptr = pool_clone.alloc_block();
+                        unsafe {
+                            (*ptr.as_ptr()).flags = 0; // Force a RAM touch
+                        }
                         black_box(ptr);
                     }
                 });
@@ -75,6 +81,9 @@ fn bench_cold_extension(c: &mut Criterion) {
             let pool = BlockPool::<f32, BSX, N>::new(16, 1024);
             for _ in 0..10_000 {
                 let ptr = pool.alloc_block();
+                unsafe {
+                    (*ptr.as_ptr()).flags = 0; // Force a RAM touch
+                }
                 black_box(ptr);
             }
             black_box(pool); // Drops and frees memory
