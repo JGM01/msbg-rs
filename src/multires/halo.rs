@@ -189,6 +189,13 @@ where
         let idx = rayon::current_thread_index().expect("Must run inside the Rayon thread pool");
         unsafe { &mut *self.slots[idx].get() }
     }
+
+    /// Retrieves the halo buffer for an explicitly known worker index.
+    /// Prefer this over `get_mut` inside `rayon::broadcast` closures.
+    #[inline(always)]
+    pub unsafe fn get_mut_by_index(&self, idx: usize) -> &mut HaloBlock<D, BSX, HSX, N_HALO> {
+        unsafe { &mut *self.slots[idx].get() }
+    }
 }
 #[cfg(test)]
 mod halo_tests {

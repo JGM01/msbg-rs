@@ -5,15 +5,41 @@ use msbg_rs::{
     multires::halo::HaloBlockPool,
     sparse_grid::{BlockPtr, SparseGrid},
 };
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
-};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{hint::black_box, sync::Arc};
 
 // 1 Block = ~16.06 KB
 const BSX: usize = 16;
 const N: usize = 4096;
+
+/// Thin `Send` wrapper around a raw mutable pointer.
+/// Thin `Send` wrapper around a raw mutable pointer.
+struct SendPtr<T>(*mut T);
+
+impl<T> Clone for SendPtr<T> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendPtr<T> {}
+
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+/// Same as `SendPtr` but for a read-only raw pointer.
+struct SendConstPtr<T>(*const T);
+
+impl<T> Clone for SendConstPtr<T> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendConstPtr<T> {}
+
+unsafe impl<T> Send for SendConstPtr<T> {}
+unsafe impl<T> Sync for SendConstPtr<T> {}
 
 fn bench_hot_path_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("blockpool_hot_path");
@@ -115,19 +141,42 @@ fn bench_laplacian_halo_mocked(c: &mut Criterion) {
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
                 let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
 
-                b.iter(|| {
-                    // Using zip so we can iterate both arrays together
-                    output_blocks
-                        .par_iter_mut()
-                        .zip(flags_blocks.par_iter())
-                        .for_each(|(out_block, flags_block)| {
-                            let halo = unsafe { halo_pool.get_mut() };
+                // Static, persistent partition computed once — mirrors OpenMP's
+                // `schedule(static)`: thread `tid` always owns the same range
+                // on every invocation below, instead of Rayon's work-stealing
+                // splitter deciding (potentially differently) each call.
+                let chunk_size = count.div_ceil(num_threads);
 
+                let out_ptr = SendPtr(output_blocks.as_mut_ptr());
+                let flags_ptr = SendConstPtr(flags_blocks.as_ptr());
+
+                b.iter(|| {
+                    rayon::broadcast(|ctx| {
+                        let out_ptr = out_ptr;
+                        let flags_ptr = flags_ptr;
+
+                        let tid = ctx.index();
+                        let start = tid * chunk_size;
+                        let end = (start + chunk_size).min(count);
+                        if start >= end {
+                            return;
+                        }
+
+                        // Direct slot lookup by broadcast index — no redundant
+                        // current_thread_index() TLS read needed.
+                        let halo = unsafe { halo_pool.get_mut_by_index(tid) };
+
+                        for i in start..end {
                             // Mocking the memory bandwidth of gathering the neighborhood via memset
                             halo.mock_fill_for_bench();
 
-                            kernel_laplacian_simd_16(halo, flags_block, out_block);
-                        });
+                            unsafe {
+                                let out_block = &mut *out_ptr.0.add(i);
+                                let flags_block = &*flags_ptr.0.add(i);
+                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                            }
+                        }
+                    });
                     black_box(&mut output_blocks);
                 });
             },
@@ -167,24 +216,51 @@ fn bench_laplacian_halo_real_fill(c: &mut Criterion) {
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
                 let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
 
-                // Compute exact static chunk size per thread
-                let chunk_size = (count + num_threads - 1) / num_threads;
+                // Static, persistent partition computed once outside the timed
+                // closure — thread `tid` owns range [tid*chunk, (tid+1)*chunk)
+                // on *every* call below, matching OpenMP's `schedule(static)`
+                // + `omp_get_thread_num()` exactly, instead of leaving the
+                // range-to-worker assignment to Rayon's work-stealing splitter
+                // (which is free to reshuffle it between iterations since this
+                // closure is invoked from Criterion's thread, not a Rayon
+                // worker, forcing a fresh injection into the global queue
+                // every call).
+                let chunk_size = count.div_ceil(num_threads);
+
+                let grid_ref = &grid; // shared ref: fill() only reads the grid
+                let out_ptr = SendPtr(output_blocks.as_mut_ptr());
+                let flags_ptr = SendConstPtr(flags_blocks.as_ptr());
 
                 b.iter(|| {
-                    grid.blockmap
-                        .par_iter()
-                        .take(count)
-                        .zip(flags_blocks.par_iter())
-                        .zip(output_blocks.par_iter_mut())
-                        .with_min_len(chunk_size) // Enforces static linear work division
-                        .enumerate()
-                        .for_each(|(bid, ((block_opt, flags_block), out_block))| {
-                            if block_opt.is_some() {
-                                let halo = unsafe { halo_pool.get_mut() };
-                                halo.fill(&grid, bid);
-                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                    rayon::broadcast(|ctx| {
+                        let out_ptr = out_ptr;
+                        let flags_ptr = flags_ptr;
+
+                        let tid = ctx.index();
+                        let start = tid * chunk_size;
+                        let end = (start + chunk_size).min(count);
+                        if start >= end {
+                            return;
+                        }
+
+                        let halo = unsafe { halo_pool.get_mut_by_index(tid) };
+
+                        for bid in start..end {
+                            if grid_ref.blockmap[bid].is_some() {
+                                halo.fill(grid_ref, bid);
+                                unsafe {
+                                    // Safe in practice: the static partition guarantees
+                                    // every `bid` is owned by exactly one broadcast
+                                    // closure, so no two threads ever alias the same
+                                    // output/flags slot — the same disjointness OpenMP's
+                                    // `schedule(static)` relies on implicitly.
+                                    let out_block = &mut *out_ptr.0.add(bid);
+                                    let flags_block = &*flags_ptr.0.add(bid);
+                                    kernel_laplacian_simd_16(halo, flags_block, out_block);
+                                }
                             }
-                        });
+                        }
+                    });
                     black_box(&mut output_blocks);
                 });
             },
