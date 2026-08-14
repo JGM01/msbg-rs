@@ -20,7 +20,7 @@ hands out blocks across thread-safe segments.
 - `blockpool_hot_path` / `blockpool_contention` / `blockpool_cold_alloc` benches
   vs the C++ `BlockPool` (scenarios A/B/C in `MSBG/benchmark.cpp`).
 - Current result: hot path ~2× faster than C++ (relaxed atomic + zero header
-  writes); contention leg needs segment-size parity before it is comparable.
+  writes); contention leg uses the same `blocks_per_seg = 4096` as C++.
 
 ---
 
@@ -111,10 +111,10 @@ padded halo buffer with boundary handling, backed by a per-thread halo pool.
 `smoothBlockSIMD4f`, `src/kernels_ispc.h` (`ispc_meancurv_smooth_halo_block`).
 
 **Scope:** the compute kernels that run over a halo buffer: 7-point Laplacian
-(maskless — the fluid mask is split out and reintroduced where MSBG actually
-uses it, in the multigrid path), mean-curvature (19-tap Hessian), bi-Laplacian,
-and downsample/upsample. Introduce the cross-platform SIMD dispatch (widest
-native width per machine) here.
+(the fluid mask is currently applied inline in the kernel, not split out),
+mean-curvature (19-tap Hessian), bi-Laplacian, and downsample/upsample.
+Introduce the cross-platform SIMD dispatch (widest native width per machine)
+here.
 
 **Acceptance:**
 - Unit tests: each kernel matches a scalar reference to within tolerance.
@@ -156,7 +156,9 @@ Laplacian (matrix-vector product + relaxation + CG) used by pressure projection.
 **Acceptance:**
 - Convergence tests on known problems (e.g. Laplace's equation, a known eikonal
   distance field).
-- `laplacian_smoothing_e2e` bench vs C++ `applyChannelPdeFast` (scenario E).
+- `laplacian_smoothing_e2e` bench vs C++ `applyChannelPdeFast` (scenario E) —
+  the bench already exists as a manual halo+stencil composition; this step wires
+  it to the real solver.
 
 ---
 

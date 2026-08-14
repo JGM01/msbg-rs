@@ -193,6 +193,49 @@ where
         }
     }
 
+    /// True if `bid` holds an allocated (writable) data block.
+    #[inline(always)]
+    pub fn is_value_block(&self, bid: usize) -> bool {
+        matches!(self.get_block(bid), BlockRef::Allocated(_))
+    }
+
+    /// True if `bid` is unallocated or the shared empty dummy.
+    #[inline(always)]
+    pub fn is_empty_block(&self, bid: usize) -> bool {
+        matches!(self.get_block(bid), BlockRef::Empty)
+    }
+
+    /// True if `bid` is the shared full dummy.
+    #[inline(always)]
+    pub fn is_full_block(&self, bid: usize) -> bool {
+        matches!(self.get_block(bid), BlockRef::Full)
+    }
+
+    /// Inverse of `get_block_id`: block id -> `(bx, by, bz)` block coords.
+    #[inline(always)]
+    pub fn get_block_coords_by_id(&self, bid: usize) -> (usize, usize, usize) {
+        debug_assert!(bid < self.n_blocks);
+        (bid % self.nx, (bid / self.nx) % self.ny, bid / self.nxy)
+    }
+
+    /// Immutable slice view of an allocated block's data; `None` for dummies.
+    #[inline(always)]
+    pub fn get_block_data(&self, bid: usize) -> Option<&[D]> {
+        match self.get_block(bid) {
+            BlockRef::Allocated(block) => Some(block.data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Mutable slice view of an allocated block's data; `None` for dummies.
+    #[inline(always)]
+    pub fn get_block_data_mut(&mut self, bid: usize) -> Option<&mut [D]> {
+        match self.get_block_mut(bid) {
+            BlockRefMut::Allocated(block) => Some(block.data.as_mut_slice()),
+            _ => None,
+        }
+    }
+
     /// Sentinel value for empty regions.
     #[inline(always)]
     pub fn empty_value(&self) -> D {
@@ -620,5 +663,50 @@ mod tests {
         );
         assert_eq!(a, 7.0);
         assert_eq!(b, 8.0);
+    }
+
+    #[test]
+    fn test_grd_22_block_state_predicates() {
+        let mut grid = setup_grid(32, 32, 32);
+        let bid = grid.get_block_id(5, 5, 5);
+
+        assert!(grid.is_empty_block(bid));
+        assert!(!grid.is_value_block(bid) && !grid.is_full_block(bid));
+
+        grid.set_full_block(bid);
+        assert!(grid.is_full_block(bid));
+        assert!(!grid.is_value_block(bid) && !grid.is_empty_block(bid));
+
+        grid.set_voxel(5, 5, 5, 1.0); // replaces the full dummy with an allocated block
+        assert!(grid.is_value_block(bid));
+        assert!(!grid.is_empty_block(bid) && !grid.is_full_block(bid));
+    }
+
+    #[test]
+    fn test_grd_23_block_coords_round_trip() {
+        let grid = setup_grid(64, 48, 32); // nx=4 ny=3 nz=2
+        for bid in [0, 1, 5, grid.n_blocks - 1] {
+            let (bx, by, bz) = grid.get_block_coords_by_id(bid);
+            assert_eq!(grid.get_block_id(bx * BSX, by * BSX, bz * BSX), bid);
+        }
+    }
+
+    #[test]
+    fn test_grd_24_block_data_accessors() {
+        let mut grid = setup_grid(32, 32, 32);
+
+        let bid = grid.get_block_id(16, 16, 16); // block (1,1,1)
+        assert!(grid.get_block_data(bid).is_none());
+        assert!(grid.get_block_data_mut(bid).is_none());
+
+        grid.set_voxel(16, 16, 16, 7.0);
+        assert_eq!(grid.get_block_data(bid).unwrap()[0], 7.0);
+
+        grid.get_block_data_mut(bid).unwrap()[0] = 9.0;
+        assert_eq!(grid.get_voxel(16, 16, 16), 9.0);
+
+        let fid = grid.get_block_id(0, 0, 0);
+        grid.set_full_block(fid);
+        assert!(grid.get_block_data(fid).is_none());
     }
 }
