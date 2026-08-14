@@ -16,6 +16,12 @@ nix-shell   # provides rustup + gcc; rust-toolchain.toml pins `nightly`
 `rustup` auto-installs/selects the pinned nightly the first time `cargo` runs.
 All `rustc`/`cargo` invocations below assume this shell.
 
+**Platform: portable.** Unlike the C++ baseline (`../MSBG`), this crate compiles
+and runs on macOS (including arm64/Apple Silicon) as well as Linux x86-64, since
+it uses `std::simd` (`portable_simd`) rather than x86-only intrinsics. The `nix`
+shell here is Linux-specific, but `cargo build`/`test`/`bench` work on macOS with
+a plain nightly toolchain.
+
 ## Layout
 
 - `src/blockpool.rs` — aligned `Block` + lock-free monotonic `BlockPool`
@@ -87,6 +93,9 @@ binaries in `../MSBG`. See `.agents/skills/debugging/SKILL.md` for what each is
 for and example invocations, and `.agents/skills/compare-cpp-rust/SKILL.md` for
 the side-by-side C++-vs-Rust comparison workflow (spawn a subagent per repo,
 aggregate IPC/cache/code-size/layout).
+- `./profile-linux.sh <bench-group>` (Linux) / `./profile-macos.sh <bench-group>`
+  profile one benchmark and write `target/profile/profile.txt` (flat top-N
+  self-time) + `flamegraph.svg`.
 
 ## Conventions
 

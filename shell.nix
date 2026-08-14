@@ -14,6 +14,8 @@ pkgs.mkShell {
     valgrind
     rr
     heaptrack
+    # profiling (profile-linux.sh -> perf report top-N + flamegraph svg)
+    inferno
     # Rust-specific
     cargo-nextest      # fast parallel test runner
     cargo-show-asm     # `cargo asm` — source-level disassembly
