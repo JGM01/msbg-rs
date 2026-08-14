@@ -62,6 +62,7 @@ mod interpolate_tests {
     }
 
     /// Reference scalar trilinear (identical math, no SIMD / grid indirection)
+    #[allow(clippy::too_many_arguments)]
     fn scalar_trilinear(
         c000: f32,
         c100: f32,

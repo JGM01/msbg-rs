@@ -90,14 +90,14 @@ where
         // 2. Left and Right faces (Single elements on the X-edges)
         for z in 0..BSX {
             for y in 0..BSX {
-                let halo_idx_l = (z + 1) * dz + (y + 1) * dy + 0;
+                let halo_idx_l = (z + 1) * dz + (y + 1) * dy;
                 let blk_idx_l = z * BSX * BSX + y * BSX + (BSX - 1);
                 unsafe {
                     *self.data.get_unchecked_mut(halo_idx_l) = *left_ptr.add(blk_idx_l);
                 }
 
                 let halo_idx_r = (z + 1) * dz + (y + 1) * dy + (BSX + 1);
-                let blk_idx_r = z * BSX * BSX + y * BSX + 0;
+                let blk_idx_r = z * BSX * BSX + y * BSX;
                 unsafe {
                     *self.data.get_unchecked_mut(halo_idx_r) = *right_ptr.add(blk_idx_r);
                 }
@@ -106,7 +106,7 @@ where
 
         // 3. Bottom and Top faces (Full X-rows on the Y-edges)
         for z in 0..BSX {
-            let halo_idx_b = (z + 1) * dz + 0 * dy + 1;
+            let halo_idx_b = (z + 1) * dz + 1;
             let blk_idx_b = z * BSX * BSX + (BSX - 1) * BSX;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -117,7 +117,7 @@ where
             }
 
             let halo_idx_t = (z + 1) * dz + (BSX + 1) * dy + 1;
-            let blk_idx_t = z * BSX * BSX + 0 * BSX;
+            let blk_idx_t = z * BSX * BSX;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     top_ptr.add(blk_idx_t),
@@ -129,7 +129,7 @@ where
 
         // 4. Back and Front faces (Full X-rows on the Z-edges)
         for y in 0..BSX {
-            let halo_idx_bk = 0 * dz + (y + 1) * dy + 1;
+            let halo_idx_bk = (y + 1) * dy + 1;
             let blk_idx_bk = (BSX - 1) * BSX * BSX + y * BSX;
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -140,7 +140,7 @@ where
             }
 
             let halo_idx_fd = (BSX + 1) * dz + (y + 1) * dy + 1;
-            let blk_idx_fd = 0 * BSX * BSX + y * BSX;
+            let blk_idx_fd = y * BSX;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     front_ptr.add(blk_idx_fd),
@@ -156,6 +156,15 @@ where
     pub fn mock_fill_for_bench(&mut self) {
         // Force CPU to iterate and pull buffer into L1
         self.data.fill(D::default());
+    }
+}
+
+impl<D, const BSX: usize, const HSX: usize> Default for HaloBlock<D, BSX, HSX>
+where
+    D: Copy + Default + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -187,10 +196,13 @@ where
         Self { slots }
     }
 
-    /// Retrieves mutable halo buffer assigned to the current worker thread.
+    /// Retrieves the mutable halo buffer assigned to the current worker thread.
     ///
-    /// Must only be called within a parallel context bounded by the pool size!
+    /// # Safety
+    /// Must only be called from inside a Rayon parallel context whose workers
+    /// are bounded by the pool size: each slot is owned by exactly one worker.
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut(&self) -> &mut HaloBlock<D, BSX, HSX> {
         let idx = rayon::current_thread_index().expect("Must run inside the Rayon thread pool");
         unsafe { &mut *self.slots[idx].get() }
@@ -273,7 +285,7 @@ mod halo_tests {
         // Left face (x=0) of halo must be empty_value
         for z in 1..=BSX {
             for y in 1..=BSX {
-                let idx = z * dz + y * dy + 0;
+                let idx = z * dz + y * dy;
                 assert_eq!(halo.data[idx], 0.0);
             }
         }
@@ -285,10 +297,10 @@ mod halo_tests {
             }
         }
         // Likewise for the other four faces (spot-check a few)
-        assert_eq!(halo.data[1 * dy + 1], 0.0); // bottom
+        assert_eq!(halo.data[dy + 1], 0.0); // bottom
         assert_eq!(halo.data[(BSX + 1) * dy + 1], 0.0); // top
         assert_eq!(halo.data[1], 0.0); // back
-        assert_eq!(halo.data[(BSX + 1) * dz + 1 * dy + 1], 0.0); // front
+        assert_eq!(halo.data[(BSX + 1) * dz + dy + 1], 0.0); // front
     }
 
     #[test]
@@ -356,11 +368,12 @@ mod halo_tests {
             // Allocate by writing one voxel
             grid.set_voxel(base_x, base_y, base_z, bid as f32);
             // Fill the whole block with the same value for easy checking
-            if let Some(ptr) = grid.blockmap[bid] {
-                if ptr != grid.empty_block && ptr != grid.full_block {
-                    unsafe {
-                        (*ptr.as_ptr()).data.fill(bid as f32);
-                    }
+            if let Some(ptr) = grid.blockmap[bid]
+                && ptr != grid.empty_block
+                && ptr != grid.full_block
+            {
+                unsafe {
+                    (*ptr.as_ptr()).data.fill(bid as f32);
                 }
             }
         }
@@ -372,31 +385,25 @@ mod halo_tests {
         let dz = HSX * HSX;
 
         // Centre interior == center_bid
-        assert_eq!(halo.data[1 * dz + 1 * dy + 1], center_bid as f32);
+        assert_eq!(halo.data[dz + dy + 1], center_bid as f32);
 
         // Left face (x=0) must come from bid-1
         let left_bid = center_bid - 1;
-        assert_eq!(halo.data[1 * dz + 1 * dy + 0], left_bid as f32);
+        assert_eq!(halo.data[dz + dy], left_bid as f32);
 
         // Right face
         let right_bid = center_bid + 1;
-        assert_eq!(halo.data[1 * dz + 1 * dy + (HSX - 1)], right_bid as f32);
+        assert_eq!(halo.data[dz + dy + (HSX - 1)], right_bid as f32);
 
         // Bottom / top / back / front
+        assert_eq!(halo.data[dz + 1], (center_bid - grid.nx) as f32);
         assert_eq!(
-            halo.data[1 * dz + 0 * dy + 1],
-            (center_bid - grid.nx) as f32
-        );
-        assert_eq!(
-            halo.data[1 * dz + (HSX - 1) * dy + 1],
+            halo.data[dz + (HSX - 1) * dy + 1],
             (center_bid + grid.nx) as f32
         );
+        assert_eq!(halo.data[dy + 1], (center_bid - grid.nxy) as f32);
         assert_eq!(
-            halo.data[0 * dz + 1 * dy + 1],
-            (center_bid - grid.nxy) as f32
-        );
-        assert_eq!(
-            halo.data[(HSX - 1) * dz + 1 * dy + 1],
+            halo.data[(HSX - 1) * dz + dy + 1],
             (center_bid + grid.nxy) as f32
         );
     }
@@ -405,7 +412,7 @@ mod halo_tests {
     fn test_h_08_mock_fill() {
         let mut halo = HaloBlock::<f32, BSX, HSX>::new();
         // Put something non-zero first
-        halo.data.fill(3.14);
+        halo.data.fill(1.0);
         halo.mock_fill_for_bench();
         assert!(halo.data.iter().all(|&v| v == 0.0));
     }
