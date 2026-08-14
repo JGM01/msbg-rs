@@ -201,6 +201,9 @@ where
             // Lazy allocation trigger
             _ => {
                 let new_block = BlockPtr(self.block_pool.alloc_block());
+                unsafe {
+                    (*new_block.as_ptr()).data.fill(self.empty_value);
+                }
                 self.blockmap[bid] = Some(new_block);
                 new_block
             }

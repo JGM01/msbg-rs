@@ -1,5 +1,5 @@
 use std::{
-    alloc::{Layout, alloc_zeroed, dealloc},
+    alloc::{Layout, alloc, dealloc},
     ptr::NonNull,
     sync::{
         Mutex,
@@ -137,8 +137,9 @@ where
         // Create a memory layout for `blocks_per_seg` contiguous blocks
         let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg).unwrap();
 
-        // Ask OS for zeroed memory
-        let raw_ptr = unsafe { alloc_zeroed(layout) } as *mut Block<D, BSX, N>;
+        // Ask OS for memory (uninitialized: callers that need defined
+        // values must initialize the block themselves)
+        let raw_ptr = unsafe { alloc(layout) } as *mut Block<D, BSX, N>;
 
         if raw_ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
