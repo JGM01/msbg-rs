@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use msbg_rs::{
     blockpool::{Block, BlockPool},
     math::laplacian::kernel_laplacian_simd_16,
@@ -118,6 +118,13 @@ fn build_sparse_grid(active_target: usize) -> (Arc<SparseGrid<f32, BSX, N>>, Vec
     (Arc::new(grid), active)
 }
 
+/// Lazily-built rayon pool with FTZ/DAZ workers.
+fn thread_pool() -> &'static msbg_rs::thread_pool::Pool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<msbg_rs::thread_pool::Pool> = OnceLock::new();
+    POOL.get_or_init(|| msbg_rs::thread_pool::Pool::new(rayon::current_num_threads()))
+}
+
 fn bench_hot_path_scaling(c: &mut Criterion) {
     let s = scale();
     let mut group = c.benchmark_group("blockpool_hot_path");
@@ -154,12 +161,11 @@ fn bench_multithreaded_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("blockpool_contention");
     group.sample_size(sample_size(s));
 
-    // Force small segments to stress segment creation lock races across all cores
     let num_threads = rayon::current_num_threads();
     let blocks_per_thread = 4096;
     let total_blocks = num_threads * blocks_per_thread;
 
-    let blocks_per_seg = 256; // 1 MB segments to trigger frequent extend_pool calls
+    let blocks_per_seg = 4096; // matches the C++ contention scenario
     let max_segments = (total_blocks / blocks_per_seg) + 16;
 
     let pool = Arc::new(BlockPool::<f32, BSX, N>::new(max_segments, blocks_per_seg));
@@ -168,15 +174,17 @@ fn bench_multithreaded_contention(c: &mut Criterion) {
         format!("{}_threads_{}_blocks", num_threads, total_blocks),
         |b| {
             b.iter(|| {
-                (0..num_threads).into_par_iter().for_each(|_| {
-                    let pool_clone = Arc::clone(&pool);
-                    for _ in 0..blocks_per_thread {
-                        let ptr = pool_clone.alloc_block();
-                        unsafe {
-                            (*ptr.as_ptr()).flags = 0; // Force a RAM touch
+                thread_pool().install(|| {
+                    (0..num_threads).into_par_iter().for_each(|_| {
+                        let pool_clone = Arc::clone(&pool);
+                        for _ in 0..blocks_per_thread {
+                            let ptr = pool_clone.alloc_block();
+                            unsafe {
+                                (*ptr.as_ptr()).flags = 0; // Force a RAM touch
+                            }
+                            black_box(ptr);
                         }
-                        black_box(ptr);
-                    }
+                    });
                 });
                 pool.reset();
             });
@@ -233,17 +241,19 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
 
                 b.iter(|| {
                     // Using zip so we can iterate both arrays together
-                    output_blocks
-                        .par_iter_mut()
-                        .zip(flags_blocks.par_iter())
-                        .for_each(|(out_block, flags_block)| {
-                            let halo = unsafe { halo_pool.get_mut() };
+                    thread_pool().install(|| {
+                        output_blocks
+                            .par_iter_mut()
+                            .zip(flags_blocks.par_iter())
+                            .for_each(|(out_block, flags_block)| {
+                                let halo = unsafe { halo_pool.get_mut() };
 
-                            // Mocking the memory bandwidth of gathering the neighborhood via memset
-                            halo.mock_fill_for_bench();
+                                // Mocking the memory bandwidth of gathering the neighborhood via memset
+                                halo.mock_fill_for_bench();
 
-                            kernel_laplacian_simd_16(halo, flags_block, out_block);
-                        });
+                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                            });
+                    });
                     black_box(&mut output_blocks);
                 });
             },
@@ -268,10 +278,12 @@ fn bench_halo_gather(c: &mut Criterion) {
             &active,
             |b, active| {
                 b.iter(|| {
-                    active.par_iter().for_each(|&bid| {
-                        let halo = unsafe { halo_pool.get_mut() };
-                        halo.fill(&grid, bid);
-                        black_box(halo.data.as_ref());
+                    thread_pool().install(|| {
+                        active.par_iter().for_each(|&bid| {
+                            let halo = unsafe { halo_pool.get_mut() };
+                            halo.fill(&grid, bid);
+                            black_box(halo.data.as_ref());
+                        });
                     });
                 });
             },
@@ -300,17 +312,19 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
             &active,
             |b, active| {
                 b.iter(|| {
-                    active
-                        .par_iter()
-                        .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
-                        .for_each(|(&bid, (out_block, flags_block))| {
-                            let halo = unsafe { halo_pool.get_mut() };
+                    thread_pool().install(|| {
+                        active
+                            .par_iter()
+                            .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
+                            .for_each(|(&bid, (out_block, flags_block))| {
+                                let halo = unsafe { halo_pool.get_mut() };
 
-                            // True gather latency from 6 spatial boundaries across RAM
-                            halo.fill(&grid, bid);
+                                // True gather latency from 6 spatial boundaries across RAM
+                                halo.fill(&grid, bid);
 
-                            kernel_laplacian_simd_16(halo, flags_block, out_block);
-                        });
+                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                            });
+                    });
                     black_box(&mut output_blocks);
                 });
             },
@@ -319,13 +333,84 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_voxel_access(c: &mut Criterion) {
+    let s = scale();
+    let mut group = c.benchmark_group("voxel_access");
+    group.sample_size(sample_size(s));
+
+    let size = match s {
+        Scale::Small => 64,
+        Scale::Full => 128,
+    };
+
+    let mut grid: SparseGrid<f32, BSX, N> = SparseGrid::new(
+        "voxel".to_string(),
+        size,
+        size,
+        size,
+        0.0,
+        1.0,
+        Arc::new(BlockPool::<f32, BSX, N>::new(16, 4096)),
+    );
+
+    // Mixed value states: full every 3rd block, allocated every 3rd+1, empty rest.
+    for bz in 0..grid.nz {
+        for by in 0..grid.ny {
+            for bx in 0..grid.nx {
+                let bid = bx + by * grid.nx + bz * grid.nxy;
+                match bid % 3 {
+                    0 => grid.set_full_block(bid),
+                    1 => grid.set_voxel(bx * BSX, by * BSX, bz * BSX, 0.5),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    group.bench_function("get_sequential", |b| {
+        b.iter(|| {
+            let mut acc = 0.0f32;
+            for z in 0..size {
+                for y in 0..size {
+                    for x in 0..size {
+                        acc += grid.get_voxel_unchecked(x, y, z);
+                    }
+                }
+            }
+            black_box(acc);
+        });
+    });
+
+    group.bench_function("set_allocated", |b| {
+        b.iter(|| {
+            for z in 0..size {
+                for y in 0..size {
+                    for x in 0..size {
+                        grid.set_value_in_block(
+                            grid.get_block_id(x, y, z),
+                            SparseGrid::<f32, BSX, N>::get_voxel_id(x, y, z),
+                            x as f32,
+                        );
+                    }
+                }
+            }
+            black_box(&grid);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_hot_path_scaling,
     bench_multithreaded_contention,
     bench_cold_extension,
+    bench_voxel_access,
     bench_laplacian_compute_only,
     bench_halo_gather,
     bench_laplacian_smoothing_e2e
 );
-criterion_main!(benches);
+
+fn main() {
+    let _ = thread_pool(); // eager build so warmup isn't charged
+    benches();
+}

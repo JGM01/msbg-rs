@@ -36,8 +36,18 @@ impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> BlockPtr
     }
 }
 
-/// Prevents accidental mutation of the shared `empty` or `full` dummy blocks.
+/// Immutable view of a block's value state.
 pub enum BlockRef<'a, D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> {
+    /// An allocated block containing data
+    Allocated(&'a Block<D, BSX, N>),
+    /// A virtual block that is entirely empty
+    Empty,
+    /// A virtual block that is entirely full (e.g., solid obstacles)
+    Full,
+}
+
+/// Mutable view of a block's value state.
+pub enum BlockRefMut<'a, D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> {
     /// An allocated block containing mutable data
     Allocated(&'a mut Block<D, BSX, N>),
     /// A virtual block that is entirely empty
@@ -79,8 +89,8 @@ where
     pub empty_block: BlockPtr<D, BSX, N>,
     pub full_block: BlockPtr<D, BSX, N>,
 
-    pub empty_value: D,
-    pub full_value: D,
+    empty_value: D,
+    full_value: D,
 }
 
 impl<D, const BSX: usize, const N: usize> SparseGrid<D, BSX, N>
@@ -161,25 +171,91 @@ where
         vx | (vy << Self::BSX_LOG2) | (vz << (2 * Self::BSX_LOG2))
     }
 
-    /// Safely retrieve a block from the map.
+    /// Immutably resolve a block's value state.
     #[inline(always)]
-    pub fn get_block(&mut self, bid: usize) -> BlockRef<'_, D, BSX, N> {
+    pub fn get_block(&self, bid: usize) -> BlockRef<'_, D, BSX, N> {
         match self.blockmap[bid] {
             Some(ptr) if ptr == self.empty_block => BlockRef::Empty,
             Some(ptr) if ptr == self.full_block => BlockRef::Full,
-            Some(mut ptr) => unsafe { BlockRef::Allocated(ptr.0.as_mut()) },
+            Some(ptr) => unsafe { BlockRef::Allocated(&*ptr.as_ptr()) },
             None => BlockRef::Empty,
         }
     }
 
+    /// Mutably resolve a block's value state.
+    #[inline(always)]
+    pub fn get_block_mut(&mut self, bid: usize) -> BlockRefMut<'_, D, BSX, N> {
+        match self.blockmap[bid] {
+            Some(ptr) if ptr == self.empty_block => BlockRefMut::Empty,
+            Some(ptr) if ptr == self.full_block => BlockRefMut::Full,
+            Some(ptr) => unsafe { BlockRefMut::Allocated(&mut *ptr.as_ptr()) },
+            None => BlockRefMut::Empty,
+        }
+    }
+
+    /// Sentinel value for empty regions.
+    #[inline(always)]
+    pub fn empty_value(&self) -> D {
+        self.empty_value
+    }
+
+    /// Sentinel value for full regions.
+    #[inline(always)]
+    pub fn full_value(&self) -> D {
+        self.full_value
+    }
+
+    /// Set the empty sentinel; re-fills the shared empty dummy block.
+    pub fn set_empty_value(&mut self, val: D) {
+        self.empty_value = val;
+        unsafe {
+            (*self.empty_block.as_ptr()).data.fill(val);
+        }
+    }
+
+    /// Set the full sentinel; re-fills the shared full dummy block.
+    pub fn set_full_value(&mut self, val: D) {
+        self.full_value = val;
+        unsafe {
+            (*self.full_block.as_ptr()).data.fill(val);
+        }
+    }
+
+    /// Mark a block as entirely empty (no data allocated).
+    #[inline(always)]
+    pub fn set_empty_block(&mut self, bid: usize) {
+        debug_assert!(bid < self.n_blocks);
+        debug_assert!(!matches!(self.get_block(bid), BlockRef::Allocated(_)));
+        self.blockmap[bid] = Some(self.empty_block);
+    }
+
+    /// Mark a block as entirely full (no data allocated).
+    #[inline(always)]
+    pub fn set_full_block(&mut self, bid: usize) {
+        debug_assert!(bid < self.n_blocks);
+        debug_assert!(!matches!(self.get_block(bid), BlockRef::Allocated(_)));
+        self.blockmap[bid] = Some(self.full_block);
+    }
+
     /// Get a single voxel value without allocating memory.
     #[inline(always)]
-    pub fn get_voxel(&mut self, x: usize, y: usize, z: usize) -> D {
+    pub fn get_voxel(&self, x: usize, y: usize, z: usize) -> D {
         debug_assert!(x < self.sx && y < self.sy && z < self.sz);
+        self.get_voxel_unchecked(x, y, z)
+    }
 
+    /// `get_voxel` without the in-range assertion; caller proves `(x,y,z)`.
+    #[inline(always)]
+    pub fn get_voxel_unchecked(&self, x: usize, y: usize, z: usize) -> D {
         let bid = self.get_block_id(x, y, z);
         let vid = Self::get_voxel_id(x, y, z);
+        self.get_value_in_block(bid, vid)
+    }
 
+    /// Read a voxel by (block, voxel-in-block) index.
+    #[inline(always)]
+    pub fn get_value_in_block(&self, bid: usize, vid: usize) -> D {
+        debug_assert!(vid < N);
         match self.get_block(bid) {
             BlockRef::Allocated(block) => unsafe { *block.data.get_unchecked(vid) },
             BlockRef::Empty => self.empty_value,
@@ -187,18 +263,22 @@ where
         }
     }
 
-    /// Set a voxel value. If the block doesn't exist, lazily allocate it.
+    /// Set a voxel value. Allocates the block on demand (over `None` or a dummy).
     #[inline(always)]
     pub fn set_voxel(&mut self, x: usize, y: usize, z: usize, val: D) {
         debug_assert!(x < self.sx && y < self.sy && z < self.sz);
-
         let bid = self.get_block_id(x, y, z);
         let vid = Self::get_voxel_id(x, y, z);
+        self.set_value_in_block(bid, vid, val);
+    }
+
+    /// Set a voxel by (block, voxel-in-block) index; allocates on demand.
+    #[inline(always)]
+    pub fn set_value_in_block(&mut self, bid: usize, vid: usize, val: D) {
+        debug_assert!(vid < N);
 
         let block_ptr = match self.blockmap[bid] {
-            // Already allocated real block
             Some(ptr) if ptr != self.empty_block && ptr != self.full_block => ptr,
-            // Lazy allocation trigger
             _ => {
                 let new_block = BlockPtr(self.block_pool.alloc_block());
                 unsafe {
@@ -269,7 +349,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_grd_04_panic_oob_x_get() {
-        let mut grid = setup_grid(32, 32, 32);
+        let grid = setup_grid(32, 32, 32);
         // sx is 32, so x=32 is out of bounds
         let _ = grid.get_voxel(32, 0, 0);
     }
@@ -306,7 +386,7 @@ mod tests {
         let bid = grid.get_block_id(20, 20, 20); // Belongs to block (1,1,1)
 
         // Inject a full block marker (e.g., simulating a solid obstacle region)
-        grid.blockmap[bid] = Some(grid.full_block);
+        grid.set_full_block(bid);
 
         // Verify state resolution
         assert!(matches!(grid.get_block(bid), BlockRef::Full));
@@ -376,7 +456,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_grd_10_zero_size_grid_get() {
-        let mut grid = setup_grid(0, 0, 0);
+        let grid = setup_grid(0, 0, 0);
         // n_blocks == 0 → any access is out-of-bounds
         let _ = grid.get_voxel(0, 0, 0);
     }
@@ -413,7 +493,7 @@ mod tests {
         let bid = grid.get_block_id(5, 5, 5);
 
         // Force the empty dummy into the map
-        grid.blockmap[bid] = Some(grid.empty_block);
+        grid.set_empty_block(bid);
         assert!(matches!(grid.get_block(bid), BlockRef::Empty));
         assert_eq!(grid.get_voxel(5, 5, 5), 0.0);
 
@@ -431,7 +511,7 @@ mod tests {
         let mut grid = setup_grid(32, 32, 32);
         let bid = grid.get_block_id(20, 20, 20);
 
-        grid.blockmap[bid] = Some(grid.full_block);
+        grid.set_full_block(bid);
         assert!(matches!(grid.get_block(bid), BlockRef::Full));
         assert_eq!(grid.get_voxel(20, 20, 20), 1.0);
 
@@ -491,5 +571,54 @@ mod tests {
             );
             assert_eq!(grid.n_blocks, grid.nx * grid.ny * grid.nz);
         }
+    }
+
+    #[test]
+    fn test_grd_18_set_empty_value_refills_dummy() {
+        let mut grid = setup_grid(32, 32, 32);
+        let bid = grid.get_block_id(5, 5, 5);
+        grid.set_empty_block(bid);
+
+        grid.set_empty_value(-1.0);
+
+        assert_eq!(grid.get_voxel(5, 5, 5), -1.0); // scalar path
+        unsafe {
+            // dummy block data must match the sentinel (halo gather reads it)
+            assert_eq!((*grid.empty_block.as_ptr()).data[0], -1.0);
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_grd_19_set_empty_block_over_allocated_panics() {
+        let mut grid = setup_grid(32, 32, 32);
+        let bid = grid.get_block_id(5, 5, 5);
+        grid.set_voxel(5, 5, 5, 42.0); // allocate a real block
+        grid.set_empty_block(bid); // must panic: would leak the pool slot
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_grd_20_get_value_in_block_vid_oob_panics() {
+        let mut grid = setup_grid(16, 16, 16);
+        grid.set_voxel(0, 0, 0, 1.0); // ensure block 0 is allocated
+        let _ = grid.get_value_in_block(0, N); // vid == N out of bounds
+    }
+
+    #[test]
+    fn test_grd_21_shared_ref_concurrent_read() {
+        let mut grid = setup_grid(32, 32, 32);
+        grid.set_voxel(1, 2, 3, 7.0);
+        grid.set_voxel(10, 11, 12, 8.0);
+
+        let grid_ref = &grid;
+        let (a, b) = rayon::join(
+            || grid_ref.get_voxel(1, 2, 3),
+            || grid_ref.get_voxel(10, 11, 12),
+        );
+        assert_eq!(a, 7.0);
+        assert_eq!(b, 8.0);
     }
 }
