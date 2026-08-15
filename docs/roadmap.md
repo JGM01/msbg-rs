@@ -169,30 +169,40 @@ single-level), and the directional face channels `face_area`/`face_coeff`
 
 ---
 
-## Step 8 — PDE solvers
+## Step 8 — PDE smoothing (happy path: 8-color in-place sweeps)
 
 **Status:** HAVEN'T STARTED
 
-**Parity target:** `src/msbg4.cpp` `applyLaplacianSmoothing` /
-`applyChannelPdeFast` (laplTyp 1 and 4), `src/msbg3.cpp`
-`multiplyLaplacianMatrixOpt` / `relax`; plus eikonal/FIM redistancing (written
-new — referenced in MSBG but not implemented there).
+**Parity target:** `src/msbg4.cpp` `applyChannelPdeFast` (laplTyp 1 Laplacian,
+laplTyp 4 mean-curvature) — the *live* path; `src/msbg_demo.cpp:716` drives it
+with `-(PDE_MEAN_CURVATURE + OPT_8_COLOR_SCHEME)`.
 
-**Scope:** mean-curvature/Laplacian smoothing, redistancing, and the multigrid
-Laplacian (matrix-vector product + relaxation + CG) used by pressure projection.
+**Scope:** a generic **8-color in-place block sweep** (read halo + run a
+per-block stencil + write back), then the mean-curvature (19-tap Hessian) and
+Laplacian (7-pt) kernels on top of it. The sweep is use-case-independent — the
+same primitive the paper (phase-field mean-curvature), the bunny demo, and a
+future pressure matvec all share — so the core library stays solver-agnostic.
 
-**Channels added here:** the remaining scratch channels (`CH_FLOAT_2/3/4/5/6/7/8`,
-`CH_FLOAT_TMP_3`, `CH_DIVERGENCE_ADJ`, `CH_VEC3_2/3/4`, `velocityAirDiff`,
-`sootDiff`, `heatDiff`, `pressureOld`, `genUint16*`/`uint8*`), the
-stochastic-quantize batch, and `prepareDataAccess` / `resetChannel` /
+**Channels added here:** `CH_FLOAT_2`/`CH_FLOAT_3` (smoother scratch src/dst),
+the stochastic-quantize batch, and `prepareDataAccess` / `resetChannel` /
 `protectChannel` semantics.
 
 **Acceptance:**
-- Convergence tests on known problems (e.g. Laplace's equation, a known eikonal
-  distance field).
-- `laplacian_smoothing_e2e` bench vs C++ `applyChannelPdeFast` (scenario E) —
-  the bench already exists as a manual halo+stencil composition; this step wires
-  it to the real solver.
+- `laplacian_smoothing_e2e` bench vs C++ `applyChannelPdeFast` (scenario E,
+  laplTyp 1 and 4) — the bench already exists as a manual halo+stencil
+  composition; this step wires it to the real solver.
+- Convergence tests on known Laplacian/mean-curvature fields.
+
+**Deferred (later extension, not parity): the multigrid pressure solver.**
+`multiplyLaplacianMatrixOpt` / `relax` / dense coarse levels / `AXPBY*` /
+`dotProdChannel` have **no call sites** in the C++ demo — they are the
+pressure-projection (Poisson) machinery for *standard* FLIP, baked into the
+library but unused by the phase-field demo. When ported, design them Rust-native
+(see `ideas.md` §2), not as C++ parity. Their channels (`CH_FLOAT_4..8`,
+`CH_FLOAT_TMP_3`, `CH_DIVERGENCE_ADJ`, `CH_VEC3_2/3/4`, `velocityAirDiff`,
+`sootDiff`, `heatDiff`, `pressureOld`, `genUint16*`/`uint8*`) land then too.
+Redistancing (eikonal/FIM) is likewise written new — referenced in MSBG but not
+implemented there.
 
 ---
 

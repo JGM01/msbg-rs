@@ -304,3 +304,51 @@ was ~3× the op count of the Maxima-factored `MtTrilinearInterpolationOld`
 formula (which is op-minimal — ~32 flops), so it was reverted; and a
 closure-based dequant (`Fn(D) -> O`) didn't inline reliably (linear value
 regressed 33 → 24 Ms/s), so the gather uses a `Dequant<O>` trait method instead.
+
+---
+
+## 8. Solver architecture (step 8) & the "dead code" finding
+
+The C++ multigrid pressure solver — `multiplyLaplacianMatrixOpt`, `relax`,
+`relaxBlockList`, `dotProdChannel`, `AXPBYChannel`(`Combined`), and the dense
+coarse MG levels (`blockSize = 1`, `isDenseLevel`) — has **zero call sites** in
+the repo. The happy path is a single call:
+
+```cpp
+applyChannelPdeFast<RenderDensity>(..., -(PDE_MEAN_CURVATURE + OPT_8_COLOR_SCHEME), ...);
+```
+
+i.e. **8-color in-place mean-curvature smoothing** (`msbg_demo.cpp:716`), the
+"PDE solver" the README's "~10B unknowns/sec" bullet refers to. The pressure
+solver is real, useful machinery (it is what a *standard* FLIP pressure
+projection needs), baked into the library but not exercised by the phase-field
+demo — the paper's method replaces the pressure Poisson solve with mean-curvature
+flow. `_mgSmType` (Jacobi/GS selector) is set at `msbg.cpp:818` but never read;
+red-black (`RELAX_BLOCKS_RED_BLACK`) colors *blocks* (`msbg3.cpp:2212`), not
+voxels, in the dead `relaxBlockList`; `MSBG_SORT_BLOCKLISTS` is never defined, so
+the Morton sort at `msbg.cpp:2043` is compiled out.
+
+Implications for the Rust port:
+
+- **Core stays use-case-independent.** `blockpool` / `sparse_grid` / `channel` /
+  `math` / `multires` provide data structures + the **8-color in-place sweep**
+  as a generic primitive (read halo → per-block stencil → write back). Mean-
+  curvature, Laplacian, and a future pressure matvec are all just stencils over
+  that primitive — no solver leaks into the core.
+- **Happy path first.** Port `applyChannelPdeFast` (laplTyp 1 + 4, 8-color) as
+  the live, benchmarkable target. The MG pressure solver is a later extension,
+  designed Rust-native (not as parity with the dead code).
+- **Threading.** The happy path threads over a flat active-block list via
+  `ThrRunParallel` (→ TBB, `thread.h:287`) with no locks; Rust's rayon
+  equivalent is already the pattern in `halo.rs`.
+
+Micro-optimization experiments (all rejected — no significant gain):
+
+- `blockmap.get_unchecked` in the halo gather: ~2% within noise (memory-bound
+  18³ copy dominates the 7 bounds checks). Reverted.
+- Y-unrolling the halo center copy: noise. Reverted.
+- SIMD-vectorizing the interpolation gather: unnecessary — a `Density` (u16)
+  cubic gradient is ~45% *faster* than `f32` (109 vs 158 ns) because the gather
+  reads half the bytes; LLVM already vectorizes the contiguous loads.
+- `Block::_pad: [u8; 62]` is redundant (`#[repr(align(64))]` already rounds the
+  size up) — a cleanup, not a perf change.
