@@ -1,6 +1,7 @@
 //! Typed data channels over `SparseGrid`.
-//! Typed channel table replaces the C++ `int`-based
-//! channel enum + `void** channelPointers` types. Each channel carries
+//!
+//! Step 3 of the port: a typed channel table replaces the C++ `int`-based
+//! channel enum + `void** channelPointers` type-punning. Each channel carries
 //! its element type at compile time; wrong-type access is a compile error.
 //!
 //! ```compile_fail
@@ -11,20 +12,26 @@
 //! let _: &SparseGrid<Density, 16, 4096> = t.get_pressure().unwrap();
 //! ```
 //!
-//! TODO(step3): SIMD batch dequant — convert a whole `[Density; N]` block to
-//! `[f32; N]` in one pass (C++ has `renderDensToFloat_simd8`).
-//! TODO(step3): u8 density (`RSURF_8_BIT`), incl. the u8-only sqrt *encode*
-//! (`renderDensFromFloat_` applies `doSqrtCompr` only when `sizeof(T)==1`).
-//! TODO(step3): the remaining ~39 C++ channels (divergence, curvature, heat,
-//! etc.) — each is one more `field: Type` line in `channel_table!`.
-//! TODO(step3): `prepareDataAccess` / `resetChannel` / `protectChannel`
-//! semantics (write-lock tokens) — needed by the Step 8 solvers.
+//! TODO(step3): SIMD batch for `Density8` (u8 path); only the u16 `Density`
+//! batch is implemented — that's what the benchmark measures.
+//! TODO(step3): stochastic-quantize batch (`quantize_sr` over a slice).
+//! TODO(step3): `PSFloat`/`double` pressure under `SOLVE_PRESSURE_DOUBLE`.
+//! TODO(step3): directional face channels (`face_area`/`face_coeff` × 3 dirs) —
+//! multigrid-specific; needs a 3-grid or Vec3 modeling decision.
+//! TODO(step3): `FaceDensity` (Vec3u16) render channel.
+//! TODO(step3): remaining C++ channels (CH_FLOAT_2/3/4/5/7/8, CH_VEC3_2/3/4,
+//! velocityAirDiff, sootDiff, heatDiff, genUint*, floatTmp*).
+//! TODO(step8): `prepareDataAccess` / `resetChannel` / `protectChannel`
+//! semantics (write-lock tokens) — needed by the solvers.
 //! TODO(step7): make the table per-level (multires); today it is single-level.
 //! TODO(step3): shared byte-arena pool for lower peak DRAM — a separate
 //! `BlockPool` redesign, orthogonal to this module.
 
 use crate::sparse_grid::SparseGrid;
+use std::mem::{align_of, size_of};
 use std::ops::{Add, Mul, Sub};
+use std::simd::num::{SimdFloat, SimdInt, SimdUint};
+use std::simd::{f32x16, i32x16, u16x16, StdFloat};
 
 /// Quantized scalar density, `u16` in `[0, 65535]`.
 #[repr(transparent)]
@@ -51,6 +58,62 @@ pub struct Vec3(pub [f32; 3]);
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Velocity(pub Vec3);
 
+/// Quantized 8-bit density (`RSURF_8_BIT`), sqrt-compressed in storage.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Density8(pub u8);
+
+// Solver/render channels — one distinct newtype per channel so the type system
+// rejects cross-channel mixing (Pressure vs Divergence vs Curvature, ...).
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Divergence(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CgP(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CgQ(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Diagonal(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Curvature(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Heat(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DensityDiff(pub f32);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DistFineCoarse(pub u16);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityAir(pub Vec3);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VelocityAvg(pub Vec3);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MassDensity(pub u16);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CellFlagsTmp(pub u16);
+
 impl Density {
     /// Full-scale value used by the quantizer (`u16::MAX`).
     pub const MAX: f32 = u16::MAX as f32;
@@ -58,7 +121,9 @@ impl Density {
     /// Decode to linear `[0, 1]` float.
     #[inline(always)]
     pub fn to_f32(self) -> f32 {
-        self.0 as f32 / Self::MAX
+        // Multiply by the reciprocal (not divide) to match C++
+        // `renderDensToFloat_` and the SIMD batch bit-for-bit.
+        self.0 as f32 * (1.0 / Self::MAX)
     }
 
     /// Decode a sqrt-compressed value: `(v/max)^2`.
@@ -83,6 +148,90 @@ impl Density {
         let v = f * Self::MAX;
         let floor = v.floor();
         Density(if rand < v - floor { floor + 1.0 } else { floor } as u16)
+    }
+}
+
+impl Density8 {
+    /// Full-scale value used by the quantizer (`u8::MAX`).
+    pub const MAX: f32 = u8::MAX as f32;
+
+    /// Linear decode (u8 storage actually uses sqrt compression; see below).
+    #[inline(always)]
+    pub fn to_f32(self) -> f32 {
+        self.0 as f32 * (1.0 / Self::MAX)
+    }
+
+    /// Sqrt-compression decode: `(v/255)^2` — the real u8 decode.
+    #[inline(always)]
+    pub fn to_f32_sqrt(self) -> f32 {
+        let f = self.to_f32();
+        f * f
+    }
+
+    /// Sqrt-compression encode: `round(sqrt(f) * 255)` — the real u8 encode
+    /// (C++ applies `doSqrtCompr` only for `sizeof(T)==1`).
+    #[inline(always)]
+    pub fn from_f32_sqrt(f: f32) -> Self {
+        debug_assert!(f.is_finite() && (0.0..=1.0).contains(&f));
+        Density8((f.sqrt() * Self::MAX).round() as u8)
+    }
+
+    /// Stochastic sqrt-compression encode.
+    #[inline(always)]
+    pub fn from_f32_sqrt_sr(f: f32, rand: f32) -> Self {
+        debug_assert!(f.is_finite() && (0.0..=1.0).contains(&f));
+        debug_assert!((0.0..1.0).contains(&rand));
+        let v = f.sqrt() * Self::MAX;
+        let floor = v.floor();
+        Density8(if rand < v - floor { floor + 1.0 } else { floor } as u8)
+    }
+}
+
+/// Batch dequantize: `Density` (u16) -> `f32` (16-wide SIMD + scalar tail).
+pub fn dequantize_density(src: &[Density], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(size_of::<Density>(), size_of::<u16>());
+    debug_assert_eq!(align_of::<Density>(), align_of::<u16>());
+    // SAFETY: `Density` is `#[repr(transparent)]` over `u16`, so the slices
+    // alias memory with identical layout.
+    let src = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, src.len()) };
+    let n = src.len();
+    let scale = f32x16::splat(1.0 / Density::MAX);
+    let mut i = 0;
+    while i + 16 <= n {
+        let u = u16x16::from_slice(&src[i..i + 16]);
+        let f: f32x16 = u.cast();
+        (f * scale).copy_to_slice(&mut dst[i..i + 16]);
+        i += 16;
+    }
+    for j in i..n {
+        dst[j] = src[j] as f32 * (1.0 / Density::MAX);
+    }
+}
+
+/// Batch quantize: `f32` -> `Density` (u16) (16-wide SIMD + scalar tail).
+pub fn quantize_density(src: &[f32], dst: &mut [Density]) {
+    assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(size_of::<Density>(), size_of::<u16>());
+    debug_assert_eq!(align_of::<Density>(), align_of::<u16>());
+    // SAFETY: as above — `Density` and `u16` share layout.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u16, dst.len()) };
+    let n = src.len();
+    let scale = f32x16::splat(Density::MAX);
+    let mut i = 0;
+    while i + 16 <= n {
+        let f = f32x16::from_slice(&src[i..i + 16]);
+        let rounded = (f * scale).round();
+        // SAFETY: `rounded` is in `[0, 65535]`, so the i32 conversion cannot
+        // overflow. `to_int_unchecked` lowers to `cvttps2dq`; the `as`-semantics
+        // `cast` (saturating) scalarizes on the baseline target.
+        let i32s: i32x16 = unsafe { rounded.to_int_unchecked::<i32>() };
+        let u: u16x16 = i32s.cast();
+        u.copy_to_slice(&mut dst[i..i + 16]);
+        i += 16;
+    }
+    for j in i..n {
+        dst[j] = Density::from_f32(src[j]).0;
     }
 }
 
@@ -309,10 +458,23 @@ macro_rules! channel_table {
 }
 
 channel_table! {
-    density:    Density,
-    velocity:   Velocity,
-    pressure:   Pressure,
-    cell_flags: CellFlags,
+    density:          Density,
+    density8:         Density8,
+    velocity:         Velocity,
+    pressure:         Pressure,
+    cell_flags:       CellFlags,
+    divergence:       Divergence,
+    cg_p:             CgP,
+    cg_q:             CgQ,
+    diagonal:         Diagonal,
+    curvature:        Curvature,
+    heat:             Heat,
+    density_diff:     DensityDiff,
+    dist_fine_coarse: DistFineCoarse,
+    velocity_air:     VelocityAir,
+    velocity_avg:     VelocityAvg,
+    mass_density:     MassDensity,
+    cell_flags_tmp:   CellFlagsTmp,
 }
 
 #[cfg(test)]
@@ -437,5 +599,56 @@ mod tests {
         t.set_pressure(grid("p", Pressure(0.0), Pressure(1.0)));
         t.get_pressure_mut().unwrap().set_voxel(3, 3, 3, Pressure(7.0));
         assert_eq!(t.get_pressure().unwrap().get_voxel(3, 3, 3), Pressure(7.0));
+    }
+
+    // Batch dequant matches the scalar path, incl. non-multiple-of-16 tails.
+    #[test]
+    fn test_batch_01_dequant_matches_scalar_odd_lengths() {
+        for n in [0usize, 1, 15, 16, 17, 4095, 4096] {
+            let src: Vec<Density> = (0..n).map(|i| Density((i * 26_543 + 1) as u16)).collect();
+            let mut got = vec![0.0f32; n];
+            dequantize_density(&src, &mut got);
+            for (i, d) in src.iter().enumerate() {
+                assert_eq!(got[i], d.to_f32(), "dequant mismatch at {i}/{n}");
+            }
+        }
+    }
+
+    // Batch quantize matches the scalar path, incl. non-multiple-of-16 tails.
+    #[test]
+    fn test_batch_02_quantize_matches_scalar_odd_lengths() {
+        for n in [0usize, 1, 15, 16, 17, 4095, 4096] {
+            let src: Vec<f32> = (0..n).map(|i| (i % 1000) as f32 / 999.0).collect();
+            let mut got = vec![Density(0); n];
+            quantize_density(&src, &mut got);
+            for (i, f) in src.iter().enumerate() {
+                assert_eq!(got[i], Density::from_f32(*f), "quantize mismatch at {i}/{n}");
+            }
+        }
+    }
+
+    // Mismatched src/dst lengths must panic.
+    #[test]
+    #[should_panic]
+    fn test_batch_03_length_mismatch_panics() {
+        let src = [Density(0); 16];
+        let mut dst = [0.0f32; 15];
+        dequantize_density(&src, &mut dst);
+    }
+
+    // Density8 endpoints must map exactly.
+    #[test]
+    fn test_density8_01_endpoints() {
+        assert_eq!(Density8(0).to_f32_sqrt(), 0.0);
+        assert_eq!(Density8(u8::MAX).to_f32_sqrt(), 1.0);
+    }
+
+    // u8 sqrt encode/decode round-trips within one quantization step.
+    #[test]
+    fn test_density8_02_sqrt_roundtrip() {
+        for f in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let back = Density8::from_f32_sqrt(f).to_f32_sqrt();
+            assert!((back - f).abs() < 1.0 / Density8::MAX, "sqrt roundtrip {f} -> {back}");
+        }
     }
 }
