@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::Vec3;
 use msbg_rs::math::{BoundaryCondition, GridAlignment, Interpolation, Sample};

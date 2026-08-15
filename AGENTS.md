@@ -48,16 +48,28 @@ cargo bench --bench interp_bench
 
 ## Benchmarks
 
-Two sizes via `MSBG_BENCH_SCALE` (default = full):
+Two knobs: `MSBG_BENCH_MACHINE` (auto-detected: `macos` → `macbook`, else
+`dell`) and `MSBG_BENCH_SCALE` (`small|big|xbig`, default `big`; `full` is an
+alias for `big`).
 
 ```bash
-MSBG_BENCH_SCALE=small cargo bench --bench allocator_benches   # fast debug cycles
-cargo bench --bench allocator_benches                          # full; ~100k blocks
+MSBG_BENCH_SCALE=small cargo bench --bench allocator_benches   # fast, identical on every machine
+cargo bench --bench allocator_benches                          # big = per-machine full stress
+MSBG_BENCH_SCALE=xbig cargo bench --bench allocator_benches    # MacBook-only aggressive (>=32GB)
 ```
 
-Full runs allocate ~100k active blocks — machines with < 7 GB RAM may OOM.
-The benches mirror `../MSBG/benchmark.cpp` scenarios A–E; see `../MSBG/AGENTS.md`
-§8 for the known asymmetries (Rust halo fill is a simplified copy, etc.).
+- `small` is the same on every machine — use it to compare the Dell (5500U)
+  against the MacBook (M3 Pro).
+- `big` is per-machine: Dell `[10k,100k,250k]` blocks / `[10k,50k,100k]` active;
+  MacBook `[100k,500k,1M]` blocks / `[50k,250k,500k]` active (~20 GB peak).
+- `xbig` (MacBook) pushes to `[100k,1M,1.5M]` blocks / `[50k,250k,750k]` active
+  (~30 GB peak). On Dell it errors out.
+
+A banner (`machine / arch / os / cores / threads`) is printed before each run.
+The C++ baseline (`../MSBG/benchmark.cpp` scenarios A–E, G) only builds on Linux;
+on macOS the benches are **Rust-only** — compare against the Dell Rust numbers,
+not C++. See `docs/refactor.md` for the aarch64 caveats (128-bit NEON vs 256-bit
+AVX2, FTZ/DAZ no-op, P/E-core asymmetry).
 
 `benches/interp_bench.rs` (field-sampling throughput) mirrors scenario G
 (`../MSBG/benchmark.cpp interp`); see `docs/refactor.md` §7 for the

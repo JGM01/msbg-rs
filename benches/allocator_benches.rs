@@ -20,47 +20,125 @@ const HSX: usize = 18;
 // Approximate occupancy fraction of the spherical-shell active-block generator.
 const SHELL_OCCUPANCY: f64 = 0.14;
 
-/// `MSBG_BENCH_SCALE=small` runs reduced sizes for fast compile/debug cycles.
-/// Anything else (or unset) runs the full stress sizes.
-#[derive(Clone, Copy, PartialEq)]
-enum Scale {
+/// Target machine. Auto-detected from the OS; override with `MSBG_BENCH_MACHINE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Machine {
+    Dell,
+    Macbook,
+}
+
+fn machine() -> Machine {
+    match env::var("MSBG_BENCH_MACHINE").as_deref() {
+        Ok("dell") => Machine::Dell,
+        Ok("macbook") => Machine::Macbook,
+        Ok(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook)"),
+        Err(_) => {
+            if cfg!(target_os = "macos") {
+                Machine::Macbook
+            } else {
+                Machine::Dell
+            }
+        }
+    }
+}
+
+/// Benchmark scale. `small` is identical on every machine (cross-machine
+/// comparison); `big` is the per-machine full stress; `xbig` is the aggressive
+/// MacBook-only stress.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Size {
     Small,
-    Full,
+    Big,
+    XBig,
 }
 
-fn scale() -> Scale {
+fn size() -> Size {
     match env::var("MSBG_BENCH_SCALE").as_deref() {
-        Ok("small") => Scale::Small,
-        _ => Scale::Full,
+        Ok("small") => Size::Small,
+        Ok("big") | Ok("full") => Size::Big,
+        Ok("xbig") => Size::XBig,
+        Ok(other) => panic!("unknown MSBG_BENCH_SCALE '{other}' (use small|big|xbig)"),
+        Err(_) => Size::Big,
     }
 }
 
-fn sample_size(s: Scale) -> usize {
+fn resolve() -> (Machine, Size) {
+    let m = machine();
+    let s = size();
+    if s == Size::XBig && m == Machine::Dell {
+        panic!("MSBG_BENCH_SCALE=xbig needs >=32GB RAM (MacBook); use big on this machine");
+    }
+    (m, s)
+}
+
+fn sample_size(s: Size) -> usize {
     match s {
-        Scale::Small => 10,
-        Scale::Full => 100,
+        Size::Small => 10,
+        Size::Big | Size::XBig => 100,
     }
 }
 
-fn blockpool_hot_counts(s: Scale) -> Vec<usize> {
-    match s {
-        Scale::Small => vec![1_000, 10_000, 50_000],
-        Scale::Full => vec![10_000, 100_000, 250_000],
+fn blockpool_hot_counts(m: Machine, s: Size) -> Vec<usize> {
+    match (m, s) {
+        (_, Size::Small) => vec![1_000, 10_000, 50_000],
+        (Machine::Dell, Size::Big) => vec![10_000, 100_000, 250_000],
+        (Machine::Macbook, Size::Big) => vec![100_000, 500_000, 1_000_000],
+        (Machine::Macbook, Size::XBig) => vec![100_000, 1_000_000, 1_500_000],
+        (Machine::Dell, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
 }
 
-fn compute_only_counts(s: Scale) -> Vec<usize> {
-    match s {
-        Scale::Small => vec![200, 1_000, 5_000],
-        Scale::Full => vec![1_000, 10_000, 50_000],
+fn compute_only_counts(m: Machine, s: Size) -> Vec<usize> {
+    match (m, s) {
+        (_, Size::Small) => vec![200, 1_000, 5_000],
+        (Machine::Dell, Size::Big) => vec![1_000, 10_000, 50_000],
+        (Machine::Macbook, Size::Big) => vec![1_000, 10_000, 50_000],
+        (Machine::Macbook, Size::XBig) => vec![10_000, 50_000, 100_000],
+        (Machine::Dell, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
 }
 
-fn active_targets(s: Scale) -> Vec<usize> {
-    match s {
-        Scale::Small => vec![1_000, 5_000, 10_000],
-        Scale::Full => vec![10_000, 50_000, 100_000],
+fn active_targets(m: Machine, s: Size) -> Vec<usize> {
+    match (m, s) {
+        (_, Size::Small) => vec![1_000, 5_000, 10_000],
+        (Machine::Dell, Size::Big) => vec![10_000, 50_000, 100_000],
+        (Machine::Macbook, Size::Big) => vec![50_000, 250_000, 500_000],
+        (Machine::Macbook, Size::XBig) => vec![50_000, 250_000, 750_000],
+        (Machine::Dell, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
+}
+
+fn cold_block_count(s: Size) -> usize {
+    match s {
+        Size::Small => 1_000,
+        Size::Big | Size::XBig => 10_000,
+    }
+}
+
+fn voxel_size(s: Size) -> usize {
+    match s {
+        Size::Small => 64,
+        Size::Big | Size::XBig => 128,
+    }
+}
+
+fn print_banner(m: Machine) {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    eprintln!(
+        "[msbg-rs bench] machine={:?} arch={} os={} logical_cores={} rayon_threads={}",
+        m,
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        cores,
+        rayon::current_num_threads(),
+    );
+}
+
+fn custom_criterion() -> Criterion {
+    print_banner(machine());
+    Criterion::default().configure_from_args()
 }
 
 /// Deterministic sparse occupancy: blocks whose center lies inside a spherical
@@ -127,11 +205,11 @@ fn thread_pool() -> &'static msbg_rs::thread_pool::Pool {
 }
 
 fn bench_hot_path_scaling(c: &mut Criterion) {
-    let s = scale();
+    let (m, s) = resolve();
     let mut group = c.benchmark_group("blockpool_hot_path");
     group.sample_size(sample_size(s));
 
-    for block_count in blockpool_hot_counts(s) {
+    for block_count in blockpool_hot_counts(m, s) {
         let blocks_per_seg = 4096; // 64 MB segments (MSBG C++ standard)
         let max_segments = (block_count / blocks_per_seg) + 2;
 
@@ -158,7 +236,7 @@ fn bench_hot_path_scaling(c: &mut Criterion) {
 }
 
 fn bench_multithreaded_contention(c: &mut Criterion) {
-    let s = scale();
+    let (_, s) = resolve();
     let mut group = c.benchmark_group("blockpool_contention");
     group.sample_size(sample_size(s));
 
@@ -196,14 +274,11 @@ fn bench_multithreaded_contention(c: &mut Criterion) {
 }
 
 fn bench_cold_extension(c: &mut Criterion) {
-    let s = scale();
+    let (_, s) = resolve();
     let mut group = c.benchmark_group("blockpool_cold_alloc");
     group.sample_size(sample_size(s));
 
-    let cold_blocks = match s {
-        Scale::Small => 1_000,
-        Scale::Full => 10_000,
-    };
+    let cold_blocks = cold_block_count(s);
 
     // Benchmark the cost of creating and expanding a pool from scratch (including OS page allocations)
     group.bench_function(format!("cold_alloc_{}_blocks", cold_blocks), |b| {
@@ -224,11 +299,11 @@ fn bench_cold_extension(c: &mut Criterion) {
 }
 
 fn bench_laplacian_compute_only(c: &mut Criterion) {
-    let s = scale();
+    let (m, s) = resolve();
     let mut group = c.benchmark_group("laplacian_compute_only");
     group.sample_size(sample_size(s));
 
-    for block_count in compute_only_counts(s) {
+    for block_count in compute_only_counts(m, s) {
         group.throughput(Throughput::Elements((block_count * N) as u64));
         group.bench_with_input(
             BenchmarkId::new("mocked_fill", block_count),
@@ -264,11 +339,11 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
 }
 
 fn bench_halo_gather(c: &mut Criterion) {
-    let s = scale();
+    let (m, s) = resolve();
     let mut group = c.benchmark_group("halo_gather");
     group.sample_size(sample_size(s));
 
-    for target in active_targets(s) {
+    for target in active_targets(m, s) {
         let (grid, active) = build_sparse_grid(target);
         let num_threads = rayon::current_num_threads();
         let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
@@ -310,11 +385,11 @@ fn bench_halo_gather(c: &mut Criterion) {
 }
 
 fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
-    let s = scale();
+    let (m, s) = resolve();
     let mut group = c.benchmark_group("laplacian_smoothing_e2e");
     group.sample_size(sample_size(s));
 
-    for target in active_targets(s) {
+    for target in active_targets(m, s) {
         let (grid, active) = build_sparse_grid(target);
         let n_active = active.len();
         let num_threads = rayon::current_num_threads();
@@ -351,14 +426,11 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
 }
 
 fn bench_voxel_access(c: &mut Criterion) {
-    let s = scale();
+    let (_, s) = resolve();
     let mut group = c.benchmark_group("voxel_access");
     group.sample_size(sample_size(s));
 
-    let size = match s {
-        Scale::Small => 64,
-        Scale::Full => 128,
-    };
+    let size = voxel_size(s);
 
     let mut grid: SparseGrid<f32, BSX, N> = SparseGrid::new(
         "voxel".to_string(),
@@ -416,16 +488,18 @@ fn bench_voxel_access(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    bench_hot_path_scaling,
-    bench_multithreaded_contention,
-    bench_cold_extension,
-    bench_voxel_access,
-    bench_laplacian_compute_only,
-    bench_halo_gather,
-    bench_laplacian_smoothing_e2e
-);
+criterion_group! {
+    name = benches;
+    config = custom_criterion();
+    targets =
+        bench_hot_path_scaling,
+        bench_multithreaded_contention,
+        bench_cold_extension,
+        bench_voxel_access,
+        bench_laplacian_compute_only,
+        bench_halo_gather,
+        bench_laplacian_smoothing_e2e
+}
 
 fn main() {
     let _ = thread_pool(); // eager build so warmup isn't charged
