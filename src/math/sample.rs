@@ -46,6 +46,11 @@ impl Dequant<f32> for f32 {
     fn dequant(self) -> f32 {
         self
     }
+
+    #[inline(always)]
+    fn copy_row(src: *const f32, dst: *mut f32, n: usize) {
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+    }
 }
 
 impl Dequant<f32> for Density {

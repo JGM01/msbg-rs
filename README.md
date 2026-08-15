@@ -10,9 +10,6 @@ well but that is secondary.
 ## Status
 
 In progress, tracked dependency-by-dependency in [`docs/roadmap.md`](docs/roadmap.md).
-Done so far: block pool, single-level sparse grid, typed channels, and field
-sampling/interpolation. Design rationale and deliberate deviations from the C++
-live in [`docs/refactor.md`](docs/refactor.md).
 
 ## Quick start
 

@@ -352,3 +352,32 @@ Micro-optimization experiments (all rejected — no significant gain):
   reads half the bytes; LLVM already vectorizes the contiguous loads.
 - `Block::_pad: [u8; 62]` is redundant (`#[repr(align(64))]` already rounds the
   size up) — a cleanup, not a perf change.
+
+---
+
+## 9. Halo / ghost gather (step 5)
+
+The C++ `fillHaloBlock_` iterates the 18³ halo as three x-segments per row
+(left halo / bulk middle / right halo) with a **per-row `getBlock`** (~324
+blockmap lookups per fill) and per-voxel `getOutOfBlockValue` for the boundary.
+The Rust port instead:
+
+- pre-resolves the **3×3×3 neighborhood to 27 raw pointers once** (empty/full
+  dummies map to their data, out-of-range blocks to the empty dummy) — 27
+  lookups vs C++'s ~324;
+- bulk-copies the middle via `Dequant::copy_row` (`memcpy` for `f32`, scalar
+  dequant for `u16`/`u8`), and resolves the two x-halo columns per row from
+  pre-resolved coords (no per-voxel `resolve_axis`);
+- makes the halo buffer **concrete `f32`** (dequantized on gather, like C++),
+  so the step-6 stencils never re-dequantize;
+- reuses `math::boundary` (`BoundaryCondition` + `resolve_axis`) for
+  Neumann/Clamp/Dirichlet — the first cross-module reuse of step 4.
+
+`fill::<FULL>` (const-generic) selects full 18³ (mean-curvature) vs faces-only
+(7-point Laplacian), mirroring C++'s `do1stOrderOnly` template param.
+
+Benchmark (scenario D, both legs, single-level): Rust ~1.8× faster than C++ on
+full fill and ~1.7× on faces-only — the gap comes from the 27-pointer
+pre-resolution and the memcpy middle (vs C++'s per-row `getBlock` + SIMD
+transfer). Note: the laptop (Ryzen 5500U) thermal-throttles under sustained
+benchmarks, so ~10% deltas are noise; this gap is far outside that.

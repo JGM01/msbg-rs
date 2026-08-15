@@ -112,18 +112,25 @@ Dirichlet }` and `GridAlignment { Corner, CellCentered }` replace C++'s
 
 ## Step 5 — Halo / ghost gather
 
-**Status:** ALMOST DONE (simplified; full parity pending)
+**Status:** DONE (single-level; fine-coarse multires deferred to step 7)
 
-**Parity target:** `src/halo.h` / `src/halo.cpp` `HaloBlockSet::fillHaloBlock_`.
+**Parity target:** `src/halo.cpp` `HaloBlockSet::fillHaloBlock_` (single-level;
+the `sgLo` multires path lands in step 7).
 
-**Scope:** the 18³ halo gather — copy a block plus its six face neighbors into a
-padded halo buffer with boundary handling, backed by a per-thread halo pool.
+**Scope:** a concrete `f32` halo buffer (`BSX + 2` cube), `fill::<FULL>` generic
+over the source element type via `Dequant<f32>` (u16/u8 density dequantized on
+gather), pre-resolving the 3×3×3 block neighborhood to 27 raw pointers, a
+contiguous middle copy (`memcpy` for `f32`), and `BoundaryCondition` reuse
+(Neumann/Clamp/Dirichlet via `math::boundary`).
 
 **Acceptance:**
-- `halo_gather` bench vs C++ `fillHaloBlock_` (scenario D in `MSBG/benchmark.cpp`).
-- Correctness: boundary/Neumann handling tests on edge blocks.
-- Note: the current Rust `fill` is a simplified copy (no multires/coarse
-  handling); full `fillHaloBlock_` parity is finalized in Step 7.
+- Boundary/awkward test matrix (domain corner/edge, partial last block, single
+  block, empty/full dummies, Neumann vs Dirichlet, full-vs-faces consistency,
+  u16 dequant) plus the 7-pt Laplacian happy path.
+- `halo_gather` bench vs C++ `fillHaloBlock_` (scenario D, both legs): Rust
+  ~1.8× faster on full fill, ~1.7× on faces-only (~4.5–5.0 vs ~2.4–3.0
+  Gvoxels/s).
+- Note: fine-coarse (multires) neighbor handling deferred to step 7.
 
 ---
 

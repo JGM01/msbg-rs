@@ -9,6 +9,15 @@ const MAX_SLOTS: usize = 8;
 /// Dequantize a stored element into the sampling domain (`f32` or `Vec3`).
 pub trait Dequant<O>: Copy + Default + Send + Sync {
     fn dequant(self) -> O;
+
+    /// Dequantize `n` contiguous elements from `src` into `dst`. The default is
+    /// a scalar loop; `f32` overrides it with a memcpy.
+    #[inline]
+    fn copy_row(src: *const Self, dst: *mut O, n: usize) {
+        for i in 0..n {
+            unsafe { *dst.add(i) = (*src.add(i)).dequant(); }
+        }
+    }
 }
 
 /// Gather the `(dmax + 1)^3` stencil window anchored at `(ix0, iy0, iz0)`,

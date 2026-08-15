@@ -10,7 +10,7 @@ const FLUID_MASK: u16 = 1 | 4 | 4096;
 /// Hardcoded for 16-wide registers (BSX=16).
 #[inline(always)]
 pub fn kernel_laplacian_simd_16<const N: usize>(
-    halo: &HaloBlock<f32, 16, 18>,
+    halo: &HaloBlock<16, 18>,
     flags_block: &Block<u16, 16, N>,
     output: &mut Block<f32, 16, N>,
 ) {
@@ -72,7 +72,7 @@ mod laplacian_tests {
 
     /// Slow scalar 7-point Laplacian (reference)
     fn scalar_laplacian_7pt(
-        halo: &HaloBlock<f32, BSX, HSX>,
+        halo: &HaloBlock<BSX, HSX>,
         flags: &Block<u16, BSX, N>,
         out: &mut Block<f32, BSX, N>,
     ) {
@@ -106,7 +106,7 @@ mod laplacian_tests {
 
     /// Build a HaloBlock filled with a known analytic field: f = x² + y² + z²
     /// (Laplacian of this field is constantly 6)
-    fn fill_halo_quadratic(halo: &mut HaloBlock<f32, BSX, HSX>) {
+    fn fill_halo_quadratic(halo: &mut HaloBlock<BSX, HSX>) {
         // Halo coordinates run [-1 … 16] relative to the interior block
         for z in 0..HSX {
             for y in 0..HSX {
@@ -123,7 +123,7 @@ mod laplacian_tests {
 
     #[test]
     fn test_lap_01_quadratic_field_laplacian_is_six() {
-        let mut halo = HaloBlock::<f32, BSX, HSX>::new();
+        let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_quadratic(&mut halo);
 
         // all zeros = fluid
@@ -145,7 +145,7 @@ mod laplacian_tests {
 
     #[test]
     fn test_lap_02_mask_preserves_solid_cells() {
-        let mut halo = HaloBlock::<f32, BSX, HSX>::new();
+        let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_quadratic(&mut halo);
 
         let mut flags = Block::<u16, BSX, N>::new();
@@ -177,7 +177,7 @@ mod laplacian_tests {
 
     #[test]
     fn test_lap_03_simd_matches_scalar_reference() {
-        let mut halo = HaloBlock::<f32, BSX, HSX>::new();
+        let mut halo = HaloBlock::<BSX, HSX>::new();
 
         // Random-ish but deterministic field
         for (i, v) in halo.data.iter_mut().enumerate() {
@@ -223,7 +223,7 @@ mod laplacian_tests {
     #[test]
     fn test_lap_04_air_and_void_also_masked() {
         // Exercise the other two bits of FLUID_MASK
-        let mut halo = HaloBlock::<f32, BSX, HSX>::new();
+        let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_quadratic(&mut halo);
 
         let mut flags = Block::<u16, BSX, N>::new();

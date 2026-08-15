@@ -1,6 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use msbg_rs::{
     blockpool::{Block, BlockPool},
+    math::BoundaryCondition,
     math::laplacian::kernel_laplacian_simd_16,
     multires::halo::HaloBlockPool,
     sparse_grid::{BlockPtr, SparseGrid},
@@ -234,7 +235,7 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
             &block_count,
             |b, &count| {
                 let num_threads = rayon::current_num_threads();
-                let halo_pool = HaloBlockPool::<f32, BSX, HSX>::new(num_threads);
+                let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
 
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
                 let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
@@ -270,18 +271,34 @@ fn bench_halo_gather(c: &mut Criterion) {
     for target in active_targets(s) {
         let (grid, active) = build_sparse_grid(target);
         let num_threads = rayon::current_num_threads();
-        let halo_pool = HaloBlockPool::<f32, BSX, HSX>::new(num_threads);
+        let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
 
         group.throughput(Throughput::Elements((active.len() * N) as u64));
         group.bench_with_input(
-            BenchmarkId::new("shell_fill", target),
+            BenchmarkId::new("shell_fill_full", target),
             &active,
             |b, active| {
                 b.iter(|| {
                     thread_pool().install(|| {
                         active.par_iter().for_each(|&bid| {
                             let halo = unsafe { halo_pool.get_mut() };
-                            halo.fill(&grid, bid);
+                            halo.fill::<true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                            black_box(halo.data.as_ref());
+                        });
+                    });
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("shell_fill_faces", target),
+            &active,
+            |b, active| {
+                b.iter(|| {
+                    thread_pool().install(|| {
+                        active.par_iter().for_each(|&bid| {
+                            let halo = unsafe { halo_pool.get_mut() };
+                            halo.fill::<false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
                             black_box(halo.data.as_ref());
                         });
                     });
@@ -301,7 +318,7 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
         let (grid, active) = build_sparse_grid(target);
         let n_active = active.len();
         let num_threads = rayon::current_num_threads();
-        let halo_pool = HaloBlockPool::<f32, BSX, HSX>::new(num_threads);
+        let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
 
         let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); n_active];
         let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
@@ -320,7 +337,7 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
                                 let halo = unsafe { halo_pool.get_mut() };
 
                                 // True gather latency from 6 spatial boundaries across RAM
-                                halo.fill(&grid, bid);
+                                halo.fill::<false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
 
                                 kernel_laplacian_simd_16(halo, flags_block, out_block);
                             });
