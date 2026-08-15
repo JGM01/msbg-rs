@@ -17,3 +17,7 @@ harness = false
 [[bench]]
 name = "density_bench"
 harness = false
+
+[[bench]]
+name = "interp_bench"
+harness = false

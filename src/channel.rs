@@ -1,31 +1,24 @@
-//! Typed data channels over `SparseGrid`.
+//! Typed data channels over [`SparseGrid`](crate::sparse_grid::SparseGrid).
 //!
-//! Step 3 of the port: a typed channel table replaces the C++ `int`-based
-//! channel enum + `void** channelPointers` type-punning. Each channel carries
-//! its element type at compile time; wrong-type access is a compile error.
+//! A fluid simulation tracks many scalar and vector fields — density, pressure,
+//! velocity, cell flags, and more. Rather than magic `int` channel ids, each
+//! channel is its own type ([`Density`], [`Pressure`], [`Velocity`], ...), so a
+//! field's element type is known at compile time and cross-channel mixing is a
+//! compile error.
+//!
+//! [`ChannelTable`] owns one `SparseGrid` per channel with typed `get_*` /
+//! `set_*` accessors; [`ChannelId`] and [`ChannelRef`] allow type-erased
+//! iteration over the channels a table currently holds.
 //!
 //! ```compile_fail
 //! use msbg_rs::channel::{ChannelTable, Density};
 //! use msbg_rs::sparse_grid::SparseGrid;
-//! let mut t = ChannelTable::<16, 4096>::new();
-//! // `get_pressure()` yields `SparseGrid<Pressure>`; ascribing `SparseGrid<Density>` must not compile.
+//!
+//! let t = ChannelTable::<16, 4096>::new();
+//! // `get_pressure()` yields `SparseGrid<Pressure>`; ascribing it to
+//! // `SparseGrid<Density>` is a type error.
 //! let _: &SparseGrid<Density, 16, 4096> = t.get_pressure().unwrap();
 //! ```
-//!
-//! TODO(step3): SIMD batch for `Density8` (u8 path); only the u16 `Density`
-//! batch is implemented — that's what the benchmark measures.
-//! TODO(step3): stochastic-quantize batch (`quantize_sr` over a slice).
-//! TODO(step3): `PSFloat`/`double` pressure under `SOLVE_PRESSURE_DOUBLE`.
-//! TODO(step3): directional face channels (`face_area`/`face_coeff` × 3 dirs) —
-//! multigrid-specific; needs a 3-grid or Vec3 modeling decision.
-//! TODO(step3): `FaceDensity` (Vec3u16) render channel.
-//! TODO(step3): remaining C++ channels (CH_FLOAT_2/3/4/5/7/8, CH_VEC3_2/3/4,
-//! velocityAirDiff, sootDiff, heatDiff, genUint*, floatTmp*).
-//! TODO(step8): `prepareDataAccess` / `resetChannel` / `protectChannel`
-//! semantics (write-lock tokens) — needed by the solvers.
-//! TODO(step7): make the table per-level (multires); today it is single-level.
-//! TODO(step3): shared byte-arena pool for lower peak DRAM — a separate
-//! `BlockPool` redesign, orthogonal to this module.
 
 use crate::sparse_grid::SparseGrid;
 use std::mem::{align_of, size_of};
@@ -63,8 +56,8 @@ pub struct Velocity(pub Vec3);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Density8(pub u8);
 
-// Solver/render channels — one distinct newtype per channel so the type system
-// rejects cross-channel mixing (Pressure vs Divergence vs Curvature, ...).
+// Solver/render channels: One newtype per channel to make the compiler
+// reject cross-channel mixing (Pressure vs Divergence vs Curvature, etc).
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -122,7 +115,7 @@ impl Density {
     #[inline(always)]
     pub fn to_f32(self) -> f32 {
         // Multiply by the reciprocal (not divide) to match C++
-        // `renderDensToFloat_` and the SIMD batch bit-for-bit.
+        // `renderDensToFloat_` and the SIMD batch.
         self.0 as f32 * (1.0 / Self::MAX)
     }
 
@@ -161,14 +154,14 @@ impl Density8 {
         self.0 as f32 * (1.0 / Self::MAX)
     }
 
-    /// Sqrt-compression decode: `(v/255)^2` — the real u8 decode.
+    /// Sqrt-compression decode: `(v/255)^2`
     #[inline(always)]
     pub fn to_f32_sqrt(self) -> f32 {
         let f = self.to_f32();
         f * f
     }
 
-    /// Sqrt-compression encode: `round(sqrt(f) * 255)` — the real u8 encode
+    /// Sqrt-compression encode: `round(sqrt(f) * 255)`
     /// (C++ applies `doSqrtCompr` only for `sizeof(T)==1`).
     #[inline(always)]
     pub fn from_f32_sqrt(f: f32) -> Self {
@@ -239,6 +232,21 @@ impl Vec3 {
     #[inline(always)]
     pub fn new(x: f32, y: f32, z: f32) -> Self {
         Vec3([x, y, z])
+    }
+
+    #[inline(always)]
+    pub fn x(self) -> f32 {
+        self.0[0]
+    }
+
+    #[inline(always)]
+    pub fn y(self) -> f32 {
+        self.0[1]
+    }
+
+    #[inline(always)]
+    pub fn z(self) -> f32 {
+        self.0[2]
     }
 
     #[inline(always)]
@@ -495,7 +503,7 @@ mod tests {
         SparseGrid::new(name.to_string(), 32, 32, 32, empty, full, pool)
     }
 
-    // Boundary: dequant endpoints must map exactly.
+    // dequant endpoints must map exactly.
     #[test]
     fn test_density_01_endpoints() {
         assert_eq!(Density(0).to_f32(), 0.0);
@@ -542,7 +550,7 @@ mod tests {
         assert_eq!(v * 2.0, Vec3::new(2.0, 4.0, 4.0));
     }
 
-    // Empty table: nothing present.
+    // nothing present.
     #[test]
     fn test_table_01_empty() {
         let t = ChannelTable::<BSX, N>::new();

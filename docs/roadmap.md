@@ -46,43 +46,67 @@ allocated blocks whose unwritten voxels read back as `empty_value`.
 
 ## Step 3 — Typed channels & density dequantization
 
-**Status:** DONE (for a lot of the channels, i didnt include all of them)
+**Status:** DONE (core set — typed table + dequant + the channels steps 4–6
+need; remaining channels re-tagged to steps 7–9 in `channel.rs`)
 
-**Parity target:** MSBG's channel enum (`src/msbg.h`, `CH_FLOAT_1`…`CH_CELL_FLAGS`)
+**Parity target:** MSBG's channel enum (`src/msbg.h`, `CH_FLOAT_1`…`CH_HEAT_DIFF`)
 and `renderDensToFloat_` / `renderDensFromFloat_` (density ↔ quantized storage).
 
-**Scope:** replace magic `int` channel ids with typed channels. A `Channel<T>`
-identifier carrying its element type, a `ChannelTable` that owns one
+**Scope:** replace magic `int` channel ids with typed channels: a per-channel
+newtype carrying its element type, a `ChannelId` enum plus `ChannelRef`/
+`ChannelRefMut` for type-erased iteration, a `ChannelTable` that owns one
 `SparseGrid<T>` per channel with safe typed access, and concrete element types:
-`Density` (quantized `u16`), `Velocity` (`Vec3f32`), `Pressure` (`f32`),
-`CellFlags` (`u16` bitfield). Density dequantization is an explicit typed
-`Density::to_f32` / `from_f32`.
+`Density` (quantized `u16`), `Density8` (`u8`), `Velocity` (`Vec3f32`),
+`Pressure` (`f32`), `CellFlags` (`u16`). Density dequantization is an explicit
+typed `Density::to_f32` / `from_f32` (+ sqrt/stochastic + SIMD batch).
 
 **Acceptance:**
 - Typed insert/retrieve tests on `ChannelTable` (wrong-type access fails to
   compile or is safely rejected).
 - Dequantize round-trip and range tests.
 - Benchmark: channel lookup overhead is negligible vs raw `SparseGrid` access
-  (lookup happens once per block sweep, not per voxel).
+  (lookup happens once per block sweep, not per voxel). *(deferred — not
+  measurable until channels are wired into a sweep in steps 4/6; only the
+  dequant/quant batches are benched today in `density_bench`.)*
+
+**Note:** the step-4 sampler is generic over `SparseGrid<T>` via `InterpElem`
+(`Density`, `Density8`, `Pressure`, …), but it does not go through the
+`ChannelTable`/`ChannelId` enums yet — that indirection lands with the multires
+work (step 7). `laplacian`/`halo`/`BlockIterator` still operate on raw
+`SparseGrid<f32>`/`Block<u16>`.
 
 ---
 
 ## Step 4 — Field sampling & interpolation
 
-**Status:** KINDA (trilinear only)
+**Status:** DONE
 
 **Parity target:** `src/msbg.cpp` `interpolateScalarFast2` / `interpolate`, and
-`src/sbg.h` `interpolateWithDerivs` with `IP_BSPLINE_CUBIC`.
+`src/sbg.h` `interpolateFloatFast` / `interpolateLinearWithGradient` /
+`interpolateUint16ToFloatFast` / `interpolateWithDerivs`
+(`IP_BSPLINE_CUBIC`) / `interpolateWithSecondDerivs`.
 
-**Scope:** a `Sample`/`Field3` trait exposing `sample(pos) -> f32` and
-`gradient(pos) -> Vec3`, implemented over a channel. Trilinear interpolation,
-then cubic B-spline interpolation with derivatives (analytic gradient).
+**Scope:** a `Sample` / `SampleVec3` trait (+ stateful `Sampler` /
+`SamplerVec3` wrappers) over `SparseGrid<T>`, generic over element type via
+`InterpElem` (dequant). Trilinear and cubic B-spline value + analytic gradient,
+cubic Hessian, and a Vec3 sampler. `BoundaryCondition { Clamp, Neumann,
+Dirichlet }` and `GridAlignment { Corner, CellCentered }` replace C++'s
+`OPT_IPBC_*`/`OPT_IPCORNER` flags; `const IP: Interpolation` dispatch.
 
 **Acceptance:**
-- Property tests against analytic fields (e.g. `f = x²+y²+z²` gives
-  `∇f = 2·(x,y,z)`).
-- Benchmark: interpolation throughput vs the C++ `interpolate*` path, using only
-  a Step 2/3 grid (no halo, no solver).
+- Property tests against analytic fields (affine reproduced exactly by both
+  methods; gradient/hessian cross-checked against finite differences) plus a
+  boundary/awkward/weird test matrix (block-boundary straddle, partial last
+  block, single-voxel grid, dummy blocks, Dirichlet/Neumann/Clamp, u16 dequant).
+- Tolerance-based difftest vs the C++ `interpolate*` path
+  (`tests/difftest_interp.rs` + `../MSBG/interptest.cpp`): value/grad/Hessian
+  match within 1e-4 (not bit-exact — Rust uses f32 + FMA, C++ uses `double`).
+- Benchmark (`benches/interp_bench.rs` + `../MSBG` scenario G): linear value at
+  parity, cubic value+grad ~20% faster, cubic Hessian parity-to-faster, linear
+  value+grad ~10% slower (see refactor.md §7 for rationale).
+
+**Note:** fine-coarse (`CH_DIST_FINECOARSE`) level blending is deferred to step
+7; `interpolate`'s multires alpha-blend builds on this single-level sampler.
 
 ---
 
@@ -134,6 +158,10 @@ here.
 (level + flags), the refinement map and its regularization, and coarse-level
 ghost sampling (finishes the `fillHaloBlock_` parity from Step 5).
 
+**Channels added here:** per-level tables (today's `ChannelTable` is
+single-level), and the directional face channels `face_area`/`face_coeff`
+(× 3 directions; a 3-grid or Vec3 modeling decision).
+
 **Acceptance:**
 - Refinement-map correctness: legal transitions, `bi->level` semantics.
 - "Coarse sample == fine downsample" consistency checks.
@@ -153,6 +181,12 @@ new — referenced in MSBG but not implemented there).
 **Scope:** mean-curvature/Laplacian smoothing, redistancing, and the multigrid
 Laplacian (matrix-vector product + relaxation + CG) used by pressure projection.
 
+**Channels added here:** the remaining scratch channels (`CH_FLOAT_2/3/4/5/6/7/8`,
+`CH_FLOAT_TMP_3`, `CH_DIVERGENCE_ADJ`, `CH_VEC3_2/3/4`, `velocityAirDiff`,
+`sootDiff`, `heatDiff`, `pressureOld`, `genUint16*`/`uint8*`), the
+stochastic-quantize batch, and `prepareDataAccess` / `resetChannel` /
+`protectChannel` semantics.
+
 **Acceptance:**
 - Convergence tests on known problems (e.g. Laplace's equation, a known eikonal
   distance field).
@@ -171,6 +205,13 @@ lock-free particle splatting, finalize, active-block determination).
 
 **Scope:** read particles, splat them into a density channel, determine active
 blocks, and run the Step 8 smoother — the "bunny" pipeline without rendering.
+
+**Channels added here:** `FaceDensity` (Vec3u16) render channel, particle/uint8
+tmp channels, and the SIMD batch for `Density8` (8-bit build path).
+
+Deferred (no step owns them yet): `PSFloat`/`double` pressure (opt-in build),
+and a shared byte-arena pool for lower peak DRAM (a separate `BlockPool`
+redesign).
 
 **Acceptance:**
 - A `.ply` produces a density field with the expected block occupancy.
