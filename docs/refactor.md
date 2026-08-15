@@ -240,9 +240,67 @@ src/
   channels.rs
   relax.rs          // In-place solvers (Red-Black Gauss-Seidel)
   lib.rs
-benches/
-  bench_blockpool.rs
-tests/
-  difftest_cpp.rs   // Differential testing against C++ baseline
+  benches/
+    bench_blockpool.rs
+  tests/
+    difftest_cpp.rs   # Differential testing against C++ baseline
 
 ```
+
+---
+
+## 7. Field sampling & interpolation (step 4)
+
+The C++ interpolation layer (`sbg.h`) is ~40 template functions with three
+interleaved dispatch paths (domain-border / within-block / straddle) plus
+academic code (WENO, cubic-mono, quadratic, ghost, dense-scalar, coherence
+cache). The Rust port collapses this to four small modules:
+
+```
+src/math/
+  sample.rs     # InterpElem/Sample/SampleVec3 traits, Sampler structs, reducers
+  bspline.rs    # const cubic B-spline weights (value / 1st / 2nd derivative)
+  gather.rs     # stencil-window gather (branchless fast path + 8-slot fallback)
+  boundary.rs   # BoundaryCondition / GridAlignment / Interpolation + resolve_axis
+```
+
+Deliberate deviations from C++ (each a win or a wash, none a 1:1 port):
+
+- **f32-only arithmetic.** C++ computes the trilinear value/gradient in `double`
+  (`MtTrilinearInterpolationOld`). Rust stays in f32 (FMA via `mul_add`), which
+  is faster and changes results by ≤1 ulp — hence the *tolerance-based* difftest.
+- **Unified branchless gather.** One `gather` serves linear and cubic windows:
+  a single mask selects a fast path (window inside one block + domain → one
+  blockmap lookup, direct index math, no BC branch) vs. an 8-slot fallback
+  (resolve the ≤8 surrounding blocks once; empty/full dummies map to their
+  materialized dummy-block data so reads are unconditional). This replaces
+  C++'s three-path dispatch.
+- **Dequant-per-corner.** `Dequant::dequant` (the `InterpElem` /
+  `InterpVec3Elem` marker traits) linearizes a stored sample before
+  interpolation. For `Density` (u16) and `Density8` (u8) this is equivalent to
+  C++'s "interpolate in storage units, scale once at the end" for linear/cubic
+  (scaling commutes with the affine weights); for sqrt-compressed `Density8`
+  the sampler returns the interpolated sqrt-space value (square it to recover a
+  physical density), matching C++'s render path. `gather_map` applies it inline
+  so there is no intermediate `[D; W]` scratch array.
+- **Not ported (dead/academic):** `interpolateGhost`, `interpolateDenseScalarFast`,
+  `IpolAccessCache` (never used in the live C++ scalar path),
+  `interpolateWithSecondDerivs`' `Vec4d` double-gradient accumulation (Rust uses
+  f32), `IP_WENO4` / `IP_CUBIC_MONO(_2)` / `IP_LINEAR_FADE` /
+  `IP_LINEAR_DIVERGENCE_FREE`, `wenoParabola`, `Interpolate1D_MINMOD`.
+
+Benchmark (scenario G, `../MSBG/benchmark.cpp interp` vs `benches/interp_bench.rs`,
+96³ grid, 100k pseudo-random interior samples): at parity with C++ on linear
+value, ~10% slower on linear value+grad, and **faster on cubic** (value+grad
+~20% faster, Hessian parity-to-faster). Two findings drove this: (1) the first
+cut was ~3× slower on linear until a within-block fast path was added (the
+unified 8-slot gather paid 8 blockmap lookups per sample vs C++'s 1); (2) the
+cubic y/z accumulation became FMAs via `mul_add` (`val += wy*wz*sx` → `val =
+sx.mul_add(wy*wz, val)`), since LLVM won't reassociate FP — a ~10% win. `#[inline]`
+(not `always`) on the trait methods is required for cross-crate inlining.
+
+Two rejected experiments: a 4-lane SIMD trilinear gradient (4×8 dot products)
+was ~3× the op count of the Maxima-factored `MtTrilinearInterpolationOld`
+formula (which is op-minimal — ~32 flops), so it was reverted; and a
+closure-based dequant (`Fn(D) -> O`) didn't inline reliably (linear value
+regressed 33 → 24 Ms/s), so the gather uses a `Dequant<O>` trait method instead.
