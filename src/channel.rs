@@ -1,7 +1,6 @@
 //! Typed data channels over `SparseGrid`.
-//!
-//! Step 3 of the port: a typed channel table replaces the C++ `int`-based
-//! channel enum + `void** channelPointers` type-punning. Each channel carries
+//! Typed channel table replaces the C++ `int`-based
+//! channel enum + `void** channelPointers` types. Each channel carries
 //! its element type at compile time; wrong-type access is a compile error.
 //!
 //! ```compile_fail
