@@ -21,6 +21,9 @@ hands out blocks across thread-safe segments.
   vs the C++ `BlockPool` (scenarios A/B/C in `MSBG/benchmark.cpp`).
 - Current result: hot path ~2× faster than C++ (relaxed atomic + zero header
   writes); contention leg uses the same `blocks_per_seg = 4096` as C++.
+- Cross-platform: benches are sized by `Machine { Dell, Macbook }` ×
+  `Size { Small, Big, XBig }` (`MSBG_BENCH_MACHINE` / `MSBG_BENCH_SCALE`);
+  macOS runs are Rust-only (no C++ baseline) — see refactor.md §10.
 
 ---
 

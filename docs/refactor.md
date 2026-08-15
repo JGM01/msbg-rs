@@ -381,3 +381,29 @@ full fill and ~1.7× on faces-only — the gap comes from the 27-pointer
 pre-resolution and the memcpy middle (vs C++'s per-row `getBlock` + SIMD
 transfer). Note: the laptop (Ryzen 5500U) thermal-throttles under sustained
 benchmarks, so ~10% deltas are noise; this gap is far outside that.
+
+---
+
+## 10. Cross-platform benchmarking (Dell 5500U vs M3 Pro)
+
+The benches are sized by `Machine { Dell, Macbook }` × `Size { Small, Big,
+XBig }` (`MSBG_BENCH_MACHINE`, `MSBG_BENCH_SCALE`). `small` is identical on both
+machines for apples-to-apples comparison; `big` is the per-machine stress
+(MacBook ~20 GB peak); `xbig` is the MacBook-only ~30 GB peak. On macOS there is
+no C++ baseline (that is the point), so MacBook runs are compared against the
+Dell *Rust* numbers only.
+
+aarch64 caveats to keep in mind when reading M3 Pro numbers:
+
+- **128-bit NEON vs 256-bit AVX2.** `f32x16` lowers to 4 NEON ops on aarch64 vs
+  2 AVX2 ops on the 5500U. Per-core FMA width is comparable (4×128 ≈ 2×256 per
+  cycle), so compute-bound kernels are ~per-core-neutral; the M3's edge is
+  memory bandwidth (~150 vs ~50 GB/s), more real cores (12 vs 6c/12t SMT), and
+  higher IPC.
+- **`enable_ftz_daz` is a no-op on aarch64** (x86 MXCSR only). ARM handles
+  denormals in hardware, so no microcode-assist hazard; only relevant if a
+  kernel ever generates denormals.
+- **P/E asymmetry.** The M3 Pro's 6 efficiency cores are much slower than its 6
+  performance cores, and rayon has no P/E affinity — multithreaded benches may
+  scale sub-linearly past ~6 threads (E-core stragglers). If observed, the fix
+  is P-core pinning / thread-count tuning (follow-up, not yet done).
