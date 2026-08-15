@@ -1,5 +1,5 @@
 use std::{
-    alloc::{Layout, alloc_zeroed, dealloc},
+    alloc::{Layout, alloc, dealloc},
     ptr::NonNull,
     sync::{
         Mutex,
@@ -53,6 +53,15 @@ where
     }
 }
 
+impl<D, const BSX: usize, const N: usize> Default for Block<D, BSX, N>
+where
+    D: Copy + Default + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lock-free & monotonic allocator
 pub struct BlockPool<D, const BSX: usize, const N: usize>
 where
@@ -103,26 +112,34 @@ where
         }
     }
 
+    /// Allocate a block, or `None` once the pool is exhausted.
     #[inline]
-    pub fn alloc_block(&self) -> NonNull<Block<D, BSX, N>> {
+    pub fn try_alloc_block(&self) -> Option<NonNull<Block<D, BSX, N>>> {
         let index = self.next_free.fetch_add(1, Ordering::Relaxed);
         let seg_idx = index >> self.blocks_per_seg_log2;
+
+        let seg_ptr = self.segments.get(seg_idx)?.load(Ordering::Acquire);
+        let seg_ptr = if seg_ptr.is_null() {
+            self.extend_pool(seg_idx)
+        } else {
+            seg_ptr
+        };
+
         let block_idx = index & self.blocks_per_seg_mask;
+        unsafe { Some(NonNull::new_unchecked(seg_ptr.add(block_idx))) }
+    }
 
-        assert!(
-            seg_idx < self.segments.len(),
-            "BlockPool memory limit exhausted"
-        );
+    /// Infallible allocation; panics when the pool is exhausted.
+    #[inline]
+    pub fn alloc_block(&self) -> NonNull<Block<D, BSX, N>> {
+        self.try_alloc_block()
+            .expect("BlockPool memory limit exhausted")
+    }
 
-        let mut seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
-        if seg_ptr.is_null() {
-            seg_ptr = self.extend_pool(seg_idx);
-        }
-
-        unsafe {
-            let block_ptr = seg_ptr.add(block_idx);
-            NonNull::new_unchecked(block_ptr)
-        }
+    /// Blocks handed out since the last `reset` (monotonic cursor).
+    #[inline]
+    pub fn allocated(&self) -> usize {
+        self.next_free.load(Ordering::Relaxed)
     }
 
     #[cold]
@@ -137,8 +154,9 @@ where
         // Create a memory layout for `blocks_per_seg` contiguous blocks
         let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg).unwrap();
 
-        // Ask OS for zeroed memory
-        let raw_ptr = unsafe { alloc_zeroed(layout) } as *mut Block<D, BSX, N>;
+        // Ask OS for memory (uninitialized: callers that need defined
+        // values must initialize the block themselves)
+        let raw_ptr = unsafe { alloc(layout) } as *mut Block<D, BSX, N>;
 
         if raw_ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
@@ -150,7 +168,7 @@ where
 
     #[inline]
     pub fn reset(&self) {
-        self.next_free.store(0, Ordering::Release);
+        self.next_free.store(0, Ordering::Relaxed);
     }
 }
 
@@ -308,25 +326,26 @@ mod block_tests {
     }
 
     #[test]
-    #[should_panic(expected = "BlockPool memory limit exhausted")]
-    fn test_pol_06_oom_panics_when_exhausted() {
+    fn test_pol_06_exhaustion() {
         // Capacity = 1 segment * 2 blocks = 2 blocks total
         let pool: BlockPool<f32, 16, 4096> = BlockPool::new(1, 2);
-        let _ = pool.alloc_block();
-        let _ = pool.alloc_block();
-
-        // 3rd allocation exhausts pool and panics
-        let _ = pool.alloc_block();
+        assert!(pool.try_alloc_block().is_some());
+        assert!(pool.try_alloc_block().is_some());
+        assert!(pool.try_alloc_block().is_none()); // bound: exhausted
     }
 
     #[test]
     fn test_pol_07_allocation_reset() {
         let pool: BlockPool<f32, 16, 4096> = BlockPool::new(2, 4);
 
+        assert_eq!(pool.allocated(), 0);
+
         let first_pass_ptr = pool.alloc_block();
         let _ = pool.alloc_block();
+        assert_eq!(pool.allocated(), 2);
 
         pool.reset();
+        assert_eq!(pool.allocated(), 0);
 
         // Re-allocate: Should reuse segment 0 and return the same first pointer
         let second_pass_ptr = pool.alloc_block();

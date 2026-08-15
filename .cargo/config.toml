@@ -1,0 +1,5 @@
+[build]
+# Match the C++ side's `-march=native`. Without this the crate targets baseline
+# x86-64 (SSE2 only), which silently scalarizes the SIMD kernels and makes all
+# benches compare Rust-SSE2 against C++-AVX2.
+rustflags = ["-C", "target-cpu=native"]
