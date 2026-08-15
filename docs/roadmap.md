@@ -46,7 +46,7 @@ allocated blocks whose unwritten voxels read back as `empty_value`.
 
 ## Step 3 — Typed channels & density dequantization
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE (for a lot of the channels, i didnt include all of them)
 
 **Parity target:** MSBG's channel enum (`src/msbg.h`, `CH_FLOAT_1`…`CH_CELL_FLAGS`)
 and `renderDensToFloat_` / `renderDensFromFloat_` (density ↔ quantized storage).
