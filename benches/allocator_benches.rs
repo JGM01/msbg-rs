@@ -2,8 +2,11 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use msbg_rs::{
     blockpool::{Block, BlockPool},
     math::BoundaryCondition,
-    math::laplacian::kernel_laplacian_simd_16,
-    multires::halo::HaloBlockPool,
+    math::laplacian::kernel_laplacian,
+    math::meancurv::kernel_meancurv,
+    math::simd::LANES,
+    math::stencil::MaskBlock,
+    multires::halo::{HaloBlock, HaloBlockPool},
     sparse_grid::{BlockPtr, SparseGrid},
 };
 use rayon::iter::{
@@ -16,6 +19,7 @@ use std::{env, hint::black_box, sync::Arc};
 const BSX: usize = 16;
 const N: usize = 4096;
 const HSX: usize = 18;
+const CHUNKS: usize = N / LANES;
 
 // Approximate occupancy fraction of the spherical-shell active-block generator.
 const SHELL_OCCUPANCY: f64 = 0.14;
@@ -74,7 +78,10 @@ fn resolve() -> (Machine, Size) {
 fn sample_size(s: Size) -> usize {
     match s {
         Size::Small => 10,
-        Size::Big | Size::XBig => 100,
+        Size::Big => 100,
+        // xbig legs run ~0.6-1.8s each at 500k-750k active; 100 samples grinds
+        // for minutes and thermal-throttles the M3 Pro, so keep it short.
+        Size::XBig => 20,
     }
 }
 
@@ -306,28 +313,65 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
     for block_count in compute_only_counts(m, s) {
         group.throughput(Throughput::Elements((block_count * N) as u64));
         group.bench_with_input(
-            BenchmarkId::new("mocked_fill", block_count),
+            BenchmarkId::new("kernel_only", block_count),
             &block_count,
             |b, &count| {
-                let num_threads = rayon::current_num_threads();
-                let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
+                // Real data: gather one halo from a real block once (gather is
+                // measured separately in halo_gather), build the fluid mask
+                // once, then time only the kernel over `count` fresh outputs.
+                let (grid, active) = build_sparse_grid(1);
+                let bid = active[0];
+                let mut halo = HaloBlock::<BSX, HSX>::new();
+                halo.fill::<1, false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                let flags = Block::<u16, BSX, N>::new();
+                let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
+                let dt = 0.05;
 
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
-                let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); count];
 
                 b.iter(|| {
-                    // Using zip so we can iterate both arrays together
                     thread_pool().install(|| {
                         output_blocks
                             .par_iter_mut()
-                            .zip(flags_blocks.par_iter())
-                            .for_each(|(out_block, flags_block)| {
-                                let halo = unsafe { halo_pool.get_mut() };
+                            .for_each(|out_block| {
+                                kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, out_block);
+                            });
+                    });
+                    black_box(&mut output_blocks);
+                });
+            },
+        );
+    }
+    group.finish();
+}
 
-                                // Mocking the memory bandwidth of gathering the neighborhood via memset
-                                halo.mock_fill_for_bench();
+fn bench_mean_curvature_compute_only(c: &mut Criterion) {
+    let (m, s) = resolve();
+    let mut group = c.benchmark_group("mean_curvature_compute_only");
+    group.sample_size(sample_size(s));
 
-                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+    for block_count in compute_only_counts(m, s) {
+        group.throughput(Throughput::Elements((block_count * N) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("kernel_only", block_count),
+            &block_count,
+            |b, &count| {
+                let (grid, active) = build_sparse_grid(1);
+                let bid = active[0];
+                let mut halo = HaloBlock::<BSX, HSX>::new();
+                halo.fill::<1, true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                let flags = Block::<u16, BSX, N>::new();
+                let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
+                let dt = 0.05;
+
+                let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
+
+                b.iter(|| {
+                    thread_pool().install(|| {
+                        output_blocks
+                            .par_iter_mut()
+                            .for_each(|out_block| {
+                                kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, out_block);
                             });
                     });
                     black_box(&mut output_blocks);
@@ -357,7 +401,7 @@ fn bench_halo_gather(c: &mut Criterion) {
                     thread_pool().install(|| {
                         active.par_iter().for_each(|&bid| {
                             let halo = unsafe { halo_pool.get_mut() };
-                            halo.fill::<true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                            halo.fill::<1, true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
                             black_box(halo.data.as_ref());
                         });
                     });
@@ -373,7 +417,7 @@ fn bench_halo_gather(c: &mut Criterion) {
                     thread_pool().install(|| {
                         active.par_iter().for_each(|&bid| {
                             let halo = unsafe { halo_pool.get_mut() };
-                            halo.fill::<false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                            halo.fill::<1, false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
                             black_box(halo.data.as_ref());
                         });
                     });
@@ -397,6 +441,7 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
 
         let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); n_active];
         let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
+        let dt = 0.05;
 
         group.throughput(Throughput::Elements((n_active * N) as u64));
         group.bench_with_input(
@@ -412,9 +457,53 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
                                 let halo = unsafe { halo_pool.get_mut() };
 
                                 // True gather latency from 6 spatial boundaries across RAM
-                                halo.fill::<false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                                halo.fill::<1, false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                                let mask = MaskBlock::<LANES, CHUNKS>::build(flags_block);
 
-                                kernel_laplacian_simd_16(halo, flags_block, out_block);
+                                kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(halo, &mask, dt, out_block);
+                            });
+                    });
+                    black_box(&mut output_blocks);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_mean_curvature_shell_sweep(c: &mut Criterion) {
+    let (m, s) = resolve();
+    let mut group = c.benchmark_group("mean_curvature_shell_sweep");
+    group.sample_size(sample_size(s));
+
+    for target in active_targets(m, s) {
+        let (grid, active) = build_sparse_grid(target);
+        let n_active = active.len();
+        let num_threads = rayon::current_num_threads();
+        let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
+
+        let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); n_active];
+        let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
+        let dt = 0.05;
+
+        group.throughput(Throughput::Elements((n_active * N) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("shell_sweep", target),
+            &active,
+            |b, active| {
+                b.iter(|| {
+                    thread_pool().install(|| {
+                        active
+                            .par_iter()
+                            .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
+                            .for_each(|(&bid, (out_block, flags_block))| {
+                                let halo = unsafe { halo_pool.get_mut() };
+
+                                // Full 18^3 gather (faces + edges + corners)
+                                halo.fill::<1, true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
+                                let mask = MaskBlock::<LANES, CHUNKS>::build(flags_block);
+
+                                kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(halo, &mask, dt, out_block);
                             });
                     });
                     black_box(&mut output_blocks);
@@ -497,8 +586,10 @@ criterion_group! {
         bench_cold_extension,
         bench_voxel_access,
         bench_laplacian_compute_only,
+        bench_mean_curvature_compute_only,
         bench_halo_gather,
-        bench_laplacian_smoothing_e2e
+        bench_laplacian_smoothing_e2e,
+        bench_mean_curvature_shell_sweep
 }
 
 fn main() {

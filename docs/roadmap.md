@@ -139,21 +139,44 @@ contiguous middle copy (`memcpy` for `f32`), and `BoundaryCondition` reuse
 
 ## Step 6 — SIMD stencil kernels
 
-**Status:** A LITTLE (7-pt Laplacian only)
+**Status:** DONE (Laplacian, mean-curvature, bi-Laplacian; downsample/upsample deferred to step 7)
 
 **Parity target:** `src/halo.h` `procLineSegmentSIMD`, `src/msbg4.cpp`
 `smoothBlockSIMD4f`, `src/kernels_ispc.h` (`ispc_meancurv_smooth_halo_block`).
 
-**Scope:** the compute kernels that run over a halo buffer: 7-point Laplacian
-(the fluid mask is currently applied inline in the kernel, not split out),
-mean-curvature (19-tap Hessian), bi-Laplacian, and downsample/upsample.
-Introduce the cross-platform SIMD dispatch (widest native width per machine)
-here.
+**Scope:** the compute kernels that run over a halo buffer: 7-point Laplacian,
+mean-curvature (19-tap Hessian), bi-Laplacian (25-tap). Kernels are written once,
+generic over `const W: usize` lanes (`Simd<f32, W>`), and instantiated at the
+native register width per machine (`math::simd::LANES`: 16/8/4 for
+AVX-512/AVX2/NEON). Fluid masking is decoupled into a precomputed
+`MaskBlock<W, CHUNKS>` (built once from `CellFlags`, reused across iterations).
+`HaloBlock::fill::<HALO, FULL>` was generalized to a `HALO`-wide halo
+(1 for Laplacian/mean-curvature, 2 for bi-Laplacian). Kernels are boundary-blind
+(raw-pointer halo loads; `debug_assert` proves the layout) and mirror the C++
+full updates (`laplTyp==1`: `c + dt·L·G`; `laplTyp==4`: `f0 + clamp(dt·H, ±0.1)`;
+`laplTyp==2`: `f0 + clamp(-dt·H·G, ±0.1)`).
+
+**Downsample/upsample moved to step 7** (multires-coupled: they read
+`sgDataSrcHi` at `level-1` and use the refinement map — see `msbg4.cpp`
+`downsampleFloatChannelNew`/`downsampleChannel`).
 
 **Acceptance:**
-- Unit tests: each kernel matches a scalar reference to within tolerance.
-- `laplacian_compute_only` bench (already exists) for the 7-pt; add a
-  mean-curvature compute-only leg.
+- Unit tests: each kernel matches a scalar reference to within tolerance, plus
+  analytic/boundary cases (sphere curvature `2/r`, planar/constant fields,
+  `gradMagSq` guard, clamp saturation, `CELL_IS_FLUID_` mask semantics).
+- `difftest_stencil.rs` + `../MSBG/meancurvtest.cpp`: all three kernels match the
+  real C++ `applyChannelPdeFast` (one Jacobi iteration) within 1e-4.
+- Benches: `laplacian_compute_only` (real halo, kernel only — no mock),
+  `mean_curvature_compute_only`, `mean_curvature_shell_sweep`, and the existing
+  `laplacian_smoothing_e2e`, vs C++ scenario E (`applyChannelPdeFast`, laplTyp 1
+  and 4).
+- Current result (Dell 5500U, small scale, 12 threads): mean-curvature e2e
+  ~1.94–2.06 vs C++ 1.65 Gvox/s (~+20%); Laplacian e2e ~2.17–2.35 vs C++
+  1.90–2.02 Gvox/s (~+10%); kernel-only (parallel) ~3.3–3.5 Gvox/s. The win is
+  the **non-temporal output store** — C++ `renderDensFromFloat_storeSimd8` uses
+  `vstream` (`_mm256_stream_ps`, no write-allocate RFO); the Rust `store_nt`
+  matches it, halving output memory traffic and lifting the parallel kernel off
+  the ~15 GB/s memory wall.
 
 ---
 

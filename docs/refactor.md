@@ -407,3 +407,42 @@ aarch64 caveats to keep in mind when reading M3 Pro numbers:
   performance cores, and rayon has no P/E affinity — multithreaded benches may
   scale sub-linearly past ~6 threads (E-core stragglers). If observed, the fix
   is P-core pinning / thread-count tuning (follow-up, not yet done).
+
+### Measured on the M3 Pro (12c, 36 GB, aarch64)
+
+P-core L1d=128 KB / L1i=192 KB / L2=16 MB; E-core L1d=64 KB /
+L2=4 MB; SLC ~36 MB. `rayon_threads=12`.
+
+| workload | Dell (5500U, throttled floor) | M3 Pro | ratio |
+|---|---|---|---|
+| halo full, small (cache-resident) | ~4.5–5.0 Gvox/s | 24.8 Gvox/s | ~5× |
+| halo full, 500k (DRAM-bound) | ~4.9 Gvox/s | 17.6 Gvox/s | ~3.6× |
+| interp linear value (96³ grid) | ~30 ns/sample | 6.2 ns/sample | ~4.8× |
+| interp cubic grad / hess | ~150 / ~200 ns | 59.3 / 75.5 ns | ~2.5–2.6× |
+| density dequant / quantize | — | 17.5–19.1 / 16.9 G/s | — |
+| blockpool hot, 1k blocks | — | 1.79 ns/block | — |
+
+Everything is at or above the hypotheses above. The "above" cases (halo small,
+interp) are cache artifacts: the 96³ interp grid (3.5 MB) and small halo sets fit
+the M3's 16 MB L2 / 36 MB SLC, while the 5500U's 8 MB L3 cannot hold them. The
+DRAM-bound halo (~3.6×) is the honest bandwidth ratio (~150 vs ~50 GB/s).
+
+Reading the criterion output:
+
+- **Ignore every `change: %` and "regressed/improved" line.** Criterion diffs
+  each run against the *previous* run's stored estimate, and the small/big/xbig
+  runs use different sizes — so `voxel_access +718%` is 64³→128³, and
+  `blockpool 1M −97.9%` is a clean measurement beating a prior throttled one.
+  Only the absolute `time:`/`thrpt:` lines are comparable.
+- **Thermal throttling.** The 5500U throttles within ±15% noise; the M3 Pro
+  throttles under the *big/xbig* legs: `laplacian_e2e` collapses 8.0→3.2→1.74
+  Gvox/s from 250k→500k→750k active, and the first-touch of the 16 GB pool in
+  `blockpool_hot/1M` produced one 881 ms outlier (the clean re-run is 17.7 ms).
+  Trust the 250k/500k halo numbers (17.6–17.8 Gvox/s, stable pre-throttle) for
+  DRAM characterization, and re-run cold (plugged in, idle) for the big legs.
+- **`target-cpu=native` matters differently per arch.** On x86 it's essential
+  (baseline SSE2 would scalarize the SIMD kernels). On aarch64 NEON is baseline,
+  so the flag's win is **LSE atomics** (`ldadd` vs LL/SC) for
+  `AtomicUsize::fetch_add` — visible in the blockpool benches.
+
+

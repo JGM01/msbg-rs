@@ -3,9 +3,9 @@ use crate::math::gather::Dequant;
 use crate::sparse_grid::SparseGrid;
 use std::cell::UnsafeCell;
 
-/// Thread-local staging buffer: a `BSX + 2` cube holding a block plus a
-/// 1-voxel halo on every face (and the edges/corners, when filled in full
-/// mode). `HSX` must equal `BSX + 2`.
+/// Thread-local staging buffer: a `BSX + 2*HALO` cube holding a block plus a
+/// `HALO`-voxel halo on every face (and the edges/corners, when filled in full
+/// mode). `HSX` must equal `BSX + 2*HALO`.
 pub struct HaloBlock<const BSX: usize, const HSX: usize> {
     pub data: Box<[f32]>,
 }
@@ -13,19 +13,21 @@ pub struct HaloBlock<const BSX: usize, const HSX: usize> {
 impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
     #[inline(always)]
     pub fn new() -> Self {
-        assert_eq!(HSX, BSX + 2, "Halo dimensions must be exactly BSX + 2");
         Self {
             data: vec![0.0f32; HSX * HSX * HSX].into_boxed_slice(),
         }
     }
 
     /// Fill the halo from block `bid` of `grid`, dequantizing each element to
-    /// `f32`. `FULL = true` fills the whole `HSX^3` cube (faces + edges +
-    /// corners, needed by the 19-tap mean-curvature stencil); `FULL = false`
-    /// fills only the center and the six faces (enough for the 7-point
-    /// Laplacian) and leaves the edges/corners zero.
+    /// `f32`.
+    ///
+    /// `HALO` is the halo width in voxels on each face (1 for the 7/19-tap
+    /// stencils, 2 for the 25-tap bi-Laplacian). `FULL = true` fills the whole
+    /// `HSX^3` cube (faces + edges + corners); `FULL = false` fills the center
+    /// plus the six faces only (enough for the 7-point Laplacian) and leaves
+    /// the edges/corners zero.
     #[inline]
-    pub fn fill<const FULL: bool, D, const N: usize>(
+    pub fn fill<const HALO: usize, const FULL: bool, D, const N: usize>(
         &mut self,
         grid: &SparseGrid<D, BSX, N>,
         bid: usize,
@@ -33,6 +35,7 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
     ) where
         D: Dequant<f32>,
     {
+        debug_assert_eq!(HSX, BSX + 2 * HALO, "HSX must equal BSX + 2*HALO");
         let bsx_log2 = BSX.trailing_zeros();
         let bsx_mask = BSX - 1;
         let bsx_i = BSX as i32;
@@ -53,14 +56,18 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
         let empty_ptr = unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() };
         let full_ptr = unsafe { (*grid.full_block.as_ptr()).data.as_ptr() };
 
-        // Resolve the 3x3x3 block neighborhood to raw data pointers once.
-        let mut ptrs: [*const D; 27] = [empty_ptr; 27];
-        for dz in 0..3i32 {
-            for dy in 0..3i32 {
-                for dx in 0..3i32 {
-                    let bx = bx0 + dx - 1;
-                    let by = by0 + dy - 1;
-                    let bz = bz0 + dz - 1;
+        // Resolve the (2*HALO+1)^3 block neighborhood to raw data pointers once.
+        // Fixed upper bound: HALO <= 2 -> 5^3 = 125 pointers.
+        let n = 2 * HALO + 1;
+        debug_assert!(n <= 5, "HALO must be <= 2");
+        let halo_i = HALO as i32;
+        let mut ptrs: [*const D; 125] = [empty_ptr; 125];
+        for dz in 0..n {
+            for dy in 0..n {
+                for dx in 0..n {
+                    let bx = bx0 + dx as i32 - halo_i;
+                    let by = by0 + dy as i32 - halo_i;
+                    let bz = bz0 + dz as i32 - halo_i;
                     let p = if bx >= 0 && bx < nx && by >= 0 && by < ny && bz >= 0 && bz < nz {
                         let b = (bx as usize) + (by as usize) * grid.nx + (bz as usize) * grid.nxy;
                         match grid.blockmap[b] {
@@ -72,7 +79,7 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
                     } else {
                         empty_ptr
                     };
-                    ptrs[(dx + 3 * dy + 9 * dz) as usize] = p;
+                    ptrs[dx + n * dy + n * n * dz] = p;
                 }
             }
         }
@@ -83,40 +90,46 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
 
         // Read a voxel whose coords are already resolved into the domain.
         let read = |x: i32, y: i32, z: i32| -> f32 {
-            let idx = ((x >> bsx_log2) - bx0 + 1)
-                + 3 * ((y >> bsx_log2) - by0 + 1)
-                + 9 * ((z >> bsx_log2) - bz0 + 1);
-            debug_assert!(idx >= 0 && idx < 27);
+            let idx = ((x >> bsx_log2) - bx0 + halo_i) as usize
+                + n * (((y >> bsx_log2) - by0 + halo_i) as usize)
+                + n * n * (((z >> bsx_log2) - bz0 + halo_i) as usize);
+            debug_assert!(idx < n * n * n);
             let vid = (x as usize & bsx_mask)
                 | ((y as usize & bsx_mask) << bsx_log2)
                 | ((z as usize & bsx_mask) << (2 * bsx_log2));
-            unsafe { (*ptrs[idx as usize].add(vid)).dequant() }
+            unsafe { (*ptrs[idx].add(vid)).dequant() }
         };
 
         // The x-halo columns do not depend on the row; resolve them once.
-        let rx_left = resolve_axis(x0 - 1, sx - 1, bc);
-        let rx_right = resolve_axis(x0 + bsx_i, sx - 1, bc);
+        let mut rx_left = [None; HALO];
+        let mut rx_right = [None; HALO];
+        for j in 0..HALO {
+            rx_left[j] = resolve_axis(x0 - halo_i + j as i32, sx - 1, bc);
+            rx_right[j] = resolve_axis(x0 + bsx_i + j as i32, sx - 1, bc);
+        }
 
         for z in 0..HSX {
-            let gz = bz0 * bsx_i + z as i32 - 1;
+            let gz = bz0 * bsx_i + z as i32 - halo_i;
             let rz = resolve_axis(gz, sz - 1, bc);
             for y in 0..HSX {
-                let gy = by0 * bsx_i + y as i32 - 1;
+                let gy = by0 * bsx_i + y as i32 - halo_i;
                 let ry = resolve_axis(gy, sy - 1, bc);
                 let row = z * dz_stride + y * dy_stride;
 
-                // Middle segment (halo x = 1..=BSX): contiguous when fully
-                // inside the domain.
+                // Middle segment (halo x = HALO..=HALO+BSX-1): contiguous when
+                // fully inside the domain.
                 match (ry, rz) {
                     (Some(ryv), Some(rzv)) if x0 + bsx_i <= sx => {
                         let by = ryv >> bsx_log2;
                         let bz = rzv >> bsx_log2;
-                        let idx = 1 + 3 * (by - by0 + 1) + 9 * (bz - bz0 + 1);
-                        let p = ptrs[idx as usize];
+                        let idx = halo_i as usize
+                            + n * ((by - by0 + halo_i) as usize)
+                            + n * n * ((bz - bz0 + halo_i) as usize);
+                        let p = ptrs[idx];
                         let vid = ((ryv as usize & bsx_mask) << bsx_log2)
                             | ((rzv as usize & bsx_mask) << (2 * bsx_log2));
                         unsafe {
-                            D::copy_row(p.add(vid), dst.add(row + 1), BSX);
+                            D::copy_row(p.add(vid), dst.add(row + HALO), BSX);
                         }
                     }
                     (Some(ryv), Some(rzv)) => {
@@ -130,39 +143,35 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
                                     Some(rx) => read(rx, by, bz),
                                     None => empty_f32,
                                 };
-                                *dst.add(row + 1 + i) = v;
+                                *dst.add(row + HALO + i) = v;
                             }
                         }
                     }
                     _ => unsafe {
                         for i in 0..BSX {
-                            *dst.add(row + 1 + i) = empty_f32;
+                            *dst.add(row + HALO + i) = empty_f32;
                         }
                     },
                 }
 
                 // Left/right halo columns. For faces-only they are only read
                 // from center rows, so they are skipped elsewhere.
-                if FULL || (y >= 1 && y <= BSX && z >= 1 && z <= BSX) {
+                if FULL || (y >= HALO && y < HALO + BSX && z >= HALO && z < HALO + BSX) {
                     unsafe {
-                        *dst.add(row) = match (rx_left, ry, rz) {
-                            (Some(lx), Some(ly), Some(lz)) => read(lx, ly, lz),
-                            _ => empty_f32,
-                        };
-                        *dst.add(row + HSX - 1) = match (rx_right, ry, rz) {
-                            (Some(rx), Some(ly), Some(lz)) => read(rx, ly, lz),
-                            _ => empty_f32,
-                        };
+                        for j in 0..HALO {
+                            *dst.add(row + j) = match (rx_left[j], ry, rz) {
+                                (Some(lx), Some(ly), Some(lz)) => read(lx, ly, lz),
+                                _ => empty_f32,
+                            };
+                            *dst.add(row + HALO + BSX + j) = match (rx_right[j], ry, rz) {
+                                (Some(rx), Some(ly), Some(lz)) => read(rx, ly, lz),
+                                _ => empty_f32,
+                            };
+                        }
                     }
                 }
             }
         }
-    }
-
-    /// Simulates memory bandwidth of a `fill` operation for benchmarking.
-    #[inline(always)]
-    pub fn mock_fill_for_bench(&mut self) {
-        self.data.fill(0.0f32);
     }
 }
 
@@ -243,12 +252,6 @@ mod halo_tests {
         assert!(halo.data.iter().all(|&v| v == 0.0));
     }
 
-    #[test]
-    #[should_panic(expected = "Halo dimensions must be exactly BSX + 2")]
-    fn test_h_02_bad_hsx_panics() {
-        let _ = HaloBlock::<16, 17>::new();
-    }
-
     // Happy path: interior of a single block is copied verbatim.
     #[test]
     fn test_h_03_center_copy() {
@@ -261,7 +264,7 @@ mod halo_tests {
             }
         }
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 0, NEUMANN);
+        halo.fill::<1, true, f32, N>(&grid, 0, NEUMANN);
         for z in 0..BSX {
             for y in 0..BSX {
                 for x in 0..BSX {
@@ -290,7 +293,7 @@ mod halo_tests {
         }
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 13, NEUMANN);
+        halo.fill::<1, true, f32, N>(&grid, 13, NEUMANN);
 
         assert_eq!(halo_at(&halo, 1, 1, 1), 13.0); // center
         assert_eq!(halo_at(&halo, 0, 1, 1), 12.0); // left face
@@ -313,7 +316,7 @@ mod halo_tests {
         grid.set_empty_value(7.0);
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 0, BoundaryCondition::Dirichlet);
+        halo.fill::<1, true, f32, N>(&grid, 0, BoundaryCondition::Dirichlet);
 
         // Left face (global x = -1) must be the empty sentinel, not voxel 0.
         for z in 1..=BSX {
@@ -331,7 +334,7 @@ mod halo_tests {
         fill_axis(&mut grid, |x| x as f32);
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 0, NEUMANN);
+        halo.fill::<1, true, f32, N>(&grid, 0, NEUMANN);
 
         // Left face (x=-1) mirrors x=0; right face (x=16) mirrors x=15.
         assert_eq!(halo_at(&halo, 0, 1, 1), 0.0);
@@ -358,7 +361,7 @@ mod halo_tests {
         grid.set_empty_value(2.0);
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 0, BoundaryCondition::Dirichlet);
+        halo.fill::<1, true, f32, N>(&grid, 0, BoundaryCondition::Dirichlet);
 
         // Interior = 5.0 (allocated block), out-of-domain/empty faces = 2.0.
         assert_eq!(halo_at(&halo, 1, 1, 1), 5.0);
@@ -377,7 +380,7 @@ mod halo_tests {
         fill_axis(&mut grid, |x| x as f32);
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, grid.get_block_id(16, 0, 0), NEUMANN);
+        halo.fill::<1, true, f32, N>(&grid, grid.get_block_id(16, 0, 0), NEUMANN);
 
         // Interior global x=16 -> 16.0; global 17 mirrors to 16; global 18 to 15.
         assert_eq!(halo_at(&halo, 1, 1, 1), 16.0);
@@ -396,7 +399,7 @@ mod halo_tests {
         grid.set_empty_value(2.0);
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, f32, N>(&grid, 0, NEUMANN);
+        halo.fill::<1, true, f32, N>(&grid, 0, NEUMANN);
 
         // Right face = full_value (1.0); left face (out-of-domain) mirrors
         // edge voxel x=0 (3.0), not empty.
@@ -423,9 +426,9 @@ mod halo_tests {
         }
 
         let mut full = HaloBlock::<BSX, HSX>::new();
-        full.fill::<true, f32, N>(&grid, 13, NEUMANN);
+        full.fill::<1, true, f32, N>(&grid, 13, NEUMANN);
         let mut faces = HaloBlock::<BSX, HSX>::new();
-        faces.fill::<false, f32, N>(&grid, 13, NEUMANN);
+        faces.fill::<1, false, f32, N>(&grid, 13, NEUMANN);
 
         for z in 0..HSX {
             for y in 0..HSX {
@@ -465,19 +468,49 @@ mod halo_tests {
         }
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.fill::<true, Density, N>(&grid, 0, NEUMANN);
+        halo.fill::<1, true, Density, N>(&grid, 0, NEUMANN);
 
         // Interior voxel at global x=15 -> 15/31 ~ 0.4839.
         let v = halo_at(&halo, 16, 1, 1);
         assert!((v - 15.0 / 31.0).abs() < 1e-3, "got {v}");
     }
 
+    // HALO=2 full fill: a 5^3 neighborhood resolves +-2 neighbors correctly.
     #[test]
-    fn test_h_12_mock_fill() {
-        let mut halo = HaloBlock::<BSX, HSX>::new();
-        halo.data.fill(1.0);
-        halo.mock_fill_for_bench();
-        assert!(halo.data.iter().all(|&v| v == 0.0));
+    fn test_h_12_halo2_fill() {
+        const HSX2: usize = BSX + 4;
+        let mut grid = setup_grid(48, 48, 48);
+        for bid in 0..grid.n_blocks {
+            let bx = bid % grid.nx;
+            let by = (bid / grid.nx) % grid.ny;
+            let bz = bid / grid.nxy;
+            grid.set_voxel(bx * BSX, by * BSX, bz * BSX, bid as f32);
+            if let Some(ptr) = grid.blockmap[bid]
+                && ptr != grid.empty_block
+                && ptr != grid.full_block
+            {
+                unsafe { (*ptr.as_ptr()).data.fill(bid as f32) };
+            }
+        }
+
+        // Block 13 = (1,1,1) in a 3^3 block grid (bid = bx + by*3 + bz*9).
+        let mut halo = HaloBlock::<BSX, HSX2>::new();
+        halo.fill::<2, true, f32, N>(&grid, 13, NEUMANN);
+
+        let at = |x: usize, y: usize, z: usize| halo.data[z * HSX2 * HSX2 + y * HSX2 + x];
+
+        // Halo index x maps to global x0 + (x - HALO); interior is x in [2, 18).
+        assert_eq!(at(2, 2, 2), 13.0); // center (global 16) -> block 13
+        assert_eq!(at(0, 2, 2), 12.0); // x=-2 (global 14) -> block (0,1,1) = 12
+        assert_eq!(at(1, 2, 2), 12.0); // x=-1 (global 15) -> block 12
+        assert_eq!(at(18, 2, 2), 14.0); // x=+1 (global 32) -> block (2,1,1) = 14
+        assert_eq!(at(19, 2, 2), 14.0); // x=+2 (global 33) -> block 14
+        assert_eq!(at(2, 0, 2), 10.0); // y=-2 -> block (1,0,1) = 10
+        assert_eq!(at(2, 18, 2), 16.0); // y=+1 -> block (1,2,1) = 16
+        assert_eq!(at(2, 2, 0), 4.0); // z=-2 -> block (1,1,0) = 4
+        assert_eq!(at(2, 2, 18), 22.0); // z=+1 -> block (1,1,2) = 22
+        assert_eq!(at(0, 0, 0), 0.0); // corner (-2,-2,-2) -> block (0,0,0) = 0
+        assert_eq!(at(19, 19, 19), 26.0); // corner (+2,+2,+2) -> block (2,2,2) = 26
     }
 
     #[test]
