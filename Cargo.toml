@@ -21,3 +21,7 @@ harness = false
 [[bench]]
 name = "interp_bench"
 harness = false
+
+[[bench]]
+name = "scale_stress"
+harness = false
