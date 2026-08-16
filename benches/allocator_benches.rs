@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use msbg_rs::{
     blockpool::{Block, BlockPool},
     math::BoundaryCondition,
@@ -32,13 +32,80 @@ enum Machine {
     Windows,
 }
 
+/// Parsed `--scale`/`--machine` flags plus the benchmark FILTER.
+struct Cli {
+    scale: Option<String>,
+    machine: Option<String>,
+    filter: Option<String>,
+}
+
+fn cli() -> &'static Cli {
+    static CLI: std::sync::OnceLock<Cli> = std::sync::OnceLock::new();
+    CLI.get_or_init(parse_cli)
+}
+
+fn parse_cli() -> Cli {
+    const VALUE_FLAGS: &[&str] = &[
+        "--color",
+        "--save-baseline",
+        "--baseline",
+        "--format",
+        "--profile-time",
+        "--sample-size",
+        "--measurement-time",
+        "--warm-up-time",
+        "--nresamples",
+        "--load-baseline",
+        "--plotting-backend",
+        "--output-format",
+    ];
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut scale = None;
+    let mut machine = None;
+    let mut filter = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--scale" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                scale = Some(args[i + 1].clone());
+                i += 1;
+            }
+        } else if a == "--machine" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                machine = Some(args[i + 1].clone());
+                i += 1;
+            }
+        } else if a == "--bench" || a == "--test" {
+            // cargo passes --bench; --test is the libtest-compat toggle that is ignored.
+        } else if VALUE_FLAGS.contains(&a) {
+            i += 1; // skip the flag's value
+        } else if a.starts_with('-') {
+            eprintln!("note: ignoring unsupported bench flag '{a}'");
+        } else if filter.is_none() {
+            filter = Some(a.to_string());
+        }
+        i += 1;
+    }
+    Cli {
+        scale,
+        machine,
+        filter,
+    }
+}
+
 fn machine() -> Machine {
-    match env::var("MSBG_BENCH_MACHINE").as_deref() {
-        Ok("dell") => Machine::Dell,
-        Ok("macbook") => Machine::Macbook,
-        Ok("windows") => Machine::Windows,
-        Ok(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows)"),
-        Err(_) => {
+    let raw = cli()
+        .machine
+        .clone()
+        .or_else(|| env::var("MSBG_BENCH_MACHINE").ok());
+    match raw.as_deref() {
+        Some("dell") => Machine::Dell,
+        Some("macbook") => Machine::Macbook,
+        Some("windows") => Machine::Windows,
+        Some(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows)"),
+        None => {
             if cfg!(target_os = "macos") {
                 Machine::Macbook
             } else if cfg!(target_os = "windows") {
@@ -61,12 +128,13 @@ enum Size {
 }
 
 fn size() -> Size {
-    match env::var("MSBG_BENCH_SCALE").as_deref() {
-        Ok("small") => Size::Small,
-        Ok("big") | Ok("full") => Size::Big,
-        Ok("xbig") => Size::XBig,
-        Ok(other) => panic!("unknown MSBG_BENCH_SCALE '{other}' (use small|big|xbig)"),
-        Err(_) => Size::Big,
+    let raw = cli().scale.clone().or_else(|| env::var("MSBG_BENCH_SCALE").ok());
+    match raw.as_deref() {
+        Some("small") => Size::Small,
+        Some("big") | Some("full") => Size::Big,
+        Some("xbig") => Size::XBig,
+        Some(other) => panic!("unknown MSBG_BENCH_SCALE '{other}' (use small|big|xbig)"),
+        None => Size::Big,
     }
 }
 
@@ -138,23 +206,19 @@ fn voxel_size(s: Size) -> usize {
     }
 }
 
-fn print_banner(m: Machine) {
+fn print_banner(m: Machine, s: Size) {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
     eprintln!(
-        "[msbg-rs bench] machine={:?} arch={} os={} logical_cores={} rayon_threads={}",
+        "[msbg-rs bench] machine={:?} scale={:?} arch={} os={} logical_cores={} rayon_threads={}",
         m,
+        s,
         std::env::consts::ARCH,
         std::env::consts::OS,
         cores,
         rayon::current_num_threads(),
     );
-}
-
-fn custom_criterion() -> Criterion {
-    print_banner(machine());
-    Criterion::default().configure_from_args()
 }
 
 /// Deterministic sparse occupancy: blocks whose center lies inside a spherical
@@ -586,22 +650,22 @@ fn bench_voxel_access(c: &mut Criterion) {
     });
 }
 
-criterion_group! {
-    name = benches;
-    config = custom_criterion();
-    targets =
-        bench_hot_path_scaling,
-        bench_multithreaded_contention,
-        bench_cold_extension,
-        bench_voxel_access,
-        bench_laplacian_compute_only,
-        bench_mean_curvature_compute_only,
-        bench_halo_gather,
-        bench_laplacian_smoothing_e2e,
-        bench_mean_curvature_shell_sweep
-}
-
 fn main() {
     let _ = thread_pool(); // eager build so warmup isn't charged
-    benches();
+    print_banner(machine(), size());
+
+    let mut criterion = Criterion::default();
+    if let Some(f) = &cli().filter {
+        criterion = criterion.with_filter(f.clone());
+    }
+
+    bench_hot_path_scaling(&mut criterion);
+    bench_multithreaded_contention(&mut criterion);
+    bench_cold_extension(&mut criterion);
+    bench_voxel_access(&mut criterion);
+    bench_laplacian_compute_only(&mut criterion);
+    bench_mean_curvature_compute_only(&mut criterion);
+    bench_halo_gather(&mut criterion);
+    bench_laplacian_smoothing_e2e(&mut criterion);
+    bench_mean_curvature_shell_sweep(&mut criterion);
 }
