@@ -44,8 +44,9 @@ pub unsafe fn store<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, W>)
 ///
 /// # Safety
 ///
-/// `base + off` must be 16/32-byte aligned (true: `Block` is 64-byte aligned
-/// and `off` is a multiple of `W`) and in-bounds of the output block.
+/// `base + off` must be 16/32/64-byte aligned for W = 4/8/16 respectively
+/// (true: `Block` is 64-byte aligned and `off` is a multiple of `W`) and
+/// in-bounds of the output block.
 #[inline(always)]
 pub unsafe fn store_nt<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, W>) {
     unsafe {
@@ -53,6 +54,12 @@ pub unsafe fn store_nt<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, 
         #[cfg(target_arch = "x86_64")]
         {
             let a = v.to_array();
+            #[cfg(target_feature = "avx512f")]
+            if W == 16 {
+                let m = std::arch::x86_64::_mm512_loadu_ps(a.as_ptr());
+                std::arch::x86_64::_mm512_stream_ps(p, m);
+                return;
+            }
             if W == 8 {
                 let m = std::arch::x86_64::_mm256_loadu_ps(a.as_ptr());
                 std::arch::x86_64::_mm256_stream_ps(p, m);
