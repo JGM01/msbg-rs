@@ -115,6 +115,19 @@ cd ../MSBG && nix-shell && ./build_interptest.sh && exit
 MSBG_CPP_INTERTEST_BIN="$PWD/../MSBG/build/interptest" cargo test --test difftest_interp
 ```
 
+### Solver difftest (`tests/difftest_smoother.rs`)
+
+Compares the 8-color in-place `Sweeper` (4 iterations) against
+`../MSBG/smoothertest.cpp` — the REAL `applyChannelPdeFast` in its live path
+(`-(laplTyp + OPT_8_COLOR_SCHEME)`). Golden samples are hardcoded (Laplacian
+1e-4, mean-curvature 1e-3; see `docs/refactor.md` §8); the live check runs the
+C++ binary if `MSBG_CPP_SMOOTHERTEST_BIN` is set:
+
+```bash
+cd ../MSBG && nix-shell && ./build_smoothertest.sh && exit
+MSBG_CPP_SMOOTHERTEST_BIN="$PWD/../MSBG/build/smoothertest" cargo test --test difftest_smoother
+```
+
 ## Debugging
 
 The shell ships both Rust-specific tooling (`cargo miri`, `cargo asm`,

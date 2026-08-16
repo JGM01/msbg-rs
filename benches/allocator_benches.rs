@@ -5,13 +5,13 @@ use msbg_rs::{
     math::laplacian::kernel_laplacian,
     math::meancurv::kernel_meancurv,
     math::simd::LANES,
-    math::stencil::MaskBlock,
+    math::stencil::SimdRng,
     multires::halo::{HaloBlock, HaloBlockPool},
+    solver::{Fence, PdeParams, Stencil, Sweeper},
     sparse_grid::{BlockPtr, SparseGrid},
 };
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 use std::{env, hint::black_box, sync::Arc};
 
@@ -19,7 +19,6 @@ use std::{env, hint::black_box, sync::Arc};
 const BSX: usize = 16;
 const N: usize = 4096;
 const HSX: usize = 18;
-const CHUNKS: usize = N / LANES;
 
 // Approximate occupancy fraction of the spherical-shell active-block generator.
 const SHELL_OCCUPANCY: f64 = 0.14;
@@ -390,14 +389,12 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
             &block_count,
             |b, &count| {
                 // Real data: gather one halo from a real block once (gather is
-                // measured separately in halo_gather), build the fluid mask
-                // once, then time only the kernel over `count` fresh outputs.
+                // measured separately in halo_gather), then time only the kernel
+                // over `count` fresh outputs.
                 let (grid, active) = build_sparse_grid(1);
                 let bid = active[0];
                 let mut halo = HaloBlock::<BSX, HSX>::new();
                 halo.fill::<1, false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
-                let flags = Block::<u16, BSX, N>::new();
-                let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
                 let dt = 0.05;
 
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
@@ -407,7 +404,10 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
                         output_blocks
                             .par_iter_mut()
                             .for_each(|out_block| {
-                                kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, out_block);
+                                let mut rng = SimdRng::<LANES>::seed(0);
+                                kernel_laplacian::<LANES, BSX, HSX, f32>(
+                                    &halo, dt, false, out_block.data.as_mut_ptr(), &mut rng,
+                                );
                             });
                     });
                     black_box(&mut output_blocks);
@@ -433,8 +433,6 @@ fn bench_mean_curvature_compute_only(c: &mut Criterion) {
                 let bid = active[0];
                 let mut halo = HaloBlock::<BSX, HSX>::new();
                 halo.fill::<1, true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
-                let flags = Block::<u16, BSX, N>::new();
-                let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
                 let dt = 0.05;
 
                 let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); count];
@@ -444,7 +442,10 @@ fn bench_mean_curvature_compute_only(c: &mut Criterion) {
                         output_blocks
                             .par_iter_mut()
                             .for_each(|out_block| {
-                                kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, out_block);
+                                let mut rng = SimdRng::<LANES>::seed(0);
+                                kernel_meancurv::<LANES, BSX, HSX, f32>(
+                                    &halo, dt, false, out_block.data.as_mut_ptr(), &mut rng,
+                                );
                             });
                     });
                     black_box(&mut output_blocks);
@@ -507,79 +508,67 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
     group.sample_size(sample_size(s));
 
     for target in active_targets(m, s) {
-        let (grid, active) = build_sparse_grid(target);
+        let (grid, active_usize) = build_sparse_grid(target);
+        let active: Vec<u32> = active_usize.iter().map(|&b| b as u32).collect();
         let n_active = active.len();
         let num_threads = rayon::current_num_threads();
-        let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
+        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&grid, num_threads, Fence::Sfence);
+        // Match C++ scenario E: numIter 10 above 50k active, else 20; dt 0.025.
+        let num_iter = if target >= 50_000 { 10 } else { 20 };
 
-        let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); n_active];
-        let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
-        let dt = 0.05;
+        // Throughput counts every voxel-visit across all `num_iter` sweeps, so
+        // criterion's `elements/s` equals the C++ per-iteration `Gvoxels/s`.
+        group.throughput(Throughput::Elements((n_active * N * num_iter) as u64));
 
-        group.throughput(Throughput::Elements((n_active * N) as u64));
-        group.bench_with_input(
-            BenchmarkId::new("shell_sweep", target),
-            &active,
-            |b, active| {
-                b.iter(|| {
-                    thread_pool().install(|| {
-                        active
-                            .par_iter()
-                            .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
-                            .for_each(|(&bid, (out_block, flags_block))| {
-                                let halo = unsafe { halo_pool.get_mut() };
-
-                                // True gather latency from 6 spatial boundaries across RAM
-                                halo.fill::<1, false, f32, N>(&grid, bid, BoundaryCondition::Neumann);
-                                let mask = MaskBlock::<LANES, CHUNKS>::build(flags_block);
-
-                                kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(halo, &mask, dt, out_block);
-                            });
+        for stencil in [Stencil::Laplacian, Stencil::MeanCurvature] {
+            let name = match stencil {
+                Stencil::Laplacian => "laplacian",
+                Stencil::MeanCurvature => "mean_curvature",
+                Stencil::BiLaplacian => unreachable!(),
+            };
+            let params = PdeParams { dt: 0.025, iterations: num_iter, do_constr_zero_one: false };
+            group.bench_with_input(
+                BenchmarkId::new(name, target),
+                &active,
+                |b, active| {
+                    b.iter(|| {
+                        thread_pool().install(|| {
+                            sweeper.sweep(active, stencil, &params);
+                        });
+                        black_box(&grid);
                     });
-                    black_box(&mut output_blocks);
-                });
-            },
-        );
+                },
+            );
+        }
     }
     group.finish();
 }
 
-fn bench_mean_curvature_shell_sweep(c: &mut Criterion) {
-    let (m, s) = resolve();
-    let mut group = c.benchmark_group("mean_curvature_shell_sweep");
+fn bench_smoothing_fence(c: &mut Criterion) {
+    let (_, s) = resolve();
+    let mut group = c.benchmark_group("smoothing_fence");
     group.sample_size(sample_size(s));
 
-    for target in active_targets(m, s) {
-        let (grid, active) = build_sparse_grid(target);
-        let n_active = active.len();
-        let num_threads = rayon::current_num_threads();
-        let halo_pool = HaloBlockPool::<BSX, HSX>::new(num_threads);
+    // One mid-size shell: large enough to be parallel, small enough to avoid
+    // thermal throttling across the three fence legs.
+    let target = match s {
+        Size::Small => 5_000,
+        Size::Big | Size::XBig => 50_000,
+    };
+    let (grid, active_usize) = build_sparse_grid(target);
+    let active: Vec<u32> = active_usize.iter().map(|&b| b as u32).collect();
+    let num_threads = rayon::current_num_threads();
+    let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
 
-        let mut output_blocks: Vec<Block<f32, BSX, N>> = vec![Block::new(); n_active];
-        let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
-        let dt = 0.05;
-
-        group.throughput(Throughput::Elements((n_active * N) as u64));
+    for fence in [Fence::Sfence, Fence::Mfence, Fence::None] {
+        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&grid, num_threads, fence);
         group.bench_with_input(
-            BenchmarkId::new("shell_sweep", target),
+            BenchmarkId::new("mean_curvature", format!("{fence:?}")),
             &active,
             |b, active| {
                 b.iter(|| {
-                    thread_pool().install(|| {
-                        active
-                            .par_iter()
-                            .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
-                            .for_each(|(&bid, (out_block, flags_block))| {
-                                let halo = unsafe { halo_pool.get_mut() };
-
-                                // Full 18^3 gather (faces + edges + corners)
-                                halo.fill::<1, true, f32, N>(&grid, bid, BoundaryCondition::Neumann);
-                                let mask = MaskBlock::<LANES, CHUNKS>::build(flags_block);
-
-                                kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(halo, &mask, dt, out_block);
-                            });
-                    });
-                    black_box(&mut output_blocks);
+                    thread_pool().install(|| sweeper.sweep(active, Stencil::MeanCurvature, &params));
+                    black_box(&grid);
                 });
             },
         );
@@ -667,5 +656,5 @@ fn main() {
     bench_mean_curvature_compute_only(&mut criterion);
     bench_halo_gather(&mut criterion);
     bench_laplacian_smoothing_e2e(&mut criterion);
-    bench_mean_curvature_shell_sweep(&mut criterion);
+    bench_smoothing_fence(&mut criterion);
 }

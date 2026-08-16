@@ -1,14 +1,12 @@
-//! Shared stencil infrastructure: fluid mask precomputation and the constants
-//! shared by every PDE smoothing kernel.
+//! Shared stencil infrastructure: raw SIMD loads and (non-)temporal stores, the
+//! write-back `StoreBack` conversion, and the stochastic-rounding RNG used by
+//! the `Density8` path.
 
-use crate::blockpool::Block;
-use std::simd::cmp::SimdPartialEq;
-use std::simd::{Mask, Simd};
+use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use std::simd::num::{SimdFloat, SimdInt};
+use std::simd::{Select, Simd, StdFloat};
 
-/// Per-voxel cell flags that are *not* fluid. Matches the C++ `CELL_IS_FLUID_`
-/// predicate (`msbg.h`): `!(cell & (CELL_SOLID | CELL_VOID))`, so `CELL_AIR`
-/// counts as fluid.
-pub const FLUID_MASK: u16 = 0x1 | 0x1000; // CELL_SOLID | CELL_VOID
+use crate::channel::{Density, Density8};
 
 /// Load `W` contiguous `f32` lanes from `base + off` without bounds checks.
 ///
@@ -74,37 +72,122 @@ pub unsafe fn store_nt<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, 
     }
 }
 
-/// Precomputed, SIMD-ready fluid mask for one block.
+/// Store-only fence ordering non-temporal stores before later loads (x86).
 ///
-/// Decoupled from the math kernels: built once per block (per frame) from the
-/// `CellFlags` channel and reused across iterations, so the hot loop stays
-/// pure arithmetic with a single branchless select at the end.
-///
-/// `W` is the SIMD lane width and `CHUNKS == N / W` the number of chunks
-/// (passed explicitly to avoid unstable `generic_const_exprs`).
-pub struct MaskBlock<const W: usize, const CHUNKS: usize> {
-    masks: [Mask<i32, W>; CHUNKS],
+/// After a block is written with streaming stores, a later pass's halo gather
+/// re-reads it with regular cached loads. Streaming stores are weakly ordered,
+/// so a fence is required before the data is observed by another core.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn store_fence() {
+    unsafe { std::arch::x86_64::_mm_sfence() };
 }
 
-impl<const W: usize, const CHUNKS: usize> MaskBlock<W, CHUNKS> {
-    /// Precompute the fluid mask from a `CellFlags` block.
-    pub fn build<const BSX: usize, const N: usize>(flags: &Block<u16, BSX, N>) -> Self {
-        debug_assert_eq!(CHUNKS * W, N, "CHUNKS * W must equal N");
-        let mut masks = [Mask::<i32, W>::splat(false); CHUNKS];
-        let mask_splat = Simd::<u16, W>::splat(FLUID_MASK);
-        let zero = Simd::<u16, W>::splat(0);
-        for (i, slot) in masks.iter_mut().enumerate() {
-            let v = Simd::<u16, W>::from_slice(&flags.data[i * W..i * W + W]);
-            let is_fluid = (v & mask_splat).simd_eq(zero);
-            *slot = is_fluid.cast::<i32>();
-        }
-        Self { masks }
+/// Full fence — the C++ baseline (`_mm_mfence()` per block).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn store_mfence() {
+    unsafe { std::arch::x86_64::_mm_mfence() };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn store_fence() {}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn store_mfence() {}
+
+/// Lane-parallel PRNG for the `Density8` stochastic-rounding quantizer (a
+/// murmur-hashed seed followed by an LCG, widened to `W` lanes).
+pub struct SimdRng<const W: usize> {
+    state: Simd<u32, W>,
+}
+
+impl<const W: usize> SimdRng<W> {
+    /// Seed `W` lanes deterministically from a scalar seed (distinct lanes are
+    /// decorrelated so a uniform scalar seed yields uniform lanes).
+    pub fn seed(seed: u32) -> Self {
+        let lane = Simd::<u32, W>::from_array(std::array::from_fn(|i| i as u32));
+        let mut h = Simd::<u32, W>::splat(seed) ^ (lane * Simd::splat(0x9e37_79b9));
+        h ^= h >> Simd::splat(16u32);
+        h *= Simd::splat(0x85eb_ca6b);
+        h ^= h >> Simd::splat(13u32);
+        h *= Simd::splat(0xc2b2_ae35);
+        h ^= h >> Simd::splat(16u32);
+        let nonzero = h
+            .simd_eq(Simd::splat(0u32))
+            .select(Simd::splat(0xdead_beef), h);
+        Self { state: nonzero }
     }
 
-    /// Mask for chunk `i` (in output/`flags` layout order).
+    /// Uniform `[0, 1)` in `W` lanes.
     #[inline(always)]
-    pub fn chunk(&self, i: usize) -> Mask<i32, W> {
-        self.masks[i]
+    pub fn next(&mut self) -> Simd<f32, W> {
+        self.state *= Simd::splat(16807u32);
+        let bits = (self.state >> Simd::splat(9u32)) | Simd::splat(0x3f80_0000);
+        let f: Simd<f32, W> = Simd::from_bits(bits);
+        f - Simd::splat(1.0f32)
+    }
+}
+
+/// Converts a smoothed `Simd<f32, W>` chunk into a stored element and writes it
+/// to `out + off` (element offset). The storage conversion is monomorphized
+/// away: `f32` is a raw non-temporal store, `Density` is a round-to-`u16`
+/// store, `Density8` is a sqrt-compress + stochastic-rounding `u8` store.
+///
+/// # Safety
+///
+/// `out` must point at a writable block payload of at least `off + W` elements.
+pub trait StoreBack<const W: usize>: Copy {
+    /// Whether the store is non-temporal (and therefore needs a store fence
+    /// between color passes before another thread re-reads the block).
+    const USES_NT: bool;
+
+    /// Write one smoothed chunk. `rng` is only read by stochastic quantizers.
+    unsafe fn store_chunk(out: *mut Self, off: usize, v: Simd<f32, W>, rng: &mut SimdRng<W>);
+}
+
+impl<const W: usize> StoreBack<W> for f32 {
+    const USES_NT: bool = true;
+
+    #[inline(always)]
+    unsafe fn store_chunk(out: *mut f32, off: usize, v: Simd<f32, W>, _rng: &mut SimdRng<W>) {
+        unsafe { store_nt::<W>(out, off, v) };
+    }
+}
+
+impl<const W: usize> StoreBack<W> for Density {
+    const USES_NT: bool = false;
+
+    #[inline(always)]
+    unsafe fn store_chunk(out: *mut Density, off: usize, v: Simd<f32, W>, _rng: &mut SimdRng<W>) {
+        let scale = Simd::<f32, W>::splat(Density::MAX);
+        let rounded = (v * scale).round();
+        // SAFETY: `v` is in `[0, 1]`, so `rounded` is in `[0, 65535]`; the i32
+        // conversion cannot overflow (`cvttps2dq`).
+        let i: Simd<i32, W> = unsafe { rounded.to_int_unchecked() };
+        let u: Simd<u16, W> = i.cast();
+        let p = unsafe { (out as *mut u16).add(off) };
+        unsafe { u.copy_to_slice(std::slice::from_raw_parts_mut(p, W)) };
+    }
+}
+
+impl<const W: usize> StoreBack<W> for Density8 {
+    const USES_NT: bool = false;
+
+    #[inline(always)]
+    unsafe fn store_chunk(out: *mut Density8, off: usize, v: Simd<f32, W>, rng: &mut SimdRng<W>) {
+        let vf = v.sqrt() * Simd::splat(Density8::MAX);
+        let floor = vf.floor();
+        let frac = vf - floor;
+        let u = rng.next();
+        let rounded = u.simd_lt(frac).select(floor + Simd::splat(1.0), floor);
+        // SAFETY: `rounded` is in `[0, 255]`.
+        let i: Simd<i32, W> = unsafe { rounded.to_int_unchecked() };
+        let u8s: Simd<u8, W> = i.cast();
+        let p = unsafe { (out as *mut u8).add(off) };
+        unsafe { u8s.copy_to_slice(std::slice::from_raw_parts_mut(p, W)) };
     }
 }
 
@@ -113,36 +196,23 @@ mod tests {
     use super::*;
 
     const W: usize = crate::math::simd::LANES;
-    const BSX: usize = 16;
-    const N: usize = 4096;
-    const CHUNKS: usize = N / W;
 
     #[test]
-    fn test_msk_01_fluid_bits_match_cpp_predicate() {
-        let mut flags = Block::<u16, BSX, N>::new();
-        // solid, void, air, fluid
-        flags.data[0] = 0x1; // CELL_SOLID -> not fluid
-        flags.data[1] = 0x1000; // CELL_VOID -> not fluid
-        flags.data[2] = 0x4; // CELL_AIR -> fluid (CELL_IS_FLUID_)
-        flags.data[3] = 0x0; // fluid
-
-        let m = MaskBlock::<W, CHUNKS>::build(&flags);
-
-        // all three sample cells live in chunk 0
-        let chunk = m.chunk(0);
-        let bits = chunk.to_array();
-        assert!(!bits[0]); // solid masked
-        assert!(!bits[1]); // void masked
-        assert!(bits[2]); // air is fluid
-        assert!(bits[3]); // fluid
+    fn test_rng_01_uniform_in_range() {
+        let mut rng = SimdRng::<W>::seed(0x1234_5678);
+        for _ in 0..100 {
+            let v = rng.next();
+            let arr = v.to_array();
+            for &f in &arr {
+                assert!((0.0..1.0).contains(&f), "rng out of range {f}");
+            }
+        }
     }
 
     #[test]
-    fn test_msk_02_all_fluid_when_zero() {
-        let flags = Block::<u16, BSX, N>::new(); // all zeros = all fluid
-        let m = MaskBlock::<W, CHUNKS>::build(&flags);
-        for i in 0..CHUNKS {
-            assert!(m.chunk(i).all());
-        }
+    fn test_rng_02_distinct_seeds_distinct_streams() {
+        let mut a = SimdRng::<W>::seed(1);
+        let mut b = SimdRng::<W>::seed(2);
+        assert_ne!(a.next().to_array(), b.next().to_array());
     }
 }

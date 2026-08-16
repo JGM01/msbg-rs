@@ -1,38 +1,32 @@
-//! 19-tap mean-curvature smoothing kernel (C++ `applyChannelPdeFast`, `laplTyp==4`).
+//! 19-tap mean-curvature smoothing kernel.
 
-use crate::blockpool::Block;
-use crate::math::stencil::{self, MaskBlock};
+use crate::math::stencil::{self, SimdRng, StoreBack};
 use crate::multires::halo::HaloBlock;
 use std::simd::cmp::SimdPartialOrd;
 use std::simd::num::SimdFloat;
 use std::simd::{Select, Simd, StdFloat};
 
-/// Full-update mean-curvature smoothing over a pre-staged full halo.
+/// Full-update mean-curvature smoothing over a pre-staged full halo, writing
+/// the smoothed chunk back through the storage's [`StoreBack`].
 ///
-/// Mirrors the C++ `laplTyp==4` update: `H = Hnum / gradMagSq` (guarded at
-/// `gradMagSq > 1e-7`), `D = clamp(dt * H, ±0.1)`, `new = F0 + D`.
-/// Non-fluid cells keep their previous value (`f0`). Mixed partials are factored
-/// as `0.25*(a-b-c+d)` — fewer FLOPs than C++'s two-stage `0.5` form.
+/// Update `H = Hnum / gradMagSq` (guarded at `gradMagSq > 1e-7`),
+/// `D = clamp(dt * H, ±0.1)`, `new = F0 + D`. Mixed partials are factored as
+/// `0.25*(a-b-c+d)` — fewer FLOPs than the two-stage `0.5` form. No fluid mask
+/// (every voxel is smoothed); `clamp01` is the `doConstrZeroOne` `[0, 1]` clamp.
 #[inline(always)]
-pub fn kernel_meancurv<
-    const W: usize,
-    const CHUNKS: usize,
-    const BSX: usize,
-    const HSX: usize,
-    const N: usize,
->(
+pub fn kernel_meancurv<const W: usize, const BSX: usize, const HSX: usize, D>(
     halo: &HaloBlock<BSX, HSX>,
-    mask: &MaskBlock<W, CHUNKS>,
     dt: f32,
-    output: &mut Block<f32, BSX, N>,
-) {
-
+    clamp01: bool,
+    out: *mut D,
+    rng: &mut SimdRng<W>,
+) where
+    D: StoreBack<W>,
+{
     debug_assert_eq!(HSX, BSX + 2, "mean-curvature needs a 1-voxel halo");
     debug_assert_eq!(BSX % W, 0, "BSX must be a multiple of W");
-    debug_assert_eq!(CHUNKS * W, N, "CHUNKS must equal N / W");
 
     let base = halo.data.as_ptr();
-    let out = output.data.as_mut_ptr();
     let dy = HSX;
     let dz = HSX * HSX;
 
@@ -44,6 +38,7 @@ pub fn kernel_meancurv<
     let lo = Simd::<f32, W>::splat(-0.1);
     let hi = Simd::<f32, W>::splat(0.1);
     let zero = Simd::<f32, W>::splat(0.0);
+    let one = Simd::<f32, W>::splat(1.0);
 
     let mut out_idx = 0;
     for z in 1..=BSX {
@@ -100,8 +95,9 @@ pub fn kernel_meancurv<
                     let d = (dtv * h).simd_clamp(lo, hi);
 
                     let new = f0 + d;
-                    let m = mask.chunk(out_idx / W);
-                    stencil::store_nt::<W>(out, out_idx, m.select(new, f0));
+                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
+
+                    D::store_chunk(out, out_idx, new, rng);
                 }
                 hidx += W;
                 out_idx += W;
@@ -113,12 +109,12 @@ pub fn kernel_meancurv<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockpool::Block;
     use crate::math::simd::LANES;
 
     const BSX: usize = 16;
-    const N: usize = 4096;
     const HSX: usize = 18;
-    const CHUNKS: usize = N / LANES;
+    const N: usize = 4096;
 
     /// Curvature `H = Hnum/gradMagSq` (guarded) at a scalar halo index.
     fn scalar_curvature(halo: &HaloBlock<BSX, HSX>, h: usize) -> f32 {
@@ -165,12 +161,7 @@ mod tests {
     }
 
     /// Scalar full-update reference.
-    fn scalar_meancurv(
-        halo: &HaloBlock<BSX, HSX>,
-        flags: &Block<u16, BSX, N>,
-        dt: f32,
-        out: &mut Block<f32, BSX, N>,
-    ) {
+    fn scalar_meancurv(halo: &HaloBlock<BSX, HSX>, dt: f32, out: &mut [f32; N]) {
         const DY: usize = HSX;
         const DZ: usize = HSX * HSX;
         let mut out_idx = 0;
@@ -181,9 +172,7 @@ mod tests {
                     let f0 = halo.data[h];
                     let hc = scalar_curvature(halo, h);
                     let d = (dt * hc).clamp(-0.1, 0.1);
-                    let new = f0 + d;
-                    let is_fluid = (flags.data[out_idx] & crate::math::stencil::FLUID_MASK) == 0;
-                    out.data[out_idx] = if is_fluid { new } else { f0 };
+                    out[out_idx] = f0 + d;
                     out_idx += 1;
                 }
             }
@@ -206,9 +195,7 @@ mod tests {
     #[test]
     fn test_mc_01_sphere_curvature_analytic() {
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        // Distance field from center (8,8,8) -> mean curvature 2/r.
         fill_halo_sphere(&mut halo, 8.0, 8.0, 8.0);
-        // Sample at relative (11,8,8): r = 3 -> curvature ~= 2/3.
         let h = 9 * HSX * HSX + 9 * HSX + 12; // z=9,y=9,x=12 -> rel (11,8,8)
         let c = scalar_curvature(&halo, h);
         let expected = 2.0 / 3.0;
@@ -224,32 +211,23 @@ mod tests {
         for (i, v) in halo.data.iter_mut().enumerate() {
             *v = ((i * 31) % 200) as f32 * 0.05;
         }
-        let mut flags = Block::<u16, BSX, N>::new();
-        for i in 0..N {
-            flags.data[i] = match i % 6 {
-                0 => 0x1,
-                1 => 0x1000,
-                _ => 0x0,
-            };
-        }
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
 
         let mut out = Block::<f32, BSX, N>::new();
-        let mut ref_out = Block::<f32, BSX, N>::new();
+        let mut ref_out = [0.0f32; N];
         let dt = 0.025;
-        kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, &mut out);
-        scalar_meancurv(&halo, &flags, dt, &mut ref_out);
+        let mut rng = SimdRng::<LANES>::seed(0);
+        kernel_meancurv::<LANES, BSX, HSX, f32>(&halo, dt, false, out.data.as_mut_ptr(), &mut rng);
+        scalar_meancurv(&halo, dt, &mut ref_out);
 
         for i in 0..N {
-            let d = (out.data[i] - ref_out.data[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out.data[i]);
+            let d = (out.data[i] - ref_out[i]).abs();
+            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
         }
     }
 
     #[test]
     fn test_mc_03_planar_and_constant_are_unchanged() {
-        let flags = Block::<u16, BSX, N>::new();
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
+        let mut out = Block::<f32, BSX, N>::new();
 
         // Planar field f = 2x + 3y - z: zero curvature, zero Laplacian.
         let mut halo = HaloBlock::<BSX, HSX>::new();
@@ -263,14 +241,14 @@ mod tests {
                 }
             }
         }
-        let mut out = Block::<f32, BSX, N>::new();
-        kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, 0.5, &mut out);
+        let mut rng = SimdRng::<LANES>::seed(1);
+        kernel_meancurv::<LANES, BSX, HSX, f32>(&halo, 0.5, false, out.data.as_mut_ptr(), &mut rng);
         let mut out_idx = 0;
         for z in 1..=16 {
             for y in 1..=16 {
                 for x in 1..=16 {
-                    let expected = 2.0 * (x as i32 - 1) as f32 + 3.0 * (y as i32 - 1) as f32
-                        - (z as i32 - 1) as f32;
+                    let expected =
+                        2.0 * (x as i32 - 1) as f32 + 3.0 * (y as i32 - 1) as f32 - (z as i32 - 1) as f32;
                     assert!((out.data[out_idx] - expected).abs() < 1e-5);
                     out_idx += 1;
                 }
@@ -282,8 +260,8 @@ mod tests {
         for v in halo.data.iter_mut() {
             *v = 5.0;
         }
-        let mut out = Block::<f32, BSX, N>::new();
-        kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, 0.5, &mut out);
+        let mut rng = SimdRng::<LANES>::seed(2);
+        kernel_meancurv::<LANES, BSX, HSX, f32>(&halo, 0.5, false, out.data.as_mut_ptr(), &mut rng);
         for v in out.data.iter() {
             assert_eq!(*v, 5.0);
         }
@@ -291,18 +269,14 @@ mod tests {
 
     #[test]
     fn test_mc_04_clamp_saturates() {
-        // Distance field sampled near the center gives large curvature; a large
-        // dt drives D into the ±0.1 clamp.
         let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_sphere(&mut halo, 8.0, 8.0, 8.0);
-        let flags = Block::<u16, BSX, N>::new();
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
 
         let mut out = Block::<f32, BSX, N>::new();
-        kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, 100.0, &mut out);
+        let mut rng = SimdRng::<LANES>::seed(3);
+        kernel_meancurv::<LANES, BSX, HSX, f32>(&halo, 100.0, false, out.data.as_mut_ptr(), &mut rng);
 
         // Cell at relative (10,8,8): r=2, curvature ~=1, D = +100*1 -> clamped +0.1.
-        // Its out index = x=11,y=9,z=9 (relative x=10,y=8,z=8).
         let idx = 10 + 8 * 16 + 8 * 256;
         let f0 = 2.0f32; // r=2
         assert!(

@@ -35,5 +35,6 @@ pub mod blockpool;
 pub mod channel;
 pub mod math;
 pub mod multires;
+pub mod solver;
 pub mod sparse_grid;
 pub mod thread_pool;

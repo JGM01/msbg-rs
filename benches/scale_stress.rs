@@ -1,22 +1,17 @@
 use msbg_rs::{
     blockpool::{Block, BlockPool},
-    channel::{Density, quantize_density},
-    math::{
-        boundary::BoundaryCondition, meancurv::kernel_meancurv, simd::LANES, stencil::MaskBlock,
-    },
-    multires::halo::{HaloBlock, HaloBlockPool},
+    channel::Density,
+    math::boundary::BoundaryCondition,
+    multires::halo::HaloBlockPool,
+    solver::{Fence, PdeParams, Stencil, Sweeper},
     sparse_grid::{BlockPtr, SparseGrid},
 };
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
-};
-use std::{cell::UnsafeCell, hint::black_box, sync::Arc, time::Instant};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use std::{hint::black_box, sync::Arc, time::Instant};
 
 const BSX: usize = 16;
 const N: usize = 4096;
 const HSX: usize = 18;
-const CHUNKS: usize = N / LANES;
 
 // Virtual Domain: 4096^3 voxels = 256^3 blocks
 const DOMAIN_VOXELS: usize = 4096;
@@ -28,25 +23,6 @@ fn gyroid(x: f32, y: f32, z: f32, freq: f32) -> f32 {
     let (sy, cy) = (y * freq).sin_cos();
     let (sz, cz) = (z * freq).sin_cos();
     sx * cy + sy * cz + sz * cx
-}
-
-struct ScratchPool(Vec<UnsafeCell<Block<f32, BSX, N>>>);
-// SAFETY: Each thread exclusively accesses its own pre-allocated slot via `current_thread_index`.
-unsafe impl Sync for ScratchPool {}
-
-impl ScratchPool {
-    fn new(threads: usize) -> Self {
-        Self(
-            (0..threads)
-                .map(|_| UnsafeCell::new(Block::new()))
-                .collect(),
-        )
-    }
-
-    unsafe fn get_mut(&self) -> &mut Block<f32, BSX, N> {
-        let tid = rayon::current_thread_index().unwrap();
-        unsafe { &mut *self.0[tid].get() }
-    }
 }
 
 fn main() {
@@ -156,13 +132,6 @@ fn main() {
     println!("\n[2/4] Initializing Stencil Buffers & Thread Pools...");
     let halo_pool = HaloBlockPool::<BSX, HSX>::new(threads);
 
-    // Thread-local scratchpads using our new Sync wrapper
-    let scratch_pool = ScratchPool::new(threads);
-
-    let mut output_blocks: Vec<Block<Density, BSX, N>> = vec![Block::new(); n_active];
-    let flags_blocks: Vec<Block<u16, BSX, N>> = vec![Block::new(); n_active];
-    let dt = 0.025f32;
-
     // 3. Benchmark: Halo Gather Throughput
     println!("\n[3/4] Benchmarking 16-bit Halo Gather Throughput...");
     let gather_iters = 3;
@@ -184,26 +153,14 @@ fn main() {
 
     // 4. Benchmark: End-to-End Mean-Curvature PDE Smoothing Sweep
     println!("\n[4/4] Benchmarking 19-tap Mean Curvature PDE Solve...");
+    let active: Vec<u32> = candidate_blocks.iter().map(|&b| b as u32).collect();
+    let sweeper = Sweeper::<Density, BSX, N, HSX>::new(&grid, threads, Fence::Sfence);
+    let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
     let pde_iters = 3;
     let start_pde = Instant::now();
     for _ in 0..pde_iters {
-        candidate_blocks
-            .par_iter()
-            .zip(output_blocks.par_iter_mut().zip(flags_blocks.par_iter()))
-            .for_each(|(&bid, (out_block, flags_block))| {
-                let halo = unsafe { halo_pool.get_mut() };
-                halo.fill::<1, true, Density, N>(&grid, bid, BoundaryCondition::Neumann);
-                let mask = MaskBlock::<LANES, CHUNKS>::build(flags_block);
-
-                // Safely get thread-local f32 scratchpad
-                let scratch = unsafe { scratch_pool.get_mut() };
-
-                // Run math in f32
-                kernel_meancurv::<LANES, CHUNKS, BSX, HSX, N>(halo, &mask, dt, scratch);
-
-                // Quantize f32 back to u16 output block
-                quantize_density(&scratch.data, &mut out_block.data);
-            });
+        sweeper.sweep(&active, Stencil::MeanCurvature, &params);
+        black_box(&grid);
     }
     let pde_duration = start_pde.elapsed() / pde_iters as u32;
     let pde_gvoxels = (total_active_voxels as f64 / pde_duration.as_secs_f64()) / 1e9;

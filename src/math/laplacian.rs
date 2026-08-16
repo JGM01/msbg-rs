@@ -1,41 +1,39 @@
-//! 7-point Laplacian smoothing kernel (C++ `applyChannelPdeFast`, `laplTyp==1`).
+//! 7-point Laplacian smoothing kernel.
 
-use crate::blockpool::Block;
-use crate::math::stencil::{self, MaskBlock};
+use crate::math::stencil::{self, SimdRng, StoreBack};
 use crate::multires::halo::HaloBlock;
-use std::simd::{Select, Simd, StdFloat};
+use std::simd::num::SimdFloat;
+use std::simd::{Simd, StdFloat};
 
-/// Full-update 7-point Laplacian smoothing over a pre-staged faces-only halo.
+/// Full-update 7-point Laplacian smoothing over a pre-staged faces-only halo,
+/// writing the smoothed chunk back through the storage's [`StoreBack`].
 ///
-/// Mirrors the C++ `laplTyp==1` update `phi += dt * L * G` where
-/// `L = sum(6 neighbors) - 6*center` and `G` is the gradient magnitude of the
-/// center stencil. Non-fluid cells keep their previous value (`f0`).
+/// Update `phi += dt * L * G` where `L = sum(6 neighbors) - 6*center` and `G`
+/// is the gradient magnitude of the center stencil. No fluid mask (every voxel
+/// is smoothed); an optional `[0, 1]` clamp (`doConstrZeroOne`) is applied
+/// before the store.
 #[inline(always)]
-pub fn kernel_laplacian<
-    const W: usize,
-    const CHUNKS: usize,
-    const BSX: usize,
-    const HSX: usize,
-    const N: usize,
->(
+pub fn kernel_laplacian<const W: usize, const BSX: usize, const HSX: usize, D>(
     halo: &HaloBlock<BSX, HSX>,
-    mask: &MaskBlock<W, CHUNKS>,
     dt: f32,
-    output: &mut Block<f32, BSX, N>,
-) {
-
+    clamp01: bool,
+    out: *mut D,
+    rng: &mut SimdRng<W>,
+) where
+    D: StoreBack<W>,
+{
     debug_assert_eq!(HSX, BSX + 2, "Laplacian needs a 1-voxel halo");
     debug_assert_eq!(BSX % W, 0, "BSX must be a multiple of W");
-    debug_assert_eq!(CHUNKS * W, N, "CHUNKS must equal N / W");
 
     let base = halo.data.as_ptr();
-    let out = output.data.as_mut_ptr();
     let dy = HSX;
     let dz = HSX * HSX;
 
     let dtv = Simd::<f32, W>::splat(dt);
     let six = Simd::<f32, W>::splat(6.0);
     let half = Simd::<f32, W>::splat(0.5);
+    let zero = Simd::<f32, W>::splat(0.0);
+    let one = Simd::<f32, W>::splat(1.0);
 
     let mut out_idx = 0;
     for z in 1..=BSX {
@@ -57,12 +55,12 @@ pub fn kernel_laplacian<
                     let fx = (rx - lx) * half;
                     let fy = (dyd - dyu) * half;
                     let fz = (dzf - dzb) * half;
-                    let g = (fx.mul_add(fx, fy.mul_add(fy, fz * fz))).sqrt();
+                    let g = fx.mul_add(fx, fy.mul_add(fy, fz * fz)).sqrt();
 
                     let new = (dtv * lap).mul_add(g, c); // c + dt*lap*g
+                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
 
-                    let m = mask.chunk(out_idx / W);
-                    stencil::store_nt::<W>(out, out_idx, m.select(new, c));
+                    D::store_chunk(out, out_idx, new, rng);
                 }
                 hidx += W;
                 out_idx += W;
@@ -74,12 +72,12 @@ pub fn kernel_laplacian<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockpool::Block;
     use crate::math::simd::LANES;
 
     const BSX: usize = 16;
-    const N: usize = 4096;
     const HSX: usize = 18;
-    const CHUNKS: usize = N / LANES;
+    const N: usize = 4096;
 
     fn fill_halo_quadratic(halo: &mut HaloBlock<BSX, HSX>) {
         // Halo coords run [-1 .. 16] relative to the interior block.
@@ -96,12 +94,7 @@ mod tests {
     }
 
     /// Scalar full-update 7-point Laplacian (reference).
-    fn scalar_laplacian_7pt(
-        halo: &HaloBlock<BSX, HSX>,
-        flags: &Block<u16, BSX, N>,
-        dt: f32,
-        out: &mut Block<f32, BSX, N>,
-    ) {
+    fn scalar_laplacian_7pt(halo: &HaloBlock<BSX, HSX>, dt: f32, out: &mut [f32; 4096]) {
         const DY: usize = HSX;
         const DZ: usize = HSX * HSX;
         let mut out_idx = 0;
@@ -124,9 +117,7 @@ mod tests {
                     let g = (fx * fx + fy * fy + fz * fz).sqrt();
                     let new = c + dt * lap * g;
 
-                    let flag = flags.data[out_idx];
-                    let is_fluid = (flag & crate::math::stencil::FLUID_MASK) == 0;
-                    out.data[out_idx] = if is_fluid { new } else { c };
+                    out[out_idx] = new;
                     out_idx += 1;
                 }
             }
@@ -137,19 +128,18 @@ mod tests {
     fn test_lap_01_quadratic_field_matches_scalar() {
         let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_quadratic(&mut halo);
-        let flags = Block::<u16, BSX, N>::new();
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
 
         let mut out = Block::<f32, BSX, N>::new();
-        let mut ref_out = Block::<f32, BSX, N>::new();
+        let mut ref_out = [0.0f32; N];
         let dt = 0.025;
+        let mut rng = SimdRng::<LANES>::seed(0);
 
-        kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, &mut out);
-        scalar_laplacian_7pt(&halo, &flags, dt, &mut ref_out);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, dt, false, out.data.as_mut_ptr(), &mut rng);
+        scalar_laplacian_7pt(&halo, dt, &mut ref_out);
 
         for i in 0..N {
-            let d = (out.data[i] - ref_out.data[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out.data[i]);
+            let d = (out.data[i] - ref_out[i]).abs();
+            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
         }
     }
 
@@ -159,70 +149,29 @@ mod tests {
         for (i, v) in halo.data.iter_mut().enumerate() {
             *v = ((i * 17) % 100) as f32 * 0.1;
         }
-        let mut flags = Block::<u16, BSX, N>::new();
-        for i in 0..N {
-            flags.data[i] = match i % 5 {
-                0 => 0x1, // solid
-                1 => 0x4, // air (fluid under CELL_IS_FLUID_)
-                2 => 0x1000, // void
-                _ => 0x0, // fluid
-            };
-        }
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
 
         let mut out = Block::<f32, BSX, N>::new();
-        let mut ref_out = Block::<f32, BSX, N>::new();
+        let mut ref_out = [0.0f32; N];
         let dt = 0.05;
+        let mut rng = SimdRng::<LANES>::seed(1);
 
-        kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, &mut out);
-        scalar_laplacian_7pt(&halo, &flags, dt, &mut ref_out);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, dt, false, out.data.as_mut_ptr(), &mut rng);
+        scalar_laplacian_7pt(&halo, dt, &mut ref_out);
 
         for i in 0..N {
-            let d = (out.data[i] - ref_out.data[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out.data[i]);
+            let d = (out.data[i] - ref_out[i]).abs();
+            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
         }
     }
 
     #[test]
-    fn test_lap_03_mask_semantics_air_is_fluid() {
+    fn test_lap_03_dt_zero_is_identity() {
         let mut halo = HaloBlock::<BSX, HSX>::new();
         fill_halo_quadratic(&mut halo);
 
-        let mut flags = Block::<u16, BSX, N>::new();
-        flags.data[0] = 0x1; // solid -> preserved (== f0)
-        flags.data[1] = 0x1000; // void -> preserved (== f0)
-        flags.data[2] = 0x4; // air -> fluid -> updated
-        flags.data[3] = 0x0; // fluid -> updated
-
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
         let mut out = Block::<f32, BSX, N>::new();
-        let dt = 0.025;
-        kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, &mut out);
-
-        // Cell 0 and 1 live in the halo interior (global block coords 0..16);
-        // their f0 values are the halo center = quadratic field at (x,y,z).
-        // f0(0,0,0)=0; f0 for cell 1 = (1,0,0)->1; cell 2 = (2,0,0)->4; cell 3=(3,0,0)->9.
-        assert_eq!(out.data[0], 0.0); // solid preserved == f0 == 0
-        assert_eq!(out.data[1], 1.0); // void preserved == f0 == 1
-        // air (fluid): new = c + dt*L*G ; for f=x^2+y^2+z^2 at (2,0,0): c=4, L=6, G=2r=4 -> 4 + 0.025*24
-        let expected_air = 4.0 + 0.025 * 6.0 * (2.0 * 2.0);
-        assert!((out.data[2] - expected_air).abs() < 1e-4);
-        let expected_fluid = 9.0 + 0.025 * 6.0 * (2.0 * 3.0);
-        assert!((out.data[3] - expected_fluid).abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_lap_04_dt_zero_is_identity() {
-        let mut halo = HaloBlock::<BSX, HSX>::new();
-        fill_halo_quadratic(&mut halo);
-        let flags = Block::<u16, BSX, N>::new();
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
-
-        let mut out = Block::<f32, BSX, N>::new();
-        for v in out.data.iter_mut() {
-            *v = -1.0;
-        }
-        kernel_laplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, 0.0, &mut out);
+        let mut rng = SimdRng::<LANES>::seed(2);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, 0.0, false, out.data.as_mut_ptr(), &mut rng);
 
         // dt=0 -> new == c (halo center), i.e. the quadratic field value.
         let mut out_idx = 0;
@@ -236,6 +185,22 @@ mod tests {
                     out_idx += 1;
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_lap_04_clamp_zero_one() {
+        // A field with magnitude >> 1 and a large dt drives `new` far out of
+        // range; with clamp01 the result must stay within [0, 1].
+        let mut halo = HaloBlock::<BSX, HSX>::new();
+        for (i, v) in halo.data.iter_mut().enumerate() {
+            *v = 100.0 + (i % 10) as f32;
+        }
+        let mut out = Block::<f32, BSX, N>::new();
+        let mut rng = SimdRng::<LANES>::seed(3);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, 1000.0, true, out.data.as_mut_ptr(), &mut rng);
+        for &v in &out.data {
+            assert!((0.0..=1.0).contains(&v), "clamp01 violated: {v}");
         }
     }
 }

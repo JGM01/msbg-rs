@@ -214,38 +214,55 @@ the supported block sizes.
 
 ## Step 8 — PDE smoothing (happy path: 8-color in-place sweeps)
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Parity target:** `src/msbg4.cpp` `applyChannelPdeFast` (laplTyp 1 Laplacian,
-laplTyp 4 mean-curvature) — the *live* path; `src/msbg_demo.cpp:716` drives it
-with `-(PDE_MEAN_CURVATURE + OPT_8_COLOR_SCHEME)`.
+laplTyp 4 mean-curvature, laplTyp 2 bi-Laplacian) — the *live* 8-color
+in-place path; `src/msbg_demo.cpp:716` drives it with
+`-(PDE_MEAN_CURVATURE + OPT_8_COLOR_SCHEME)`.
 
-**Scope:** a generic **8-color in-place block sweep** (read halo + run a
-per-block stencil + write back), then the mean-curvature (19-tap Hessian) and
-Laplacian (7-pt) kernels on top of it. The sweep is use-case-independent — the
-same primitive the paper (phase-field mean-curvature), the bunny demo, and a
-future pressure matvec all share — so the core library stays solver-agnostic.
+**Scope:** a generic **8-color in-place block sweep** (`src/solver.rs`) — read
+halo → run a per-block stencil → store back into the same block — with the
+mean-curvature (19-tap), Laplacian (7-pt) and bi-Laplacian (25-tap) kernels on
+top. Generic over storage element type via `StoreBack` (`f32` NT store, `u16`
+quantize, `u8` sqrt+stochastic-rounding quantize). The sweep is
+use-case-independent; the core stays solver-agnostic.
 
-**Channels added here:** `CH_FLOAT_2`/`CH_FLOAT_3` (smoother scratch src/dst),
-the stochastic-quantize batch, and `prepareDataAccess` / `resetChannel` /
-`protectChannel` semantics.
+**Decisions (owned):** generic `f32`/`u16`/`u8` storage from day one; **no
+fluid mask** (match C++ — smooth every voxel + `[0,1]` clamp); **no scratch
+channels** (`CH_FLOAT_2`/`CH_FLOAT_3` dropped — only the dead Jacobi
+double-buffer path used them); `Stencil` enum + `PdeParams` replace the
+19-arg `int laplTyp` API; kernels refactored to a raw `*mut D` output;
+pre-bucketed color lists + Morton sort; `sfence` per block (benchmarked vs
+`mfence`/none — all within ~1%, `sfence` marginally best).
 
 **Acceptance:**
-- `laplacian_smoothing_e2e` bench vs C++ `applyChannelPdeFast` (scenario E,
-  laplTyp 1 and 4) — the bench already exists as a manual halo+stencil
-  composition; this step wires it to the real solver.
-- Convergence tests on known Laplacian/mean-curvature fields.
+- `tests/difftest_smoother.rs` vs the C++ `smoothertest.cpp` (8-color, 4 iters,
+  full level-0 field): Laplacian within 1e-4, mean-curvature within 1e-3 (the
+  looser bound is the deliberate `0.25*(a-b-c+d)` mixed-partial factoring +
+  the `gradMagSq > 1e-7` guard cliff — see refactor.md §8).
+- `laplacian_smoothing_e2e` bench (scenario E, both legs) wired to the real
+  `Sweeper`; C++ `benchmark.cpp` scenario E switched to the 8-color flag so both
+  sides run the live path. Small scale (Dell 5500U, 12 threads): Rust ~2.10 /
+  1.73 / 1.72 Gvox/s (Laplacian 1k/5k/10k) vs C++ 1.79 / 1.48 / 1.52;
+  mean-curvature Rust 1.85 / 1.48 / 1.52 vs C++ 1.40 / 1.34 / 1.35.
+  **Rust ~+13–32%.** `perf`: 90% of cycles in the sweep hot loop.
+- Unit tests: color-schedule == serial Gauss-Seidel reference (bit-level),
+  affine fixed point, clamp, dummy/gap/empty active lists, odd iterations,
+  `StoreBack` RNG range.
 
-**Deferred (later extension, not parity): the multigrid pressure solver.**
-`multiplyLaplacianMatrixOpt` / `relax` / dense coarse levels / `AXPBY*` /
-`dotProdChannel` have **no call sites** in the C++ demo — they are the
-pressure-projection (Poisson) machinery for *standard* FLIP, baked into the
-library but unused by the phase-field demo. When ported, design them Rust-native
-(see `ideas.md` §2), not as C++ parity. Their channels (`CH_FLOAT_4..8`,
-`CH_FLOAT_TMP_3`, `CH_DIVERGENCE_ADJ`, `CH_VEC3_2/3/4`, `velocityAirDiff`,
-`sootDiff`, `heatDiff`, `pressureOld`, `genUint16*`/`uint8*`) land then too.
-Redistancing (eikonal/FIM) is likewise written new — referenced in MSBG but not
-implemented there.
+**Deferred (no call sites in the demo, designed Rust-native when ported):**
+- the **Jacobi double-buffer path** (`chSrc != chDst`, `CH_FLOAT_2`/`CH_FLOAT_3`
+  scratch) — `applyChannelPdeFast` with a *positive* `laplTyp`;
+- `prepareDataAccess` / `resetChannel` / `protectChannel` semantics — Rust's
+  lazy `Option<BlockPtr>` blockmap subsumes them for the live path;
+- the **multigrid pressure solver** (`multiplyLaplacianMatrixOpt`, `relax`,
+  `relaxBlockList`, dense coarse MG levels, `AXPBY*`, `dotProdChannel`) —
+  the pressure-projection machinery for *standard* FLIP, unused by the
+  phase-field demo. Its channels (`CH_FLOAT_4..8`, `CH_VEC3_*`, `pressureOld`,
+  etc.) land with it.
+- Redistancing (eikonal/FIM) is likewise written new — referenced in MSBG but
+  not implemented there.
 
 ---
 

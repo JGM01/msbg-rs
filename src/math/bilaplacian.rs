@@ -1,36 +1,30 @@
-//! 25-tap bi-Laplacian smoothing kernel (C++ `applyChannelPdeFast`, `laplTyp==2`).
+//! 25-tap bi-Laplacian smoothing kernel.
 
-use crate::blockpool::Block;
-use crate::math::stencil::{self, MaskBlock};
+use crate::math::stencil::{self, SimdRng, StoreBack};
 use crate::multires::halo::HaloBlock;
 use std::simd::num::SimdFloat;
-use std::simd::{Select, Simd, StdFloat};
+use std::simd::{Simd, StdFloat};
 
-/// Full-update bi-Laplacian smoothing over a pre-staged full 2-voxel halo.
+/// Full-update bi-Laplacian smoothing over a pre-staged full 2-voxel halo,
+/// writing the smoothed chunk back through the storage's [`StoreBack`].
 ///
-/// Mirrors the C++ `laplTyp==2` update:
-/// `H = 42*F0 - 12*sum6(±1) + 1*sum6(±2) + 2*sum12(diag ±1)`,
-/// `D = clamp(-dt * H * G, ±0.1)`, `new = F0 + D`.
+/// Update `H = 42*F0 - 12*sum6(±1) + 1*sum6(±2) + 2*sum12(diag ±1)`,
+/// `D = clamp(-dt * H * G, ±0.1)`, `new = F0 + D`. No fluid mask; `clamp01` is
+/// the `doConstrZeroOne` `[0, 1]` clamp.
 #[inline(always)]
-pub fn kernel_bilaplacian<
-    const W: usize,
-    const CHUNKS: usize,
-    const BSX: usize,
-    const HSX: usize,
-    const N: usize,
->(
+pub fn kernel_bilaplacian<const W: usize, const BSX: usize, const HSX: usize, D>(
     halo: &HaloBlock<BSX, HSX>,
-    mask: &MaskBlock<W, CHUNKS>,
     dt: f32,
-    output: &mut Block<f32, BSX, N>,
-) {
-
+    clamp01: bool,
+    out: *mut D,
+    rng: &mut SimdRng<W>,
+) where
+    D: StoreBack<W>,
+{
     debug_assert_eq!(HSX, BSX + 4, "bi-Laplacian needs a 2-voxel halo");
     debug_assert_eq!(BSX % W, 0, "BSX must be a multiple of W");
-    debug_assert_eq!(CHUNKS * W, N, "CHUNKS must equal N / W");
 
     let base = halo.data.as_ptr();
-    let out = output.data.as_mut_ptr();
     let dy = HSX;
     let dz = HSX * HSX;
 
@@ -41,6 +35,8 @@ pub fn kernel_bilaplacian<
     let two = Simd::<f32, W>::splat(2.0);
     let lo = Simd::<f32, W>::splat(-0.1);
     let hi = Simd::<f32, W>::splat(0.1);
+    let zero = Simd::<f32, W>::splat(0.0);
+    let one = Simd::<f32, W>::splat(1.0);
 
     let mut out_idx = 0;
     for z in 2..=(BSX + 1) {
@@ -83,14 +79,15 @@ pub fn kernel_bilaplacian<
                     let fx = (f2 - f1) * half;
                     let fy = (f4 - f3) * half;
                     let fz = (f6 - f5) * half;
-                    let g = (fx.mul_add(fx, fy.mul_add(fy, fz * fz))).sqrt();
+                    let g = fx.mul_add(fx, fy.mul_add(fy, fz * fz)).sqrt();
 
                     let upd = (dtv * h) * g;
                     let d = (-upd).simd_clamp(lo, hi);
 
                     let new = f0 + d;
-                    let m = mask.chunk(out_idx / W);
-                    stencil::store_nt::<W>(out, out_idx, m.select(new, f0));
+                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
+
+                    D::store_chunk(out, out_idx, new, rng);
                 }
                 hidx += W;
                 out_idx += W;
@@ -102,19 +99,14 @@ pub fn kernel_bilaplacian<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blockpool::Block;
     use crate::math::simd::LANES;
 
     const BSX: usize = 16;
-    const N: usize = 4096;
     const HSX: usize = 20;
-    const CHUNKS: usize = N / LANES;
+    const N: usize = 4096;
 
-    fn scalar_bilaplacian(
-        halo: &HaloBlock<BSX, HSX>,
-        flags: &Block<u16, BSX, N>,
-        dt: f32,
-        out: &mut Block<f32, BSX, N>,
-    ) {
+    fn scalar_bilaplacian(halo: &HaloBlock<BSX, HSX>, dt: f32, out: &mut [f32; N]) {
         const DY: usize = HSX;
         const DZ: usize = HSX * HSX;
         let mut out_idx = 0;
@@ -154,9 +146,7 @@ mod tests {
                     let fz = 0.5 * (f6 - f5);
                     let g = (fx * fx + fy * fy + fz * fz).sqrt();
                     let d = (-dt * hh * g).clamp(-0.1, 0.1);
-                    let new = f0 + d;
-                    let is_fluid = (flags.data[out_idx] & crate::math::stencil::FLUID_MASK) == 0;
-                    out.data[out_idx] = if is_fluid { new } else { f0 };
+                    out[out_idx] = f0 + d;
                     out_idx += 1;
                 }
             }
@@ -169,21 +159,17 @@ mod tests {
         for (i, v) in halo.data.iter_mut().enumerate() {
             *v = ((i * 13) % 250) as f32 * 0.01;
         }
-        let mut flags = Block::<u16, BSX, N>::new();
-        for i in 0..N {
-            flags.data[i] = if i % 7 == 0 { 0x1 } else { 0x0 };
-        }
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
 
         let mut out = Block::<f32, BSX, N>::new();
-        let mut ref_out = Block::<f32, BSX, N>::new();
+        let mut ref_out = [0.0f32; N];
         let dt = 0.01;
-        kernel_bilaplacian::<LANES, CHUNKS, BSX, HSX, N>(&halo, &mask, dt, &mut out);
-        scalar_bilaplacian(&halo, &flags, dt, &mut ref_out);
+        let mut rng = SimdRng::<LANES>::seed(0);
+        kernel_bilaplacian::<LANES, BSX, HSX, f32>(&halo, dt, false, out.data.as_mut_ptr(), &mut rng);
+        scalar_bilaplacian(&halo, dt, &mut ref_out);
 
         for i in 0..N {
-            let d = (out.data[i] - ref_out.data[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out.data[i]);
+            let d = (out.data[i] - ref_out[i]).abs();
+            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
         }
     }
 
@@ -192,9 +178,8 @@ mod tests {
     fn test_bl_02_wrong_hsx_panics() {
         // HSX=18 is wrong for bi-Laplacian (needs BSX+4).
         let halo = HaloBlock::<16, 18>::new();
-        let flags = Block::<u16, BSX, N>::new();
-        let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
         let mut out = Block::<f32, BSX, N>::new();
-        kernel_bilaplacian::<LANES, CHUNKS, 16, 18, N>(&halo, &mask, 0.01, &mut out);
+        let mut rng = SimdRng::<LANES>::seed(0);
+        kernel_bilaplacian::<LANES, 16, 18, f32>(&halo, 0.01, false, out.data.as_mut_ptr(), &mut rng);
     }
 }
