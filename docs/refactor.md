@@ -342,6 +342,56 @@ Implications for the Rust port:
   `ThrRunParallel` (→ TBB, `thread.h:287`) with no locks; Rust's rayon
   equivalent is already the pattern in `halo.rs`.
 
+### What step 8 shipped (`src/solver.rs`)
+
+- `Stencil { Laplacian, MeanCurvature, BiLaplacian }` + `PdeParams { dt,
+  iterations, do_constr_zero_one }` replace the 19-arg `int laplTyp` API (whose
+  negative value + `OPT_8_COLOR_SCHEME` bit encodes "in-place, 8-color").
+- A `Sweeper<D, BSX, N, HSX>` primitive: pre-bucket the active list into 8 color
+  lists (color = `bx&1 | (by&1)<<1 | (bz&1)<<2`) once, Morton-sort each bucket,
+  then for each iteration run 8 parallel passes. Blocks of one color are ≥2
+  blocks apart on some axis, so their ≤2-voxel halos never overlap — the in-place
+  write is race-free by construction. C++ instead re-scans the *full* active list
+  8× per iteration with a per-block `getBlockCoordsById` + color branch (its
+  `USE_RB_SEP_LISTS` pre-bucketing is `#ifdef`'d out).
+- The step-6 kernels were refactored from `&mut Block<f32>` output to a raw
+  `*mut D` sink behind `StoreBack<W>`: `f32` → `store_nt` (non-temporal) +
+  `sfence`; `Density` → round-to-`u16`; `Density8` → sqrt + stochastic-rounding
+  `u8` (a lane-parallel `SimdRng` mirroring C++ `FMA_FastRandSeed`/`FMA_FastRand`).
+  The fluid `MaskBlock` was removed — C++ smooths every voxel, only clamping to
+  `[0,1]` (`doConstrZeroOne`), and the demo relies on that.
+- **Scratch channels dropped.** `CH_FLOAT_2`/`CH_FLOAT_3` are only touched by the
+  non-colored Jacobi double-buffer path (`laplTyp >= 0`); the demo passes
+  `CH_NULL`, so `chSrc == chDst` and the trailing `resetChannel(...)` calls are
+  all `resetChannel(CH_NULL)` no-ops. `prepareDataAccess`/`resetChannel`/
+  `protectChannel` are likewise unneeded (Rust's lazy `Option<BlockPtr>` blockmap
+  covers allocation; there is nothing to protect/free on the live path).
+
+### Measured (Dell 5500U, small scale, 12 threads)
+
+Scenario E is now **8-color in-place on both sides** (the C++ `benchmark.cpp`
+scenario E was switched from `laplTyp` to `-(laplTyp + OPT_8_COLOR_SCHEME)` so it
+runs the demo's live path, not the Jacobi path). Gvox/s (per iteration):
+
+| leg | C++ 1k / 5k / 10k | Rust 1k / 5k / 10k | ratio |
+|---|---|---|---|
+| Laplacian | 1.79 / 1.48 / 1.52 | 2.10 / 1.73 / 1.72 | +13–17% |
+| mean-curvature | 1.40 / 1.34 / 1.35 | 1.85 / 1.48 / 1.52 | +11–32% |
+
+`perf record` on the mean-curvature sweep: **90% of cycles** in the inlined
+`sweep` hot loop (the kernel is fully inlined — no standalone `kernel_meancurv`
+symbol survives). The win is the scheduling (pre-bucket vs 8× rescan), the
+step-5 pre-resolved 27-pointer halo gather, and the step-6 NT store; the fence
+choice is noise — `sfence` (15.26 ms), `mfence` (15.47 ms), none (15.50 ms) for a
+5000-active mean-curvature pass.
+
+The multi-iteration difftest tolerance is **1e-4 (Laplacian) / 1e-3
+(mean-curvature)**: the mean-curvature mixed partials are factored
+`0.25*(a-b-c+d)` (fewer FLOPs than C++'s two-stage `0.5` form), and near the
+`gradMagSq > 1e-7` guard cliff that ~1-ulp `H` difference flips a voxel between
+`H = hnum/grad` and `H = 0`; four Gauss-Seidel iterations propagate the
+discontinuity. The single-iteration kernel difftest still matches at 1e-4.
+
 Micro-optimization experiments (all rejected — no significant gain):
 
 - `blockmap.get_unchecked` in the halo gather: ~2% within noise (memory-bound

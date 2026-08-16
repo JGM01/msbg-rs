@@ -10,7 +10,7 @@ use msbg_rs::{
     math::laplacian::kernel_laplacian,
     math::meancurv::kernel_meancurv,
     math::simd::LANES,
-    math::stencil::MaskBlock,
+    math::stencil::SimdRng,
     math::BoundaryCondition,
     multires::halo::HaloBlock,
     sparse_grid::{BlockPtr, SparseGrid},
@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 const BSX: usize = 16;
 const N: usize = 4096;
-const CHUNKS: usize = N / LANES;
 const DT: f32 = 0.01;
 const TOL: f32 = 1e-4;
 
@@ -61,32 +60,32 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
 }
 
 /// Run one kernel application on the interior block (1,1,1) == bid 21.
-fn run_kernel(grid: &SparseGrid<f32, BSX, N>, lapl_typ: u8) -> [f32; N] {
-    let flags = Block::<u16, BSX, N>::new();
-    let mask = MaskBlock::<LANES, CHUNKS>::build(&flags);
+fn run_kernel(grid: &SparseGrid<f32, BSX, N>, lapl_typ: u8) -> Block<f32, BSX, N> {
     let mut out = Block::<f32, BSX, N>::new();
+    let mut rng = SimdRng::<LANES>::seed(0);
     let bid = grid.get_block_id(16, 16, 16); // block (1,1,1)
     let bc = BoundaryCondition::Neumann;
+    let out_ptr = out.data.as_mut_ptr();
 
     match lapl_typ {
         1 => {
             let mut halo = HaloBlock::<BSX, 18>::new();
             halo.fill::<1, false, f32, N>(grid, bid, bc);
-            kernel_laplacian::<LANES, CHUNKS, BSX, 18, N>(&halo, &mask, DT, &mut out);
+            kernel_laplacian::<LANES, BSX, 18, f32>(&halo, DT, false, out_ptr, &mut rng);
         }
         4 => {
             let mut halo = HaloBlock::<BSX, 18>::new();
             halo.fill::<1, true, f32, N>(grid, bid, bc);
-            kernel_meancurv::<LANES, CHUNKS, BSX, 18, N>(&halo, &mask, DT, &mut out);
+            kernel_meancurv::<LANES, BSX, 18, f32>(&halo, DT, false, out_ptr, &mut rng);
         }
         2 => {
             let mut halo = HaloBlock::<BSX, 20>::new();
             halo.fill::<2, true, f32, N>(grid, bid, bc);
-            kernel_bilaplacian::<LANES, CHUNKS, BSX, 20, N>(&halo, &mask, DT, &mut out);
+            kernel_bilaplacian::<LANES, BSX, 20, f32>(&halo, DT, false, out_ptr, &mut rng);
         }
         _ => unreachable!("unknown laplTyp"),
     }
-    out.data
+    out
 }
 
 const SAMPLE_IDX: [usize; 10] = [0, 1, 2, 3, 15, 16, 255, 256, 272, 4095];
@@ -101,7 +100,7 @@ const GOLDEN: [[f32; 10]; 3] = [
     [16.7649345, 14.840188, 13.5253305, 12.664402, 13.7202902, 14.6902142, 12.7754869, 14.6202278, 12.5455322, 10.6308451],
 ];
 
-fn assert_close(got: &[f32; N], want: &[f32], tag: &str) {
+fn assert_close(got: &[f32], want: &[f32], tag: &str) {
     let mut maxd = 0.0f32;
     let mut maxi = 0;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -122,15 +121,14 @@ fn assert_close(got: &[f32; N], want: &[f32], tag: &str) {
 #[test]
 fn stencil_matches_cpp_golden_samples() {
     let grid = build_grid();
-    for (t, lapl_typ) in [0usize, 1, 2].iter().enumerate() {
-        let typ = [1u8, 4, 2][*lapl_typ];
-        let out = run_kernel(&grid, typ);
+    for (t, lapl_typ) in [1u8, 4, 2].iter().enumerate() {
+        let out = run_kernel(&grid, *lapl_typ);
         for (k, &idx) in SAMPLE_IDX.iter().enumerate() {
-            let d = (out[idx] - GOLDEN[t][k]).abs();
+            let d = (out.data[idx] - GOLDEN[t][k]).abs();
             assert!(
                 d <= TOL,
-                "laplTyp {typ} idx {idx}: got {} want {} (diff {d})",
-                out[idx],
+                "laplTyp {lapl_typ} idx {idx}: got {} want {} (diff {d})",
+                out.data[idx],
                 GOLDEN[t][k]
             );
         }
@@ -166,6 +164,6 @@ fn stencil_against_cpp_binary_if_available() {
             i += 1;
         }
         let got = run_kernel(&grid, lapl_typ);
-        assert_close(&got, &want, &format!("live laplTyp {lapl_typ}"));
+        assert_close(&got.data, &want, &format!("live laplTyp {lapl_typ}"));
     }
 }
