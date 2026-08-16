@@ -182,23 +182,33 @@ full updates (`laplTyp==1`: `c + dt·L·G`; `laplTyp==4`: `f0 + clamp(dt·H, ±0
 
 ## Step 7 — Multires hierarchy
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Parity target:** `src/msbg.cpp` `MultiresSparseGrid::create`,
 `setRefinementMap` / `regularizeRefinementMap`, `BlockInfo`.
 
-**Scope:** resolution levels, a `ChannelTable` per level, per-block `BlockInfo`
-(level + flags), the refinement map and its regularization, and coarse-level
-ghost sampling (finishes the `fillHaloBlock_` parity from Step 5).
+**Scope:** resolution levels, per-level typed channels + directional face
+channels, per-block `BlockInfo` (level + flags), the refinement map and its
+regularization, coarse-level ghost sampling (finishes the `fillHaloBlock_`
+parity from Step 5), downsampling, and Morton block-list ordering.
 
-**Channels added here:** per-level tables (today's `ChannelTable` is
-single-level), and the directional face channels `face_area`/`face_coeff`
-(× 3 directions; a 3-grid or Vec3 modeling decision).
+**Channels added here:** per-level `LevelData` (density f32 / cell flags /
+distFineCoarse / face_area×3 / face_coeff×3) behind a closed `Level` enum over
+the supported block sizes.
 
 **Acceptance:**
-- Refinement-map correctness: legal transitions, `bi->level` semantics.
-- "Coarse sample == fine downsample" consistency checks.
-- Benchmark: multires halo fill with a coarse neighbor vs single-level.
+- Refinement-map correctness: legal transitions, `bi->level` semantics
+  (`regularize_refinement_map` + `compute_block_topology` unit tests, incl. the
+  in-place aliasing case and a >1 level jump).
+- "Coarse sample == fine downsample" consistency (`downsample_channel_avg` +
+  `sample_coarse` tests).
+- Benchmark: multires halo fill with a coarse neighbor vs single-level
+  (`benches/multires_bench.rs` vs `../MSBG/benchmark.cpp multires`). Rust
+  `fill_multires` ~1.8–2.3× faster than C++ `fillHaloBlock_` +
+  `OPT_BC_COARSE_LEVEL` (coarse pointers pre-resolved once per fill instead of
+  C++'s per-voxel `getValuePtr`); full `set_refinement_map` ~1.1–1.3× faster
+  than C++ `regularizeRefinementMap`+`setRefinementMap` *while also* doing the
+  cell-flag init the C++ path skips (see refactor.md §11).
 
 ---
 

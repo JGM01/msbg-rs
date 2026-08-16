@@ -306,6 +306,22 @@ where
         }
     }
 
+    /// Allocate a real data block for `bid` (initialized to `empty_value`) if it
+    /// is currently unallocated or a dummy. Returns without effect if a value
+    /// block already exists.
+    #[inline(always)]
+    pub fn ensure_block(&mut self, bid: usize) {
+        debug_assert!(bid < self.n_blocks);
+        if matches!(self.get_block(bid), BlockRef::Allocated(_)) {
+            return;
+        }
+        let new_block = BlockPtr(self.block_pool.alloc_block());
+        unsafe {
+            (*new_block.as_ptr()).data.fill(self.empty_value);
+        }
+        self.blockmap[bid] = Some(new_block);
+    }
+
     /// Set a voxel value. Allocates the block on demand (over `None` or a dummy).
     #[inline(always)]
     pub fn set_voxel(&mut self, x: usize, y: usize, z: usize, val: D) {

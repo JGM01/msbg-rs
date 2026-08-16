@@ -446,3 +446,55 @@ Reading the criterion output:
   `AtomicUsize::fetch_add` — visible in the blockpool benches.
 
 
+
+---
+
+## 11. Multires hierarchy (step 7)
+
+The C++ multires layer has three structural costs the port removes:
+
+- **AoS `BlockInfo { uint16 level, flags }` per (levelMg, block)** — `nLevels`
+  copies, rewritten every `setRefinementMap`. Rust stores the level-0 refinement
+  level as a single `u8` per block (`BlockInfoStore::level0`) and derives the
+  per-levelMG effective level as `max(level0[bid], levelMg)` on demand — the hot
+  refinement sweeps walk 1 byte/block instead of 4.
+- **`getChannelAddr` void\*\* indirection** over ~40 named `SparseGrid*` fields.
+  Rust uses a typed `LevelData<BSX, N>` (density f32, cell flags, distFineCoarse,
+  3×face_area, 3×face_coeff) behind a closed `Level` enum — cross-level dispatch
+  happens once per operation, not per voxel.
+- **`setRefinementMap` unconditionally `resetChannel(CH_CELL_FLAGS)`** (free +
+  reallocate the blockmap + `BlockPool` for every MG level) even when
+  `doInitCellFlags=false`. The Rust topology computation touches nothing but the
+  level/flags arrays.
+
+Benchmarks (`benches/multires_bench.rs` vs `../MSBG/benchmark.cpp multires`,
+small scale, spherical-shell refinement map, Dell 5500U):
+
+| workload | C++ | Rust | ratio |
+|---|---|---|---|
+| multires halo gather (608 fine blocks) | 1.35 Gvox/s | 3.16 Gvox/s | ~2.3× |
+| multires halo gather (5240 fine blocks) | 2.02 Gvox/s | 3.63 Gvox/s | ~1.8× |
+| set_refinement_map (4096 blocks) | 12.1 ms | 11.0 ms | ~1.1× |
+| set_refinement_map (35937 blocks) | 93.3 ms | 81.7 ms | ~1.14× |
+
+The halo win is the step-5 pre-resolution carried to the coarse path: `fill_multires`
+resolves each coarse neighbor's data pointer once (per 3×3×3 neighborhood) and
+reads it with direct index math, where C++ `getOutOfBlockValue` +
+`OPT_BC_COARSE_LEVEL` does a full `getValuePtr` (blockmap lookup + clip) per halo
+voxel. The `set_refinement_map` win is understated: the Rust path *also*
+initializes the cell flags the C++ benchmark path (`doInitCellFlags=false`)
+skips. Note the 5500U thermal-throttles under sustained benchmarking, so the
+absolute deltas wobble ±10–15%; the halo gap is far outside that.
+
+`init_dist_fine_coarse` (the `CH_DIST_FINECOARSE` fill) is SIMD-vectorized across
+x (`Simd<f32, LANES>`), hoisting the y/z distance out of the x loop and using
+`to_int_unchecked` for the quantize; the C++ `distToBoxSq` is a 4-wide `Vec4f`
+that wastes its 4th lane. Two rejected experiments: a scalar `f32::INFINITY`-init
+`simd_min` accumulate (fine), and a `f32 as u16` store (the Rust saturating cast
+added ~40% over `to_int_unchecked` + `cast`).
+
+Morton ordering (`sort_block_list_morton`) is enabled (C++ `sortBlockListMorton`
+is `#ifdef`'d out): the key is computed on the coarsest lattice so a coarse block
+and its ≤8 fine descendants are contiguous in the sorted active-block list — the
+index-space interleaving a cache-friendly sweep and the eventual temporal-blocking
+scheme need, without touching physical allocation.

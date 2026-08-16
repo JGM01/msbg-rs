@@ -84,7 +84,7 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
             }
         }
 
-        let dst = self.data.as_mut_ptr();
+    let dst = self.data.as_mut_ptr();
         let dy_stride = HSX;
         let dz_stride = HSX * HSX;
 
@@ -178,6 +178,203 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
 impl<const BSX: usize, const HSX: usize> Default for HaloBlock<BSX, HSX> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Fill the halo for a block in a *multires* grid: neighbors at the same level
+/// are read from `grid`, neighbors at a coarser level (per `levels`) are ghost
+/// sampled from `coarse` (fine coordinate `>> 1`), matching the C++
+/// `OPT_BC_COARSE_LEVEL` path of `getOutOfBlockValue` (`halo.h`).
+///
+/// The center block is always fine, so the contiguous middle copy is unchanged;
+/// only the halo border reads may hit a coarse neighbor.
+#[inline]
+pub fn fill_multires<
+    const BSX: usize,
+    const HSX: usize,
+    const HALO: usize,
+    const FULL: bool,
+    D,
+    const N: usize,
+    const BSC: usize,
+    const NC: usize,
+>(
+    halo: &mut HaloBlock<BSX, HSX>,
+    grid: &SparseGrid<D, BSX, N>,
+    coarse: &SparseGrid<f32, BSC, NC>,
+    levels: &[u8],
+    bid: usize,
+    bc: BoundaryCondition,
+) where
+    D: Dequant<f32>,
+{
+    debug_assert_eq!(HSX, BSX + 2 * HALO, "HSX must equal BSX + 2*HALO");
+    debug_assert_eq!(BSX, BSC * 2, "coarse block size must be half the fine");
+    let bsx_log2 = BSX.trailing_zeros();
+    let bsx_mask = BSX - 1;
+    let bsx_i = BSX as i32;
+
+    let nx = grid.nx as i32;
+    let ny = grid.ny as i32;
+    let nz = grid.nz as i32;
+    let sx = grid.sx as i32;
+    let sy = grid.sy as i32;
+    let sz = grid.sz as i32;
+    let empty_f32 = grid.empty_value().dequant();
+
+    let bx0 = (bid % grid.nx) as i32;
+    let by0 = ((bid / grid.nx) % grid.ny) as i32;
+    let bz0 = (bid / grid.nxy) as i32;
+    let x0 = bx0 * bsx_i;
+    let lvl = levels[bid];
+
+    let empty_ptr = unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() };
+    let full_ptr = unsafe { (*grid.full_block.as_ptr()).data.as_ptr() };
+
+    // Resolve the (2*HALO+1)^3 neighborhood once: a fine data pointer per same-
+    // level neighbor, a coarse data pointer per coarser neighbor (per `levels`).
+    let n = 2 * HALO + 1;
+    debug_assert!(n <= 5, "HALO must be <= 2");
+    let halo_i = HALO as i32;
+    let mut ptrs: [*const D; 125] = [empty_ptr; 125];
+    let mut coarse_ptrs: [*const f32; 125] = [std::ptr::null(); 125];
+    let coarse_log2 = BSC.trailing_zeros();
+    let coarse_mask = BSC - 1;
+    let coarse_empty = unsafe { (*coarse.empty_block.as_ptr()).data.as_ptr() };
+    let coarse_full = unsafe { (*coarse.full_block.as_ptr()).data.as_ptr() };
+    for dz in 0..n {
+        for dy in 0..n {
+            for dx in 0..n {
+                let idx = dx + n * dy + n * n * dz;
+                let bx = bx0 + dx as i32 - halo_i;
+                let by = by0 + dy as i32 - halo_i;
+                let bz = bz0 + dz as i32 - halo_i;
+                if bx >= 0 && bx < nx && by >= 0 && by < ny && bz >= 0 && bz < nz {
+                    let b = (bx as usize) + (by as usize) * grid.nx + (bz as usize) * grid.nxy;
+                    if levels[b] > lvl {
+                        coarse_ptrs[idx] = match coarse.blockmap[b] {
+                            Some(p) if p == coarse.empty_block => coarse_empty,
+                            Some(p) if p == coarse.full_block => coarse_full,
+                            Some(p) => unsafe { (*p.as_ptr()).data.as_ptr() },
+                            None => coarse_empty,
+                        };
+                    } else {
+                        ptrs[idx] = match grid.blockmap[b] {
+                            Some(p) if p == grid.empty_block => empty_ptr,
+                            Some(p) if p == grid.full_block => full_ptr,
+                            Some(p) => unsafe { (*p.as_ptr()).data.as_ptr() },
+                            None => empty_ptr,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let dst = halo.data.as_mut_ptr();
+    let dy_stride = HSX;
+    let dz_stride = HSX * HSX;
+
+    // Read a voxel whose coords are already resolved into the domain.
+    let read = |x: i32, y: i32, z: i32| -> f32 {
+        let idx = ((x >> bsx_log2) - bx0 + halo_i) as usize
+            + n * (((y >> bsx_log2) - by0 + halo_i) as usize)
+            + n * n * (((z >> bsx_log2) - bz0 + halo_i) as usize);
+        debug_assert!(idx < n * n * n);
+        let cp = coarse_ptrs[idx];
+        if !cp.is_null() {
+            let vid = ((x as usize >> 1) & coarse_mask)
+                | (((y as usize >> 1) & coarse_mask) << coarse_log2)
+                | (((z as usize >> 1) & coarse_mask) << (2 * coarse_log2));
+            unsafe { *cp.add(vid) }
+        } else {
+            let vid = (x as usize & bsx_mask)
+                | ((y as usize & bsx_mask) << bsx_log2)
+                | ((z as usize & bsx_mask) << (2 * bsx_log2));
+            unsafe { (*ptrs[idx].add(vid)).dequant() }
+        }
+    };
+
+    let mut rx_left = [None; HALO];
+    let mut rx_right = [None; HALO];
+    for j in 0..HALO {
+        rx_left[j] = resolve_axis(x0 - halo_i + j as i32, sx - 1, bc);
+        rx_right[j] = resolve_axis(x0 + bsx_i + j as i32, sx - 1, bc);
+    }
+
+    for z in 0..HSX {
+        let gz = bz0 * bsx_i + z as i32 - halo_i;
+        let rz = resolve_axis(gz, sz - 1, bc);
+        for y in 0..HSX {
+            let gy = by0 * bsx_i + y as i32 - halo_i;
+            let ry = resolve_axis(gy, sy - 1, bc);
+            let row = z * dz_stride + y * dy_stride;
+
+            match (ry, rz) {
+                (Some(ryv), Some(rzv)) if x0 + bsx_i <= sx => {
+                    let by = ryv >> bsx_log2;
+                    let bz = rzv >> bsx_log2;
+                    let idx = halo_i as usize
+                        + n * ((by - by0 + halo_i) as usize)
+                        + n * n * ((bz - bz0 + halo_i) as usize);
+                    if !coarse_ptrs[idx].is_null() {
+                        // Middle row that falls in a coarse neighbor block only
+                        // happens for a partial trailing block; sample per voxel.
+                        unsafe {
+                            for i in 0..BSX {
+                                let gx = x0 + i as i32;
+                                let v = match resolve_axis(gx, sx - 1, bc) {
+                                    Some(rx) => read(rx, ryv, rzv),
+                                    None => empty_f32,
+                                };
+                                *dst.add(row + HALO + i) = v;
+                            }
+                        }
+                    } else {
+                        let p = ptrs[idx];
+                        let vid = ((ryv as usize & bsx_mask) << bsx_log2)
+                            | ((rzv as usize & bsx_mask) << (2 * bsx_log2));
+                        unsafe {
+                            D::copy_row(p.add(vid), dst.add(row + HALO), BSX);
+                        }
+                    }
+                }
+                (Some(ryv), Some(rzv)) => {
+                    let by = ryv;
+                    let bz = rzv;
+                    unsafe {
+                        for i in 0..BSX {
+                            let gx = x0 + i as i32;
+                            let v = match resolve_axis(gx, sx - 1, bc) {
+                                Some(rx) => read(rx, by, bz),
+                                None => empty_f32,
+                            };
+                            *dst.add(row + HALO + i) = v;
+                        }
+                    }
+                }
+                _ => unsafe {
+                    for i in 0..BSX {
+                        *dst.add(row + HALO + i) = empty_f32;
+                    }
+                },
+            }
+
+            if FULL || (y >= HALO && y < HALO + BSX && z >= HALO && z < HALO + BSX) {
+                unsafe {
+                    for j in 0..HALO {
+                        *dst.add(row + j) = match (rx_left[j], ry, rz) {
+                            (Some(lx), Some(ly), Some(lz)) => read(lx, ly, lz),
+                            _ => empty_f32,
+                        };
+                        *dst.add(row + HALO + BSX + j) = match (rx_right[j], ry, rz) {
+                            (Some(rx), Some(ly), Some(lz)) => read(rx, ly, lz),
+                            _ => empty_f32,
+                        };
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -511,6 +708,43 @@ mod halo_tests {
         assert_eq!(at(2, 2, 18), 22.0); // z=+1 -> block (1,1,2) = 22
         assert_eq!(at(0, 0, 0), 0.0); // corner (-2,-2,-2) -> block (0,0,0) = 0
         assert_eq!(at(19, 19, 19), 26.0); // corner (+2,+2,+2) -> block (2,2,2) = 26
+    }
+
+    // Multires: a fine block with a coarse neighbor ghost-samples the coarse
+    // grid (fine coord >> 1), matching C++ `OPT_BC_COARSE_LEVEL`.
+    #[test]
+    fn test_h_14_multires_coarse_neighbor() {
+        let fine_pool = Arc::new(BlockPool::<f32, BSX, N>::new(8, 64));
+        let mut fine = SparseGrid::new("fine".into(), 32, 16, 16, 0.0, 1.0, fine_pool);
+        for z in 0..16 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    fine.set_voxel(x, y, z, 1.0);
+                }
+            }
+        }
+        let coarse_pool = Arc::new(BlockPool::<f32, 8, 512>::new(8, 64));
+        let mut coarse = SparseGrid::new("coarse".into(), 16, 8, 8, 0.0, 1.0, coarse_pool);
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 8..16 {
+                    coarse.set_voxel(x, y, z, 5.0);
+                }
+            }
+        }
+        let levels = [0u8, 1]; // block 0 fine, block 1 coarse
+
+        let mut halo = HaloBlock::<BSX, HSX>::new();
+        fill_multires::<BSX, HSX, 1, true, f32, N, 8, 512>(
+            &mut halo, &fine, &coarse, &levels, 0, NEUMANN,
+        );
+
+        // Right halo (halo x=17 -> global x=16) reads coarse (8,0,0) = 5.0.
+        assert_eq!(halo_at(&halo, 17, 1, 1), 5.0);
+        // Center is the fine value.
+        assert_eq!(halo_at(&halo, 1, 1, 1), 1.0);
+        // Left halo (global x=-1) mirrors the fine edge (Neumann).
+        assert_eq!(halo_at(&halo, 0, 1, 1), 1.0);
     }
 
     #[test]
