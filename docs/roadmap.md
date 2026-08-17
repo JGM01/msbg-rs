@@ -394,3 +394,325 @@ C++ side gains `../MSBG/rendertest.cpp` + `build_rendertest.sh` (the real
 - Marching-cubes mesh export (`.ply`/`.obj`) — a separate step.
 - Volumetric emission/absorption rendering (the isosurface path is the parity
   target).
+
+---
+
+# Phase II — Paper replication (steps 11–22)
+
+Two goals: **(1) the true bunny-of-bunnies** — testCase 2 (`bun_zipper.ply`,
+35,947² = 1.29B particles) at 32,768³, ~100B active voxels, 256 GB — and
+**(2) the Adaptive Phase-Field-FLIP 2-phase simulation**, ending in a
+droplet-crown then a dam-break animation at paper scale.
+
+Decisions locked: **sparse blockmap + block 16** (not the paper's block-32 dense
+map); single-level FLIP first, then adaptive; single-phase first, then 2-phase;
+geometric multigrid pressure solver (their relaxed-Jacobi scheme); difftest each
+operator vs C++. The FLIP driver loop and the scenarios have no C++ counterpart
+in the repo (their sim driver is closed-source), so those steps verify against
+the paper's *published* throughput (~10B unknowns/s) + physical laws, while every
+operator beneath them is difftested against the real library.
+
+---
+
+## Step 11 — Sparse blockmap
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** C++ `_blockmap` (dense per-block `BlockInfo`, `msbg.cpp`) vs
+our dense per-channel `Vec<Option<BlockPtr>>`.
+
+**Scope:** replace the dense blockmap with a sparse, block-id-keyed `BlockMap`
+(open-addressing) so map cost scales with *active* blocks, not *virtual* blocks.
+At 32,768³/block-16 the dense map is 68.7 GB per grid — and ~1.85 TB across the
+27 multires channel maps; the sparse map is ~0.4 GB. This is the "smarter than
+them" architectural win that unblocks both goals. Coordinate indexing
+(`get_block_id`/`get_voxel_id`) is unchanged; only the storage changes.
+
+**Decisions (owned):** block 16 (L1-resident, our kernels stay valid) + sparse
+map instead of block 32 + dense map; u64 block keys (2048³ = 8.59B > u32::MAX);
+open-addressing vs `HashMap` chosen on measured hot-path probe cost; the
+multires `LevelData` collapses its 27 maps to one shared map.
+
+**Acceptance:**
+- All existing unit + difftests pass unchanged (map sits behind the existing API).
+- `blockmap_lookup` micro-bench: sparse probe within ~2× of a dense-array index.
+- **No-regression re-run** of every C++-backed bench (blockpool, halo, stencil,
+  interp, splat, surface, multires, render) — step-1..10 ratios must hold.
+- Memory: the multires scale-stress bench (`benches/multires_scale_bench.rs`)
+  RSS drops by the map overhead factor at a given domain.
+
+---
+
+## Step 12 — Paper-scale reconstruction (true bunny-of-bunnies)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** `msbg_demo.cpp` `msbg_test_sparse` testCase 2 (`bun_zipper.ply`,
+35,947² = 1.29B particles) — the README's 32,768³ / 100B-active-voxel run.
+
+**Scope:** 64-bit block addressing, the placement/bucket/splat scale-up to 1.29B
+particles (u64 block ids, counting sort over 8.59B blocks), and the memory model
+(density 195 GB + sparse map 0.4 GB + particles ~26 GB ≈ 225 GB → fits 256 GB;
+A3 streaming not required). Milestones: testCase 1 (66.8M, 1024³) on M3 →
+testCase 2 at 4096³/8192³ → 32,768³ on AWS.
+
+**Decisions (owned):** materialize the particle array (fits 256 GB; streaming
+deferred, not needed); verify the emergent ~100B active voxels match the paper
+for the same `rParticle=2`/`nbDist=2`; keep block 16.
+
+**Acceptance:**
+- `surface_bench` at 1024³/testCase 1 (66.8M particles) vs C++ `benchmark.cpp
+  surface` at the same config — real side-by-side.
+- testCase 2 (1.29B) per-phase throughput + RSS (Rust-only where C++ can't fit
+  our RAM; both on AWS).
+- The 32,768³ AWS run: ~100B active voxels, teaser frame via step 10.
+- **Beat:** `Sweeper` >10B unknowns/s on the 256 GB box (their headline),
+  measured not extrapolated.
+
+---
+
+## Step 13 — Implicit Laplacian operator (matvec + relaxation)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** `multiplyLaplacianMatrixOpt` / `processBlockLaplacian`
+(7-pt Poisson matvec) + `relax` / `relaxBlockList` (Jacobi/relaxed-Jacobi),
+`msbg3.cpp`.
+
+**Scope:** the *implicit* operator — `A·x` and Jacobi/Gauss-Seidel updates — on
+the sparse grid, distinct from the step-6/8 *explicit* smoother. Reuses the
+step-5 halo + step-6 stencil plumbing. The pressure solver's building block.
+
+**Decisions (owned):** 8-color in-place Gauss-Seidel (matches our sweeper infra)
++ relaxed-Jacobi `ω` (their `_mgSmOmegaSched1 = 1.7319f`, Yang et al. 2017); no
+scratch channels (in-place, per step 8); operator-level difftest because the
+full multigrid setup is hard to isolate in a C++ harness.
+
+**Acceptance:**
+- `difftest_pressure.rs` + `../MSBG/pressuretest.cpp`: matvec and one Jacobi
+  sweep match C++ `multiplyLaplacianMatrixOpt`/`relax` (golden + live).
+- `pressure_matvec` / `pressure_relax` benches vs the C++ harness.
+- Unit tests: matvec on affine fields (Laplacian = 0), BC handling, GS vs
+  Jacobi convergence rate.
+
+---
+
+## Step 14 — Geometric multigrid V-cycle (pressure solve)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** the C++ multigrid (`relax` over `_mgLevels`,
+`downsampleChannel` restriction, coarse solves), `msbg3.cpp`.
+
+**Scope:** V-cycle over the step-7 levels: smooth (step 13) → restrict
+(step-7 downsample) → coarse solve → prolongate (`sample_coarse`) → smooth.
+Converges the Poisson in O(n) vs O(n²) for plain relaxation.
+
+**Decisions (owned):** their relaxed-Jacobi smoother; reuse our already-faster
+downsample for restriction; target their convergence rate and beat it on
+throughput via our restriction + 8-color.
+
+**Acceptance:**
+- `multigrid_vcycle` bench vs C++: iterations-to-convergence (parity) +
+  unknowns/s per V-cycle (expect > C++ — our downsample is ~1.8× their
+  `downsampleChannel`).
+- Unit tests: constant-field solve, a known analytical Poisson (sphere),
+  multigrid == direct solve to tolerance.
+- Difftest one V-cycle vs the C++ harness where isolatable.
+
+---
+
+## Step 15 — Velocity transfer (P2G splat + G2P gather)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** none in the demo (it splats only density) — generalizes step
+9 to `Vec3` velocity (P2G) and pairs it with step-4 `SampleVec3` (G2P FLIP/PIC
+blend, C++ `G2P_FLIP_ALPHA_USE_GRID_LEVEL`).
+
+**Scope:** staged velocity splat (3 channels, same 8-color + L1 staging,
+race-free), the velocity gather with FLIP/PIC blending, and the particle→face
+velocity projection the step-20 MAC grid builds on.
+
+**Decisions (owned):** velocity splat reuses the density staging (3× buffer,
+3× bandwidth, still L1-resident); FLIP/PIC alpha per the C++ scheme; verify via
+the density-component difftest + physical round-trip (no C++ velocity-splat
+counterpart).
+
+**Acceptance:**
+- `velocity_splat` bench: GB/s at 3 channels vs our (and C++'s) density splat —
+  the bandwidth scaling is the regression check.
+- Physical: a rigidly-translating field splats/gathers back exactly; momentum
+  conservation; face vs cell velocity consistency.
+- Unit tests: 8-color race-freedom, cross-block splats.
+
+---
+
+## Step 16 — Flat FLIP renderer (particles + clear-air water, no shading)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** none in the C++ renderer (their `render.cpp` is a shaded
+density isosurface only) — the water-surface intersection reuses the step-10
+ESS-DDA raymarcher (already ~7.6× vs C++).
+
+**Scope:** a FLIP visualization mode in `msbg-render`: the phase-field iso
+raymarched (ESS-DDA) and filled flat opaque/translucent blue, the FLIP particles
+rendered as depth-occluded point splats, and transparent air. No lighting. This
+is the "can I see my sim" renderer — it makes the 1-phase-vs-2-phase difference
+legible: 2-phase air turbulence kicks spray particles into the air, 1-phase has
+none. Built and tested on synthetic particles + the step-9 density field,
+independently of the sim steps.
+
+**Decisions (owned):** flat surface color (bypass the step-10 `shade`);
+particles projected via the step-10 camera and depth-occluded by the surface;
+summed particle alpha as a cheap spray-density look; translucency is a flat
+alpha blend over the background (no volumetric integration — "slightly
+translucent" is a blend, not scattering).
+
+**Acceptance:**
+- Unit tests: a known particle set projects to known pixels; particles behind
+  the surface are occluded; flat surface color is normal-independent; alpha
+  blend math; determinism (same input → same frame).
+- Render a step-9 bunny density + a synthetic spray cloud: splatter visible,
+  surface flat blue, air transparent.
+- `flip_flat_render` bench: Mpix/s + Mparticles/s — the surface pass is the
+  step-10 ESS-DDA number (no regression), the particle pass is point-projection
+  throughput.
+
+---
+
+## Step 17 — Shaded/translucent FLIP renderer (lighting + velocity viz)
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** the step-10 shaded isosurface (Blinn-Phong, ~7.6× vs C++
+`render.cpp`) + velocity-field rendering (no C++ counterpart).
+
+**Scope:** the "pretty" renderer: (1) Blinn-Phong water surface (step 10) with
+translucent blending, (2) velocity-field visualization — a `|v|`/vorticity
+colormap slice overlay and/or an additive 3D field raymarch via `SampleVec3` —
+so the 2-phase air turbulence is visible, (3) lit particle drops. Tested on
+synthetic velocity fields + the step-9 density, independently of the sim steps.
+
+**Decisions (owned):** velocity viz = `SampleVec3` + turbo colormap (slices or
+additive 3D raymarch); vorticity = curl of the sampled velocity; translucency
+stays flat alpha (the deferred step-10 volumetric mode stays deferred).
+
+**Acceptance:**
+- Unit tests: colormap endpoints (zero velocity = background, max = hot);
+  vorticity of a rigid rotation is constant; translucent blend == expected
+  compositing.
+- Render the step-9 density + a synthetic vortex field: turbulence visible,
+  surface shaded + translucent.
+- `flip_shaded_render` bench: surface pass holds the step-10 ~7.6× ratio;
+  velocity-viz throughput reported separately.
+- Side-by-side flat (step 16) vs shaded (step 17) on the same frame — the
+  two-part deliverable.
+
+---
+
+## Step 18 — Single-phase FLIP driver
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** none in the repo (their FLIP loop is closed-source) — steps
+13/14/15 compose into the driver.
+
+**Scope:** the timestep loop: P2G (density + velocity) → phase-field
+mean-curvature smoothing (step 8) → pressure projection (step 14) → G2P (step
+15) → particle + velocity advection. Single-level, single-phase (water in a box).
+
+**Decisions (owned):** phase-field (no level-set reinit — `solveEikonalFIM`
+skipped); explicit mean-curvature keeps the interface narrow; CFL-limited
+explicit advection.
+
+**Acceptance:**
+- Physical: a translating droplet doesn't deform; divergence-free to tolerance;
+  volume/energy conservation over N steps.
+- `flip_timestep` bench: full-timestep throughput (particles/s, voxels/s) with
+  the operator breakdown — internal (no C++ driver), but each operator already
+  parity-benchmarked in 13–15.
+- A dam-break preview frame via the step-16 flat renderer (visual sanity).
+
+---
+
+## Step 19 — Adaptive multires FLIP
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** `downsampleVelocity` / `downsampleFaceDensity` (multires
+velocity restriction), the multires pressure solve.
+
+**Scope:** refine from the phase-field (interface = fine, bulk = coarse),
+velocity/density restriction to coarse levels, multires pressure V-cycle (step
+14 over step-7 levels), and the fine-coarse transfer each timestep.
+
+**Decisions (owned):** adaptivity driven by the phase-field (the "adaptive"
+claim); reuse step-7 refinement + step-14 V-cycle; *measure* whether adaptive
+beats single-level for the target scenario before committing to it (don't pay
+transfer cost for a marginal win).
+
+**Acceptance:**
+- `downsample_velocity` difftest + bench vs C++ `downsampleVelocity`.
+- Adaptive vs single-level timestep throughput on the same scenario (the "is
+  adaptivity worth it" evidence).
+- Unit tests: restriction/prolongation round-trip, refinement consistency
+  across a moving interface.
+
+---
+
+## Step 20 — 2-phase cut-cell MAC
+
+**Status:** HAVEN'T STARTED
+
+**Parity target:** `computeCellFaceAreaFractionsGhost` / `getFaceAreaGen` /
+`getFaceCoeffRightDomBorder` / `getGhostPressure_` — the sub-voxel air/water
+face-area machinery, `msbg.cpp`.
+
+**Scope:** air/water cell classification (`CELL_IS_LIQUID`/`CELL_AIR`/
+`CELL_SOLID`/`CELL_VOID`), face-area fractions for the cut-cell MAC pressure
+solve, free-surface BC, and surface tension via the phase-field curvature.
+
+**Decisions (owned):** keep the phase-field for the interface (no explicit level
+set); the face-area fractions are the C++ "2-phase" essence and are ported
+directly (they are the sub-voxel accuracy the paper shows off).
+
+**Acceptance:**
+- `difftest_facearea.rs` + C++ harness: face-area fractions match
+  `computeCellFaceAreaFractionsGhost` within tolerance.
+- 2-phase pressure solve with a free surface: hydrostatic equilibrium + the
+  classic 2-phase test cases.
+- Bench vs C++ face-area throughput.
+
+---
+
+## Step 21 — Droplet crown (Phase C #1)
+
+**Status:** HAVEN'T STARTED
+
+**Scope:** the full 2-phase droplet-crown scenario (steps 18–20 composed) at
+increasing resolution, ending at 32,768³ on AWS. The animation is the
+deliverable.
+
+**Acceptance:**
+- Droplet-crown animation at scale, visually matching the expected 2-phase
+  result.
+- Throughput vs the paper's ~10B unknowns/s on the same-class 256 GB box.
+- Regression: every operator holds its step-13..20 budget during the run.
+
+---
+
+## Step 22 — Dam-break + the showstopper (Phase C #2)
+
+**Status:** HAVEN'T STARTED
+
+**Scope:** the dam-break scenario at paper scale; the final side-by-side
+"we beat them" numbers (100B-voxel reconstruction + the 2-phase animation),
+plus the writeup (refactor.md sections) documenting where we're faster and why.
+
+**Acceptance:**
+- Dam-break animation at 32,768³.
+- The headline table: our e2e vs the paper's (reconstruction, smoothing
+  unknowns/s, pressure-solve throughput, total sim time) on the same 256 GB
+  machine.
