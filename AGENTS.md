@@ -37,8 +37,18 @@ a plain nightly toolchain.
 - `benches/allocator_benches.rs` — criterion benches (scenarios A–E)
 - `benches/interp_bench.rs` — field-sampling benches (scenario G)
 - `benches/surface_bench.rs` — step-9 surface benches (scenario H)
+- `benches/multires_scale_bench.rs` — multires memory-bound stress (M3 Pro 36 GB):
+  self-sizes the fine-shell density to `MSBG_STRESS_GB` (default 28 GB) and times
+  `set_refinement_map` + `fill_multires` halo + downsample at a working set that
+  cannot fit in cache. `MSBG_BENCH_SCALE=small` clamps to 0.5 GB (validates on
+  the Dell 5500U). Run the real thing on the MacBook with
+  `cargo bench --bench multires_scale_bench`.
 - `tests/difftest_cpp.rs` — differential test against the C++ baseline
 - `tests/difftest_interp.rs` — interpolation difftest vs `../MSBG/interptest.cpp`
+- `msbg-render/` — step-10 rendering **workspace crate** (camera, colormap,
+  `slice` O(N²) slicer, `raymarch` ESS-DDA isosurface raymarcher, `render_elem`),
+  `examples/render_bunny.rs`, `benches/render_bench.rs`, `tests/render_tests.rs`.
+  Depends only on `msbg-rs`'s `pub` API + `image`/`rayon`.
 - `docs/roadmap.md` — feature-parity plan; `docs/refactor.md` — design notes
 
 ## Build & test
@@ -144,6 +154,20 @@ near particle centers amplifies 1-ulp ratio differences):
 ```bash
 cd ../MSBG && nix-shell && ./build_splattest.sh && exit
 MSBG_CPP_SPLATTEST_BIN="$PWD/../MSBG/build/splattest" cargo test --test difftest_splat
+```
+
+### Render benchmark (step 10)
+
+The `msbg-render` bench runs the REAL reconstruction then the REAL renderers
+(`slice` + `raymarch`); the C++ side (`../MSBG/rendertest.cpp`) runs the real
+`getSlices2D` + `RaymarchRenderer`. Compare the `[Rust]` / `[C++]` lines:
+
+```bash
+cd ../MSBG && nix-shell && ./build_rendertest.sh && exit
+./build/rendertest data/bun_zipper_res2.ply 512 512 512 64 0.01 2.0 2.0 6 0.05 960 540
+
+cd ../msbg-rs && nix-shell
+MSBG_BENCH_SCALE=big MSBG_RENDER_W=960 MSBG_RENDER_H=540 cargo bench -p msbg-render --bench render_bench
 ```
 
 ## Debugging

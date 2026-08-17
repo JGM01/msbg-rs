@@ -613,3 +613,88 @@ was set empirically to cover that amplification without masking real bugs
   uppercase `E` scientific notation and `.5`/`5.` forms; the shipped files are
   plain decimals. A hand-rolled scanner is the documented fallback.
 
+## 13. Rendering (step 10)
+
+The renderer lives in a **separate workspace crate** (`msbg-render`) so it can
+only see `msbg-rs`'s `pub` items — the step-10 acceptance criterion made
+structural, not conventional.
+
+### The C++ slice extractor is O(N³) *and* dead
+
+`getSlices2D` (`msbg.cpp:5057`) has **zero call sites** in the repo; the demo's
+`visualizeSlices` runs the same O(N³) triple loop through the panel UI. Both
+scan every voxel and test `xIsSlice||yIsSlice||zIsSlice`. The Rust slicer
+iterates only the output pixels and samples once each, so a `512³` slice costs
+`512²` samples. Measured (Dell 5500U, real bunny):
+
+| slices (3 planes) | C++ `getSlices2D` | Rust `render_slice` | ratio |
+|---|---|---|---|
+| 256³ | 34.9 Mpix/s | 231.8 Mpix/s | ~6.6× |
+| 512³ | 21.5 Mpix/s | 200.9 Mpix/s | ~9.3× |
+
+The ratio *grows* with resolution (the O(N³) scan vs O(N²) sample gap widens);
+note the Rust side does *linear* interpolation per pixel while the C++ demo path
+uses `IP_NEAREST`, so the Rust number is conservative.
+
+### The raymarch win is empty-space skipping, not faster sampling
+
+The C++ `RaymarchRenderer` marches a fixed `1/res` step with a per-sample
+`isEmptyBlock(bid) → return 0` early-out — it does not *advance* past the empty
+block, so empty regions are still micro-stepped one voxel at a time. The Rust
+renderer walks the `16³` block lattice with an Amanatides–Woo DDA and jumps to a
+block's exit plane in O(1) when it is empty, fine-stepping only inside value
+blocks (where the surface is). `dir == 0` axes are handled by infinite `tMax`,
+so grazing rays don't divide by zero.
+
+Measured (Dell 5500U, real bunny):
+
+| raymarch | C++ | Rust (ESS) | ratio |
+|---|---|---|---|
+| 256³, 640×480 | 2.77 Mray/s | 7.12 Mray/s | ~2.6× |
+| 512³, 960×540 | 1.26 Mray/s | 9.52 Mray/s | ~7.6× |
+
+ESS-on vs ESS-off (the fixed-step reference with the same sampler): **5.0×
+@256³, 18.5× @512³**. The `perf` profile is clean: **86.5%** of raymarch cycles
+in `Sample::sample::<Linear>` (the trilinear gather), 11.8% in the trace
+closure — after ESS, traversal overhead is gone and the remaining cost is the
+essential surface sampling. The natural next lever is SIMD ray packets (4–8
+rays per `Simd` lane sharing one DDA traversal).
+
+### DDA gotcha: a ray origin exactly on a block boundary
+
+The demo camera sits at `x = 0.5·sx`, a multiple of `BSX`, so every ray with a
+negative `x` direction starts with `t_max[x] == 0` — the block boundary is
+"now". The first cut of the empty-block skip treated `tnext <= t` as "no
+progress" and returned no-hit, killing every negative-x ray at `t = 0` and
+blanking half the frame (the "bunny cut in half" bug). The fix: `advance()` to
+the next block unconditionally (it moves the block index with no `t` change) and
+only bail when the block exit is past the ray limit. This also made the
+*benchmark* look better than it was — half the rays returned `None` for free —
+so the table above is the corrected measurement. Regression test:
+`raymarch_11_origin_on_block_boundary`.
+
+### A real public-API finding: the sampler has no empty-block early-out
+
+The ESS-off reference is ~2.4× *slower* than the C++ raymarcher, not at parity.
+The reason is instructive: C++ `sampleDensity` fuses "is this block empty" +
+"interpolate" into one function, so it never interpolates in empty space. The
+Rust public `Sampler::sample::<Linear>` has no such hint — a naive consumer
+pays the full 8-corner gather for every empty-space sample. The renderer's ESS
+is exactly the workaround a user must write. This is the kind of design flaw
+step 10 exists to surface; a future `Sampler` "empty block" fast path (or a
+documented `is_empty_block` + gather pairing) would close the gap for naive
+consumers.
+
+### Other step-10 findings
+
+- **The camera is left-handed and in normalized `[0,1]³`.** C++
+  `right = cross(forward, worldUp)` with `worldUp = +Y` points *left*; the ray
+  is `normalize(forward·focal + right·ndcX + up·ndcY)`, camera at `{0,0,-5}` by
+  default (but the demo overrides it to `{0.5,0.8,0.7}`, inside the grid).
+  `msbg-render` reproduces this basis in native `Vec3` (no `glam` needed — the
+  whole thing is three lines).
+- **`getSlices2D` needs the vec3 channel just for `sx/sy/sz`** (`_sparseGrids[0]
+  .vec3_1[0]`) and asserts `levelMg==0`; `RaymarchRenderer` is in `libmsbg.a`
+  (`render.o`), so the harness links against the existing static lib.
+- **The C++ renders in `double` (`RealType`)** for ray/camera math; Rust uses
+  `f32` throughout, matching the interpolation layer.

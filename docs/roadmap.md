@@ -328,17 +328,69 @@ finalize,mod}.rs`, and the `Quant` storage trait in `src/channel.rs`.
 
 ## Step 10 — Rendering & end-user test
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
-**Parity target:** `src/render.cpp` (raymarch), `src/bitmap*` / `readpng.c`
-(PNG output), `src/visualizeSlices.cpp` (2D slices).
+**Parity target:** `src/render.cpp` (`RaymarchRenderer`), `src/msbg.cpp`
+`getSlices2D`, `src/bitmap*`/`readpng.c` (PNG output).
 
-**Scope:** offline rendering (marching cubes or raymarch) + image output,
-implemented with Rust crates and driven **only through the library's public
-API** — the point is to surface end-user design flaws, not to port the C++
-renderer (its UI/panel code is kinda bad).
+**Scope:** offline rendering (2D orthogonal slices + 3D isosurface raymarch)
++ PNG output, implemented as a **separate workspace crate `msbg-render`** that
+depends only on `msbg-rs`'s `pub` surface (`SparseGrid`, `Sampler`, channel
+types). Being outside the library crate, it *cannot* reach crate-internal items
+— the step doubles as proof that the public API is usable end-to-end. The
+C++ panel/UI glue (`visualizeSlices.cpp`, `panel.c`, `bitmap.c`) is not ported.
+
+Layout: `msbg-render/{src/{camera,colormap,raymarch,render_elem,slice}.rs,
+examples/render_bunny.rs, benches/render_bench.rs, tests/render_tests.rs}`;
+C++ side gains `../MSBG/rendertest.cpp` + `build_rendertest.sh` (the real
+`getSlices2D` + `RaymarchRenderer` on the real splatted field).
+
+**Decisions (owned):**
+- **O(N²) direct slicing.** The C++ `getSlices2D` scans every voxel (`sx·sy·sz`)
+  and tests slice-plane membership; the Rust slicer iterates only the output
+  pixels and samples once per pixel (Rayon over rows). `512³` → `512²` samples
+  instead of `512³` scans.
+- **ESS-DDA raymarcher.** C++ `RaymarchRenderer` marches every ray at a fixed
+  step with a per-sample `isEmptyBlock` early-out that returns `0` *without
+  advancing*. Rust instead walks the `16³` block lattice with an Amanatides–Woo
+  DDA and skips an empty block in O(1) (jump to the ray's block-exit plane),
+  fine-stepping only inside value blocks.
+- **Unified linear sampling + linear gradient** (C++ splits trilinear iso
+  detection vs cubic shading — a wart, not a feature). Samples are taken in
+  *physical* density space via a `RenderElem` trait (`Density`/`f32` identity,
+  `Density8` squared), so `Density8`'s sqrt compression is undone before the
+  `iso = 0.5` comparison.
+- **Native `Vec3` camera, no `glam`** — the C++ basis is a 3-line left-handed
+  look-at (`right = cross(forward, up)`), reproduced exactly; `image` (png) is
+  the only new dependency.
+- **No scratch/float channels.** Rendering is read-only over the step-9
+  `SparseGrid<Density>`; `Sampler` dequantizes on the fly.
 
 **Acceptance:**
-- Render the bunny-of-bunnies from a Step 9 density field.
-- The render consumes only the `Sample`/iteration public API (no crate-internal
-  access), confirming the API is usable.
+- `msbg-render/tests/render_tests.rs` — 10 tests: 2 happy paths (sphere slice /
+  sphere raymarch) + boundary/awkward (slice out-of-bounds Dirichlet-vs-Clamp,
+  grazing/coplanar ray, camera-inside-density, ESS≡micro-step equivalence,
+  `Density8` sqrt round-trip, 512×16×16 ribbon, ray-misses-grid, all-empty
+  grid).
+- `examples/render_bunny.rs` reconstructs the bunny through the public API and
+  writes PNG slices + a raymarch frame.
+- Benchmarks (`benches/render_bench.rs` vs `../MSBG/rendertest.cpp`, real bunny,
+  Dell 5500U):
+  | workload | C++ | Rust | ratio |
+  |---|---|---|---|
+  | slice (256³ / 3 planes) | 34.9 Mpix/s | 231.8 Mpix/s | **~6.6×** |
+  | slice (512³ / 3 planes) | 21.5 Mpix/s | 200.9 Mpix/s | **~9.3×** |
+  | raymarch (256³, 640×480) | 2.77 Mray/s | 7.12 Mray/s | **~2.6×** |
+  | raymarch (512³, 960×540) | 1.26 Mray/s | 9.52 Mray/s | **~7.6×** |
+  The slice ratio grows with resolution (O(N³)→O(N²)); the raymarch ratio grows
+  because a larger domain is proportionally emptier. ESS-on vs ESS-off (the
+  fixed-step reference): **5.0× @256³, 18.5× @512³**. `perf`: 86.5% of raymarch
+  cycles in `Sample::sample::<Linear>` — the remaining cost is the essential
+  surface sampling, not traversal overhead (see refactor.md §13).
+
+**Deferred:**
+- SIMD ray packets (4–8 rays per `Simd` lane sharing one DDA traversal) — the
+  natural next win now that ESS has removed the empty-space overhead.
+- Marching-cubes mesh export (`.ply`/`.obj`) — a separate step.
+- Volumetric emission/absorption rendering (the isosurface path is the parity
+  target).
