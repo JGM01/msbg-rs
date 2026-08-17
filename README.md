@@ -29,12 +29,3 @@ The C++ baseline msut live in `../MSBG` and is used for differential tests and
 benchmark comparisons; see the two `AGENTS.md` files for how to build and run it.
 If you do not have the original `MSBG` repository in the same directory as this
 one, you will not be able to run many of the difftests & other comparison tools.
-
-## Layout
-
-- `src/blockpool.rs` — aligned blocks and a lock-free monotonic allocator
-- `src/sparse_grid.rs` — single-level `SparseGrid<T>`
-- `src/channel.rs` — typed data channels (density, pressure, velocity, ...)
-- `src/math/` — field sampling/interpolation and SIMD stencil kernels
-- `src/multires/` — halo gather and block iteration
-- `src/thread_pool.rs` — rayon workers with FTZ/DAZ enabled
