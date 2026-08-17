@@ -548,3 +548,68 @@ is `#ifdef`'d out): the key is computed on the coarsest lattice so a coarse bloc
 and its ≤8 fine descendants are contiguous in the sorted active-block list — the
 index-space interleaving a cache-friendly sweep and the eventual temporal-blocking
 scheme need, without touching physical allocation.
+
+## 12. Surface reconstruction (step 9)
+
+### The splat is DRAM-latency bound in C++, so we changed the architecture
+
+The C++ `msbg_test_sparse` splat does a per-voxel `min`-RMW directly into the
+grid for every overlapping particle, race-free via the 8-color scheme. At scale
+the RMWs all miss cache (the active set is far larger than L3), so the splat is
+DRAM-latency bound: a 16.7M-particle bunny-of-bunnies took **~17 minutes**
+(≈ 16K particles/s) before we killed it.
+
+The Rust port instead uses **thread-local staging + a one-time commit**:
+
+1. **Stage** (`stage_chunk`, SIMD8): each block's particle chunk accumulates its
+   `min` into a thread-local `(BSX+2·ceil(rScan))³ = 24³` buffer (`MSX=24`).
+   The whole buffer lives in L1 (27 KB), so the ~140M particle-voxel writes are
+   L1 hits. The inner loop quantizes 8 voxels per SIMD lane group.
+2. **Commit** (`commit_chunk`, SIMD): write each *touched* staging voxel to its
+   real block exactly once per contributing block — `min(grid, staging)` with a
+   16-lane (interior) / 4-lane (margin) SIMD min that skips untouched chunks.
+   The 8-color pass order still makes it race-free (`rScan < BSX`).
+
+The RMW count drops from `#overlapping particles` to `#contributing blocks`
+(≤ 8), cutting the grid traffic ~100× for dense clouds. Result: the splat went
+from ~17 minutes to ~0.1 s for the same particle count (per-particle 390 → 106 ms
+at 523K particles). Two experiments that lost: MSX=32/SIMD16 (the 64 KB buffer
+spills L1 → 226 ms), and keeping the scalar stage (175 ms).
+
+### Placement: C++ SIMD4 vs Rust scalar
+
+The placement loop (`sort::place`) is the one phase where C++ wins (95.7 vs
+14.5 Mparticles/s at scale). The C++ computes the 3-axis position + domain +
+footprint with `Vec4f` SIMD4 (~8 ops) and writes to a preallocated array; the
+Rust path is scalar (~30 ops) with Vec pushes. The position math is identical
+bit-for-bit (the non-fused `origin + inst_scale·(bj−bbox)` form; a `mul_add`
+contraction diverged from g++'s codegen by up to 14 density ulps after the
+finalize sqrt near ratio 0). The footprint uses the C++-faithful division form
+(`trunc(p/bsx ± rScan/bsx)`); folding it into the center-block offset
+(`fp = p − 16·bx`) was within noise, so placement and active-block determination
+share the single implementation. An SOA-SIMD placement is deferred (roadmap
+step 9).
+
+### Diff-testing the u16 field: ulp budgets and the finalize sqrt cliff
+
+The pipeline is compared against `../MSBG/splattest.cpp` (the real demo path)
+field-by-field. Field A (after finalize) and B (after 6 MC sweeps) match within
+**max 2 ulps** with **≤0.1% of voxels off by 1** — the residual is the expected
+f32/FMA divergence. Note the sharp edge: the finalize maps `sqrt(distSq)` near
+the particle centers where `d(sqrt)/d(ratio) → ∞`, so a 1-ulp difference in the
+splat's stored ratio can become a ~14-ulp difference in the density. The budget
+was set empirically to cover that amplification without masking real bugs
+(a missing footprint block shows up as thousands of ulps, not a few).
+
+### Other step-9 findings
+
+- **The demo is single-level and scratch-free.** `msbg_test_sparse` uses
+  `OPT_SINGLE_LEVEL`; the refinement map is field-neutral. The splat, finalize,
+  and smoother all operate on the one `CH_UINT16_1` channel.
+- **The 1-voxel-halo staging plan was wrong for `rScan=4`.** A particle within
+  `rScan` of its block boundary spills up to 4 voxels into the neighbor; the
+  staging window must be `ceil(rScan)` deep.
+- **`ply-rs` handles the ASCII bunny files** but its payload grammar rejects
+  uppercase `E` scientific notation and `.5`/`5.` forms; the shipped files are
+  plain decimals. A hand-rolled scanner is the documented fallback.
+

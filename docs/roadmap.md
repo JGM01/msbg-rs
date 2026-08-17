@@ -268,24 +268,61 @@ pre-bucketed color lists + Morton sort; `sfence` per block (benchmarked vs
 
 ## Step 9 — Surface reconstruction pipeline
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Parity target:** `src/msbg_demo.cpp` `msbg_test_sparse` (PLY load, 8-color
 lock-free particle splatting, finalize, active-block determination).
 
 **Scope:** read particles, splat them into a density channel, determine active
 blocks, and run the Step 8 smoother — the "bunny" pipeline without rendering.
+`src/io/ply.rs` (PLY load via `ply-rs`), `src/particles/{sort,splat,active,
+finalize,mod}.rs`, and the `Quant` storage trait in `src/channel.rs`.
 
-**Channels added here:** `FaceDensity` (Vec3u16) render channel, particle/uint8
-tmp channels, and the SIMD batch for `Density8` (8-bit build path).
+**Channels added here:** `FaceDensity` (Vec3u16) type + channel-table row +
+`Dequant<Vec3>` (a multires phase-field channel; not used by the pipeline),
+`quantize_density8`/`dequantize_density8` SIMD batches.
 
-Deferred (no step owns them yet): `PSFloat`/`double` pressure (opt-in build),
-and a shared byte-arena pool for lower peak DRAM (a separate `BlockPool`
-redesign).
+**Decisions (owned):**
+- **Thread-local staging + SIMD commit instead of direct 8-color scatter.** The
+  C++ path does a per-voxel `min`-RMW into the grid for every overlapping
+  particle and becomes DRAM-latency bound at scale (measured ~17 min for 16.7M
+  particles vs 0.2 s for the staged path). The Rust splat accumulates each
+  block's particles into a thread-local `24³` (`MSX=24`) buffer in L1, then a
+  SIMD `commit_chunk` writes each *touched* voxel to the grid exactly once per
+  contributing block (8-coloring keeps it race-free, `rScan < BSX`).
+- **SIMD8 staging** (`stage_chunk`): the splat's hot loop quantizes 8 voxels
+  per lane group; MSX=24 keeps the buffer L1-resident (the MSX=32/SIMD16
+  variant spilled to L2 and regressed).
+- **No scratch channels** — the pipeline runs entirely on one `Density` (u16)
+  channel; `applyChannelPdeFast` with `CH_NULL` scratch is in-place (matches
+  the step-8 finding).
+- **No multires** — `OPT_SINGLE_LEVEL` demo semantics map to a plain
+  `SparseGrid<Density>` + the step-8 `Sweeper`; refinement maps are field-neutral.
+- **Placement stays scalar** — see refactor.md §12 for the SIMD4 gap.
 
 **Acceptance:**
-- A `.ply` produces a density field with the expected block occupancy.
-- Benchmark: splatting and smoothing throughput on the bunny at scale.
+- `tests/difftest_splat.rs` vs `../MSBG/splattest.cpp` (res2 bunny, 256³,
+  single instance): block occupancy identical, full 16.7M-voxel field A (after
+  finalize) and B (after 6 MC sweeps) within the budget (L-inf ≤ 2 ulps, ≤0.1%
+  off by 1 ulp) — verified against the live C++ binary.
+- Unit test matrix across `particles/*` (happy paths + boundary/awkward: block
+  boundary-crossing splats, domain corners, overlap min, radius cull, quantize
+  endpoints, degenerate clouds, dedup, asymmetric dims).
+- Benchmark (`benches/surface_bench.rs` vs C++ `benchmark.cpp surface`, 512³ /
+  64 instances / 523K particles, Dell 5500U): **splat 3.7× faster, finalize
+  1.4×, parse 1.7×, e2e (load→place→splat→finalize→6 MC) 2.6× faster
+  (156 vs 400 ms)**. Placement is 0.15× (scalar vs C++ SIMD4) — see refactor.md
+  §12. The full bunny-of-bunnies (1024³, 1.29G particles) needs >20 GB RAM and
+  is deferred (below).
+
+**Deferred:**
+- **A3 streaming generate-on-splat** (no materialized particle array; bucket
+  `(instance, base-range)` per footprint block) and the memory-optimized
+  in-place counting sort — fold into the "shared byte-arena pool" deferred item.
+- **Placement SOA SIMD** (close the 6.9× scalar-vs-SIMD4 gap; see refactor.md
+  §12).
+- Full paper-scale bunny-of-bunnies (1024³, 1.29G particles) — needs >20 GB.
+- `FaceDensity` downsampling / multires phase-field machinery (no demo call sites).
 
 ---
 

@@ -30,9 +30,13 @@ a plain nightly toolchain.
 - `src/multires/` — `halo.rs` (18³ gather), `iterator.rs`
 - `src/math/` — `sample.rs` (interpolation), `bspline.rs`, `gather.rs`,
   `boundary.rs`, `laplacian.rs` (SIMD kernels)
+- `src/particles/` — step-9 surface reconstruction (`sort` placement + bucket,
+  `splat` staged 8-color scatter, `finalize`, `active`)
+- `src/io/` — PLY loading
 - `src/thread_pool.rs` — rayon pool with FTZ/DAZ workers
 - `benches/allocator_benches.rs` — criterion benches (scenarios A–E)
 - `benches/interp_bench.rs` — field-sampling benches (scenario G)
+- `benches/surface_bench.rs` — step-9 surface benches (scenario H)
 - `tests/difftest_cpp.rs` — differential test against the C++ baseline
 - `tests/difftest_interp.rs` — interpolation difftest vs `../MSBG/interptest.cpp`
 - `docs/roadmap.md` — feature-parity plan; `docs/refactor.md` — design notes
@@ -126,6 +130,20 @@ C++ binary if `MSBG_CPP_SMOOTHERTEST_BIN` is set:
 ```bash
 cd ../MSBG && nix-shell && ./build_smoothertest.sh && exit
 MSBG_CPP_SMOOTHERTEST_BIN="$PWD/../MSBG/build/smoothertest" cargo test --test difftest_smoother
+```
+
+### Surface difftest (`tests/difftest_splat.rs`)
+
+Compares the step-9 surface-reconstruction pipeline (PLY load, placement, staged
+8-color splat, finalize, 6 mean-curvature sweeps) against
+`../MSBG/splattest.cpp`. Golden samples are hardcoded; the live check runs the
+C++ binary if `MSBG_CPP_SPLATTEST_BIN` is set and compares the two full u16
+fields within a budget (L-inf ≤ 2 ulps, ≤0.1% off by 1 ulp — the finalize sqrt
+near particle centers amplifies 1-ulp ratio differences):
+
+```bash
+cd ../MSBG && nix-shell && ./build_splattest.sh && exit
+MSBG_CPP_SPLATTEST_BIN="$PWD/../MSBG/build/splattest" cargo test --test difftest_splat
 ```
 
 ## Debugging

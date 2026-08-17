@@ -8,6 +8,8 @@
 //! * [`channel`] — typed data channels (density, pressure, velocity, ...).
 //! * [`math`] — field sampling/interpolation and SIMD stencil kernels.
 //! * [`multires`] — halo gather and block iteration.
+//! * [`particles`] — step-9 surface reconstruction (PLY → splat → density).
+//! * [`io`] — file-format I/O (PLY).
 //! * [`thread_pool`] — rayon workers with FTZ/DAZ enabled.
 //!
 //! # Example
@@ -33,8 +35,10 @@
 
 pub mod blockpool;
 pub mod channel;
+pub mod io;
 pub mod math;
 pub mod multires;
+pub mod particles;
 pub mod solver;
 pub mod sparse_grid;
 pub mod thread_pool;

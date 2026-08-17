@@ -30,7 +30,7 @@
 use std::simd::f32x4;
 use std::simd::num::SimdFloat;
 
-use crate::channel::{Density, Density8, Vec3, Velocity};
+use crate::channel::{Density, Density8, FaceDensity, Vec3, Velocity};
 use crate::math::boundary::{BoundaryCondition, GridAlignment, Interpolation};
 use crate::math::bspline::{cubic_deriv2_weights, cubic_deriv_weights, cubic_weights};
 use crate::math::gather::{gather_map, Dequant};
@@ -77,6 +77,14 @@ impl Dequant<Vec3> for Velocity {
     #[inline(always)]
     fn dequant(self) -> Vec3 {
         self.0
+    }
+}
+
+impl Dequant<Vec3> for FaceDensity {
+    #[inline(always)]
+    fn dequant(self) -> Vec3 {
+        let inv = 1.0 / u16::MAX as f32;
+        Vec3([self.0[0] as f32 * inv, self.0[1] as f32 * inv, self.0[2] as f32 * inv])
     }
 }
 

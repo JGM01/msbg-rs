@@ -20,11 +20,13 @@
 //! let _: &SparseGrid<Density, 16, 4096> = t.get_pressure().unwrap();
 //! ```
 
+use crate::math::gather::Dequant;
 use crate::sparse_grid::SparseGrid;
 use std::mem::{align_of, size_of};
 use std::ops::{Add, Mul, Sub};
+use std::simd::cmp::{SimdOrd, SimdPartialEq, SimdPartialOrd};
 use std::simd::num::{SimdFloat, SimdInt, SimdUint};
-use std::simd::{f32x16, i32x16, u16x16, StdFloat};
+use std::simd::{f32x16, i32x16, u16x16, u8x16, Mask, Select, Simd, StdFloat};
 
 /// Quantized scalar density, `u16` in `[0, 65535]`.
 #[repr(transparent)]
@@ -55,6 +57,12 @@ pub struct Velocity(pub Vec3);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Density8(pub u8);
+
+/// Quantized per-face density (`FACE_DENSITY_16_BIT`): three `u16` components
+/// in `[0, 65535]`, used by the multires phase-field solver's face areas.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FaceDensity(pub [u16; 3]);
 
 // Solver/render channels: One newtype per channel to make the compiler
 // reject cross-channel mixing (Pressure vs Divergence vs Curvature, etc).
@@ -180,6 +188,265 @@ impl Density8 {
     }
 }
 
+/// Storage-side quantization contract of the surface-reconstruction pipeline,
+/// mirroring C++ `renderDensFromFloat_` / `renderDensToFloat_` with default
+/// flags (`doSqrtCompr=false`, `doSR=false`): a plain round on the
+/// splat/finalize path for every storage width. Sqrt compression only enters
+/// through the smoother's [`StoreBack`](crate::math::stencil::StoreBack) for
+/// the 8-bit build.
+///
+/// `dequant_chunk` / `quant_chunk` are the SIMD batch forms used by the
+/// finalize pass; `from_unit` is the scalar write form used by the splat.
+pub trait Quant: Copy + Default + PartialEq + Send + Sync + Dequant<f32> {
+    /// Quantize a `[0, 1]` float to storage (plain round).
+    fn from_unit(f: f32) -> Self;
+    /// `renderDensFromFloat(1.0)` — the untouched-voxel sentinel.
+    fn full() -> Self;
+    /// `renderDensFromFloat(0.0)`.
+    fn empty() -> Self;
+    /// Element-wise min (the splat's reduction over overlapping particles).
+    fn min_of(self, o: Self) -> Self;
+
+    /// SIMD-dequantize `W` contiguous elements to `f32` lanes.
+    ///
+    /// # Safety
+    ///
+    /// `src + off..off+W` must be in-bounds.
+    unsafe fn dequant_chunk<const W: usize>(src: *const Self, off: usize) -> Simd<f32, W>;
+
+    /// SIMD-quantize `W` `f32` lanes (plain round) into `dst`.
+    ///
+    /// # Safety
+    ///
+    /// `dst + off..off+W` must be in-bounds and the lanes in `[0, 1]`.
+    unsafe fn quant_chunk<const W: usize>(dst: *mut Self, off: usize, v: Simd<f32, W>);
+
+    /// SIMD `min`-commit: `dst[i] = min(dst[i], src[i])` for `W` lanes, skipping
+    /// entirely when every source lane is `full()` (untouched — the grid value
+    /// cannot decrease). One cache-line miss amortized over `W` voxels.
+    ///
+    /// # Safety
+    ///
+    /// `src`/`dst` must point at `W` in-bounds elements.
+    unsafe fn commit_chunk<const W: usize>(src: *const Self, dst: *mut Self);
+
+    /// SIMD stage: quantize `dist_sq * inv` (plain round) to `Self` lanes and
+    /// take the element-wise `min` into `dst + off` for lanes that are both
+    /// `in_run` and within `dist_sq_max`. Lanes outside the mask keep `dst`.
+    /// The splat's hot loop — one L1 hit + quantize per `W` voxels.
+    ///
+    /// # Safety
+    ///
+    /// `dst + off..off+W` must be in-bounds.
+    unsafe fn stage_chunk<const W: usize>(
+        dst: *mut Self,
+        off: usize,
+        dist_sq: Simd<f32, W>,
+        dist_sq_max: f32,
+        inv: f32,
+        in_run: Mask<i32, W>,
+    );
+}
+
+impl Quant for f32 {
+    #[inline(always)]
+    fn from_unit(f: f32) -> Self {
+        f
+    }
+    #[inline(always)]
+    fn full() -> Self {
+        1.0
+    }
+    #[inline(always)]
+    fn empty() -> Self {
+        0.0
+    }
+    #[inline(always)]
+    fn min_of(self, o: Self) -> Self {
+        self.min(o)
+    }
+    #[inline(always)]
+    unsafe fn dequant_chunk<const W: usize>(src: *const f32, off: usize) -> Simd<f32, W> {
+        unsafe { Simd::from_slice(std::slice::from_raw_parts(src.add(off), W)) }
+    }
+    #[inline(always)]
+    unsafe fn quant_chunk<const W: usize>(dst: *mut f32, off: usize, v: Simd<f32, W>) {
+        unsafe { v.copy_to_slice(std::slice::from_raw_parts_mut(dst.add(off), W)) };
+    }
+    #[inline(always)]
+    unsafe fn commit_chunk<const W: usize>(src: *const f32, dst: *mut f32) {
+        let s = unsafe { Simd::<f32, W>::from_slice(std::slice::from_raw_parts(src, W)) };
+        let full = Simd::splat(1.0);
+        if s.simd_eq(full).all() {
+            return;
+        }
+        let d = unsafe { Simd::<f32, W>::from_slice(std::slice::from_raw_parts(dst, W)) };
+        unsafe { d.simd_min(s).copy_to_slice(std::slice::from_raw_parts_mut(dst, W)) };
+    }
+    #[inline(always)]
+    unsafe fn stage_chunk<const W: usize>(
+        dst: *mut f32,
+        off: usize,
+        dist_sq: Simd<f32, W>,
+        dist_sq_max: f32,
+        inv: f32,
+        in_run: Mask<i32, W>,
+    ) {
+        let m = in_run & dist_sq.simd_le(Simd::splat(dist_sq_max));
+        let v = dist_sq * Simd::splat(inv);
+        let old = unsafe { Simd::<f32, W>::from_slice(std::slice::from_raw_parts(dst.add(off), W)) };
+        let new = m.select(v.simd_min(old), old);
+        unsafe { new.copy_to_slice(std::slice::from_raw_parts_mut(dst.add(off), W)) };
+    }
+}
+
+impl Quant for Density {
+    #[inline(always)]
+    fn from_unit(f: f32) -> Self {
+        Density::from_f32(f)
+    }
+    #[inline(always)]
+    fn full() -> Self {
+        Density(u16::MAX)
+    }
+    #[inline(always)]
+    fn empty() -> Self {
+        Density(0)
+    }
+    #[inline(always)]
+    fn min_of(self, o: Self) -> Self {
+        Density(self.0.min(o.0))
+    }
+    #[inline(always)]
+    unsafe fn dequant_chunk<const W: usize>(src: *const Density, off: usize) -> Simd<f32, W> {
+        let u = Simd::<u16, W>::from_slice(unsafe {
+            std::slice::from_raw_parts((src as *const u16).add(off), W)
+        });
+        let f: Simd<f32, W> = u.cast();
+        f * Simd::splat(1.0 / u16::MAX as f32)
+    }
+    #[inline(always)]
+    unsafe fn quant_chunk<const W: usize>(dst: *mut Density, off: usize, v: Simd<f32, W>) {
+        let rounded = (v * Simd::splat(u16::MAX as f32)).round();
+        // SAFETY: lanes are in [0, 1], so `rounded` is in [0, 65535].
+        let i: Simd<i32, W> = unsafe { rounded.to_int_unchecked() };
+        let u: Simd<u16, W> = i.cast();
+        unsafe { u.copy_to_slice(std::slice::from_raw_parts_mut((dst as *mut u16).add(off), W)) };
+    }
+    #[inline(always)]
+    unsafe fn commit_chunk<const W: usize>(src: *const Density, dst: *mut Density) {
+        let s = Simd::<u16, W>::from_slice(unsafe {
+            std::slice::from_raw_parts(src as *const u16, W)
+        });
+        if s.simd_eq(Simd::splat(u16::MAX)).all() {
+            return;
+        }
+        let d = Simd::<u16, W>::from_slice(unsafe {
+            std::slice::from_raw_parts(dst as *const u16, W)
+        });
+        unsafe {
+            d.simd_min(s)
+                .copy_to_slice(std::slice::from_raw_parts_mut(dst as *mut u16, W))
+        };
+    }
+    #[inline(always)]
+    unsafe fn stage_chunk<const W: usize>(
+        dst: *mut Density,
+        off: usize,
+        dist_sq: Simd<f32, W>,
+        dist_sq_max: f32,
+        inv: f32,
+        in_run: Mask<i32, W>,
+    ) {
+        let m = in_run & dist_sq.simd_le(Simd::splat(dist_sq_max));
+        let t = dist_sq * Simd::splat(inv);
+        let v = (t * Simd::splat(u16::MAX as f32)).round();
+        // SAFETY: in-run lanes are <= dist_sq_max; out-of-run lanes are bounded
+        // by the staging window (~1728 max), far below i32::MAX.
+        let i: Simd<i32, W> = unsafe { v.to_int_unchecked() };
+        let val: Simd<u16, W> = i.cast();
+        let old = Simd::<u16, W>::from_slice(unsafe {
+            std::slice::from_raw_parts((dst as *const u16).add(off), W)
+        });
+        let mu: Mask<i16, W> = m.cast();
+        let new = mu.select(val.simd_min(old), old);
+        unsafe { new.copy_to_slice(std::slice::from_raw_parts_mut((dst as *mut u16).add(off), W)) };
+    }
+}
+
+impl Quant for Density8 {
+    #[inline(always)]
+    fn from_unit(f: f32) -> Self {
+        debug_assert!(f.is_finite() && (0.0..=1.0).contains(&f));
+        Density8((f * Self::MAX).round() as u8)
+    }
+    #[inline(always)]
+    fn full() -> Self {
+        Density8(u8::MAX)
+    }
+    #[inline(always)]
+    fn empty() -> Self {
+        Density8(0)
+    }
+    #[inline(always)]
+    fn min_of(self, o: Self) -> Self {
+        Density8(self.0.min(o.0))
+    }
+    #[inline(always)]
+    unsafe fn dequant_chunk<const W: usize>(src: *const Density8, off: usize) -> Simd<f32, W> {
+        let u = Simd::<u8, W>::from_slice(unsafe {
+            std::slice::from_raw_parts((src as *const u8).add(off), W)
+        });
+        let f: Simd<f32, W> = u.cast();
+        f * Simd::splat(1.0 / u8::MAX as f32)
+    }
+    #[inline(always)]
+    unsafe fn quant_chunk<const W: usize>(dst: *mut Density8, off: usize, v: Simd<f32, W>) {
+        let rounded = (v * Simd::splat(u8::MAX as f32)).round();
+        // SAFETY: lanes are in [0, 1], so `rounded` is in [0, 255].
+        let i: Simd<i32, W> = unsafe { rounded.to_int_unchecked() };
+        let u: Simd<u8, W> = i.cast();
+        unsafe { u.copy_to_slice(std::slice::from_raw_parts_mut((dst as *mut u8).add(off), W)) };
+    }
+    #[inline(always)]
+    unsafe fn commit_chunk<const W: usize>(src: *const Density8, dst: *mut Density8) {
+        let s = Simd::<u8, W>::from_slice(unsafe {
+            std::slice::from_raw_parts(src as *const u8, W)
+        });
+        if s.simd_eq(Simd::splat(u8::MAX)).all() {
+            return;
+        }
+        let d = Simd::<u8, W>::from_slice(unsafe {
+            std::slice::from_raw_parts(dst as *const u8, W)
+        });
+        unsafe {
+            d.simd_min(s)
+                .copy_to_slice(std::slice::from_raw_parts_mut(dst as *mut u8, W))
+        };
+    }
+    #[inline(always)]
+    unsafe fn stage_chunk<const W: usize>(
+        dst: *mut Density8,
+        off: usize,
+        dist_sq: Simd<f32, W>,
+        dist_sq_max: f32,
+        inv: f32,
+        in_run: Mask<i32, W>,
+    ) {
+        let m = in_run & dist_sq.simd_le(Simd::splat(dist_sq_max));
+        let t = dist_sq * Simd::splat(inv);
+        let v = (t * Simd::splat(u8::MAX as f32)).round();
+        let i: Simd<i32, W> = unsafe { v.to_int_unchecked() };
+        let val: Simd<u8, W> = i.cast();
+        let old = Simd::<u8, W>::from_slice(unsafe {
+            std::slice::from_raw_parts((dst as *const u8).add(off), W)
+        });
+        let mu: Mask<i8, W> = m.cast();
+        let new = mu.select(val.simd_min(old), old);
+        unsafe { new.copy_to_slice(std::slice::from_raw_parts_mut((dst as *mut u8).add(off), W)) };
+    }
+}
+
 /// Batch dequantize: `Density` (u16) -> `f32` (16-wide SIMD + scalar tail).
 pub fn dequantize_density(src: &[Density], dst: &mut [f32]) {
     assert_eq!(src.len(), dst.len());
@@ -225,6 +492,55 @@ pub fn quantize_density(src: &[f32], dst: &mut [Density]) {
     }
     for j in i..n {
         dst[j] = Density::from_f32(src[j]).0;
+    }
+}
+
+/// Batch dequantize: `Density8` (u8) -> `f32` (16-wide SIMD + scalar tail).
+/// Linear decode only; sqrt decompression is the caller's job (matches
+/// `renderDensToFloat_` with `doSqrtCompr=false`).
+pub fn dequantize_density8(src: &[Density8], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(size_of::<Density8>(), size_of::<u8>());
+    debug_assert_eq!(align_of::<Density8>(), align_of::<u8>());
+    // SAFETY: `Density8` is `#[repr(transparent)]` over `u8`.
+    let src = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, src.len()) };
+    let n = src.len();
+    let scale = f32x16::splat(1.0 / Density8::MAX);
+    let mut i = 0;
+    while i + 16 <= n {
+        let u = u8x16::from_slice(&src[i..i + 16]);
+        let f: f32x16 = u.cast();
+        (f * scale).copy_to_slice(&mut dst[i..i + 16]);
+        i += 16;
+    }
+    for j in i..n {
+        dst[j] = src[j] as f32 * (1.0 / Density8::MAX);
+    }
+}
+
+/// Batch quantize: `f32` -> `Density8` (u8) (16-wide SIMD + scalar tail).
+/// Plain round, matching `renderDensFromFloat_` with `doSqrtCompr=false`.
+pub fn quantize_density8(src: &[f32], dst: &mut [Density8]) {
+    assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(size_of::<Density8>(), size_of::<u8>());
+    debug_assert_eq!(align_of::<Density8>(), align_of::<u8>());
+    // SAFETY: as above — `Density8` and `u8` share layout.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len()) };
+    let n = src.len();
+    let scale = f32x16::splat(Density8::MAX);
+    let mut i = 0;
+    while i + 16 <= n {
+        let f = f32x16::from_slice(&src[i..i + 16]);
+        let rounded = (f * scale).round();
+        // SAFETY: `rounded` is in `[0, 255]`; `to_int_unchecked` lowers to
+        // `cvttps2dq` and the `as`-semantics `cast` would scalarize.
+        let i32s: i32x16 = unsafe { rounded.to_int_unchecked::<i32>() };
+        let u: u8x16 = i32s.cast();
+        u.copy_to_slice(&mut dst[i..i + 16]);
+        i += 16;
+    }
+    for j in i..n {
+        dst[j] = Density8::from_unit(src[j]).0;
     }
 }
 
@@ -468,6 +784,7 @@ macro_rules! channel_table {
 channel_table! {
     density:          Density,
     density8:         Density8,
+    face_density:     FaceDensity,
     velocity:         Velocity,
     pressure:         Pressure,
     cell_flags:       CellFlags,
