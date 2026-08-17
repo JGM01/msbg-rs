@@ -38,11 +38,12 @@ const N: usize = 4096;
 const HSX: usize = 18;
 const SHELL_OCCUPANCY: f64 = 0.14;
 
-// Per fine block, empirically calibrated (small-scale RSS): f32 density (16 KiB)
-// + u16 cell_flags (8 KiB) + blockmaps (27 grids × 8 B/block) + BlockInfoStore +
-// ring/coarse density+flags + allocator overhead. Not a paper constant — it is
-// verified by the live RSS printout on each run.
-const BYTES_PER_FINE_BLOCK: f64 = 64.0 * 1024.0;
+// Per fine block, empirically calibrated on the M3 Pro (see AGENTS.md): f32
+// density (16 KiB) + u16 cell_flags (8 KiB) + u16 dist_fine_coarse (8 KiB) +
+// blockmaps/BlockInfoStore + ring/coarse channels + the fully-materialized
+// coarse downsample scratch (~14 KiB amortized) ≈ 45 KiB. Verified by the live
+// RSS printout on each run — `MSBG_STRESS_GB` now tracks final RSS to ~10%.
+const BYTES_PER_FINE_BLOCK: f64 = 45.0 * 1024.0;
 
 fn target_gb() -> f64 {
     match env::var("MSBG_BENCH_SCALE").as_deref() {
@@ -228,11 +229,15 @@ fn main() {
         black_box(&scratch);
     }
     let per = t0.elapsed() / iters as u32;
-    let ds_gb = fine.len() as f64 * (BSX * BSX * BSX * 4) as f64 / 1e9;
-    let ds_gbs = ds_gb / per.as_secs_f64();
+    let read_gb = fine.len() as f64 * (BSX * BSX * BSX * 4) as f64 / 1e9;
+    let write_gb = scratch.n_blocks as f64 * (8 * 8 * 8 * 4) as f64 / 1e9;
+    let ds_gbs = (read_gb + write_gb) / per.as_secs_f64();
     println!(
-        "      avg per pass: {:.2?} ({:.2} GB/s)",
-        per, ds_gbs
+        "      avg per pass: {:.2?} ({:.2} GB/s read+write, {:.2} GB read + {:.2} GB written)",
+        per,
+        ds_gbs,
+        read_gb,
+        write_gb
     );
 
     println!("\n============================================================");
@@ -241,7 +246,7 @@ fn main() {
     println!("  final RSS: {:.2} GB", gb(rss_bytes() as f64));
     println!("  set_refinement_map: {refine_ms:.0} ms ({n_blocks} blocks)");
     println!("  multires halo: {halo_gvox:.2} Gvox/s ({halo_gbs:.2} GB/s)");
-    println!("  downsample:     {ds_gbs:.2} GB/s");
+    println!("  downsample:     {ds_gbs:.2} GB/s (read+write)");
     println!("============================================================");
 }
 
