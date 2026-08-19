@@ -25,7 +25,7 @@ cargo bench --bench allocator_benches
 cargo bench --bench interp_bench
 ```
 
-The C++ baseline msut live in `../MSBG` and is used for differential tests and
+The C++ baseline must live in `../MSBG` and is used for differential tests and
 benchmark comparisons; see the two `AGENTS.md` files for how to build and run it.
 If you do not have the original `MSBG` repository in the same directory as this
 one, you will not be able to run many of the difftests & other comparison tools.
