@@ -8,5 +8,5 @@ pub mod refinement;
 pub mod sort;
 
 pub use grid::{MultiresGrid, MAX_LEVELS};
-pub use level::Level;
+pub use level::{DensityBlock, FaceBlock, Level, LevelBlock, LevelData};
 pub use refinement::{BlockGridDims, RefinementMap, Topology};

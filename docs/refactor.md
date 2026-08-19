@@ -698,3 +698,80 @@ consumers.
   (`render.o`), so the harness links against the existing static lib.
 - **The C++ renders in `double` (`RealType`)** for ray/camera math; Rust uses
   `f32` throughout, matching the interpolation layer.
+
+## 14. Sparse blockmap (step 11)
+
+The C++ `SparseGrid<T>::_blockmap` is a dense `Block<T>**` (sbg.h:2387) indexed
+by an `int bid` (`getBlockIndex` returns `int`, sbg.h:1744), and
+`MultiresSparseGrid::_blockmap[MSBG_MAXRESLEVELS]` is a second dense AoS
+`BlockInfo` array (msbg.h:958). Two hard limits at paper scale: the dense map is
+`n_blocks × 8` = **68.7 GB/grid @ 32,768³/block-16**, and the `int` bid
+overflows past 2³¹ blocks (8.59e9) — the C++ cannot even *address* its own
+headline resolution with block-16. The paper dodges this with block-32, at the
+cost of a non-L1-resident kernel; we keep block-16 and fix the map instead.
+
+### The `BlockMap` primitive (`src/blockmap.rs`)
+
+Open addressing, SoA (`keys: Vec<usize>` + `vals: Vec<MaybeUninit<V>>`), linear
+probing, power-of-two capacity, tombstones on delete. Absent = empty (the empty
+dummy is never stored); the full dummy is a real entry; `set_empty_block` is a
+`remove`. The `MaybeUninit` vals are sound because `V: Copy` never needs a drop.
+
+The first hash was a SplitMix64 finalizer (3 multiplies, a ~15-cycle serial
+dependency chain) — 3.3–3.9× slower than a dense index. The fix is a single
+odd-constant multiply `key * 0x9E37_79B9_7F4A_7C15`: multiplication by an odd
+constant is a *bijection mod 2^k*, so the low `k` bits (which linear probing
+consumes) are a perfect permutation of the key's low bits, spreading consecutive
+`bx`-cluster bids uniformly across the table. Measured (`benches/blockmap_bench.rs`,
+real block pointers, hits/misses): dense `Vec` index 0.53 ns, `BlockMap::get`
+0.88 ns (1.66×, inside the 2× acceptance), `hashbrown` 1.6–3.1× slower — so the
+map stays hand-rolled and hashbrown is only a dev-dependency of the comparison
+bench.
+
+The end-to-end no-regression is what matters: the interpolation fast path (one
+probe per sample) went 4.78 → 4.87 ms (+2%, inside the ±15% thermal band) — the
+probe is ~1 ns of a ~48 ns sample, and the dominant accesses (active-list
+sweeps, halo neighbors, gather) are hit-heavy where the gap is 1.66×.
+
+### SoA multires levels — and the co-fill regression it caused
+
+`LevelData` was 9 `SparseGrid`s (density f32, cell flags, fine-coarse distance,
+3× face_area, 3× face_coeff), each with its own dense map + pool. It is now one
+shared `BlockMap<LevelBlockPtr>` per level plus a per-block payload, giving one
+map lookup + offset math instead of the C++'s ~9 `_blockmap` arrays + 9
+scattered allocations per block:
+
+- **Metadata co-resident**: `LevelBlock` holds `cell_flags` + `dist_fine_coarse`
+  (the solver's mask reads share cache lines).
+- **Density lazy + contiguous**: the `density` field is `Option<NonNull<DensityBlock>>`,
+  materialized only when a block is actually written (the halo/solver density
+  stream stays contiguous — the first cut put density *in* the block and paid a
+  16 KiB stride).
+- **Faces lazy**: `face_area`/`face_coeff` are a `FaceBlock` behind
+  `ensure_faces`, so the single-phase steps (7..19) don't pay their ~6× f32
+  footprint; step 20 materializes them without a layout change.
+
+The first cut (full SoA — density+flags+dfc in one 32 KiB block) was **2.05×
+slower** on `set_refinement_map` (Rust 179.5 ms vs C++ 87.4 ms at 35,937
+blocks). Root cause: `init_cell_flags` materializes *every* block's flags, and
+the co-allocated `ensure_block` wrote 32 KiB/block (density+flags+dfc) where the
+old code wrote 8 KiB (flags only) — 4× the writes. Making density a separate
+lazy payload recovered parity: **98.6 ms vs C++ 94.1 ms** while still doing the
+cell-flag init the C++ `benchmark.cpp` path skips (`doInitCellFlags=false`).
+
+### 64-bit block ids
+
+`bid` was `u32` in the solver/particles/topology signatures; it is `usize` now
+(64-bit on every supported target). `morton3` was 10-bit-per-axis (`u32`,
+overflow past 1024³); it is 21-bit-per-axis (`u64`) so the 2048³ paper domain's
+11-bit block coords interleave bijectively. `BlockPool` was generalized to
+`Pool<T>` (`BlockPool<D, BSX, N> = Pool<Block<D, BSX, N>>`) so the SoA
+`LevelBlock`/`DensityBlock`/`FaceBlock` pools share one allocator.
+
+### Remaining dense structures (not step 11)
+
+`BlockInfoStore.level0` (1 B/block), `BlockInfoStore.flags` (2 B/level/block),
+and `RefinementMap.levels` (1 B/block) are still dense — ~8.6 GB + ~17 GB at
+8.59B blocks. They sit behind the step-12/14 multires solver and are the next
+dense→sparse frontier.
+

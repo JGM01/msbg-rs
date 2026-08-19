@@ -4,7 +4,7 @@ use msbg_rs::{
     math::boundary::BoundaryCondition,
     multires::halo::HaloBlockPool,
     solver::{Fence, PdeParams, Stencil, Sweeper},
-    sparse_grid::{BlockPtr, SparseGrid},
+    sparse_grid::SparseGrid,
 };
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::{hint::black_box, sync::Arc, time::Instant};
@@ -86,26 +86,23 @@ fn main() {
 
     // Materialize active blocks in 16-bit
     for &bid in &candidate_blocks {
-        let ptr = BlockPtr(grid.block_pool.alloc_block());
         let (bx, by, bz) = grid.get_block_coords_by_id(bid);
-        unsafe {
-            let data = &mut (*ptr.as_ptr()).data;
-            for z in 0..BSX {
-                for y in 0..BSX {
-                    for x in 0..BSX {
-                        let gx = (bx * BSX + x) as f32;
-                        let gy = (by * BSX + y) as f32;
-                        let gz = (bz * BSX + z) as f32;
-                        let raw_val = gyroid(gx, gy, gz, freq);
+        grid.ensure_block(bid);
+        let data = grid.get_block_data_mut(bid).unwrap();
+        for z in 0..BSX {
+            for y in 0..BSX {
+                for x in 0..BSX {
+                    let gx = (bx * BSX + x) as f32;
+                    let gy = (by * BSX + y) as f32;
+                    let gz = (bz * BSX + z) as f32;
+                    let raw_val = gyroid(gx, gy, gz, freq);
 
-                        // Map Gyroid [-1.5, 1.5] into Density [0.0, 1.0] range
-                        let norm_val = (raw_val * 0.333 + 0.5).clamp(0.0, 1.0);
-                        data[x + y * BSX + z * BSX * BSX] = Density::from_f32(norm_val);
-                    }
+                    // Map Gyroid [-1.5, 1.5] into Density [0.0, 1.0] range
+                    let norm_val = (raw_val * 0.333 + 0.5).clamp(0.0, 1.0);
+                    data[x + y * BSX + z * BSX * BSX] = Density::from_f32(norm_val);
                 }
             }
         }
-        grid.blockmap[bid] = Some(ptr);
     }
 
     let n_active = candidate_blocks.len();
@@ -153,7 +150,7 @@ fn main() {
 
     // 4. Benchmark: End-to-End Mean-Curvature PDE Smoothing Sweep
     println!("\n[4/4] Benchmarking 19-tap Mean Curvature PDE Solve...");
-    let active: Vec<u32> = candidate_blocks.iter().map(|&b| b as u32).collect();
+    let active: Vec<usize> = candidate_blocks.clone();
     let sweeper = Sweeper::<Density, BSX, N, HSX>::new(&grid, threads, Fence::Sfence);
     let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
     let pde_iters = 3;

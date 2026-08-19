@@ -25,7 +25,8 @@ a plain nightly toolchain.
 
 ## Layout
 
-- `src/blockpool.rs` — aligned `Block` + lock-free monotonic `BlockPool`
+- `src/blockpool.rs` — aligned `Block` + lock-free monotonic `Pool<T>` (`BlockPool` = `Pool<Block>`)
+- `src/blockmap.rs` — sparse block-id-keyed open-addressing `BlockMap<V>`
 - `src/sparse_grid.rs` — single-level `SparseGrid<T>`
 - `src/multires/` — `halo.rs` (18³ gather), `iterator.rs`
 - `src/math/` — `sample.rs` (interpolation), `bspline.rs`, `gather.rs`,

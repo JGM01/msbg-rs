@@ -5,7 +5,7 @@ use crate::channel::{CellFlags, DistFineCoarse};
 use crate::multires::blockinfo::{
     BlockFlags, BlockInfoStore, CELL_BLK_BORDER, CELL_COARSE_FINE, CELL_FINE_COARSE, CELL_VOID,
 };
-use crate::sparse_grid::SparseGrid;
+use crate::multires::level::LevelData;
 use rayon::prelude::*;
 
 /// Per-block finest-resolution level map. `levels[bid]` is the resolution level
@@ -110,7 +110,7 @@ pub fn regularize_refinement_map(map: &mut [u8], dims: &BlockGridDims, n_levels:
 #[derive(Debug, Default, Clone)]
 pub struct Topology {
     /// Blocks flagged `BLK_FINE_COARSE`, indexed by resolution level.
-    pub blocks_fine_coarse: Vec<Vec<u32>>,
+    pub blocks_fine_coarse: Vec<Vec<usize>>,
     /// Number of blocks flagged `BLK_EXISTS` (× voxels/block = active cells).
     pub n_act_blocks: u64,
 }
@@ -188,11 +188,11 @@ pub fn compute_block_topology(
 
     // Serial: write back to the store and collect the fine-coarse block lists
     // (each block can belong to only one resolution level).
-    let mut block_lists: Vec<Vec<u32>> = vec![Vec::new(); n_levels];
+    let mut block_lists: Vec<Vec<usize>> = vec![Vec::new(); n_levels];
     let mut n_act = 0u64;
     for (bid, (level, flags)) in results.into_iter().enumerate() {
         if flags.contains(BlockFlags::FINE_COARSE) {
-            block_lists[level as usize].push(bid as u32);
+            block_lists[level as usize].push(bid);
         }
         if flags.contains(BlockFlags::EXISTS) {
             n_act += 1;
@@ -212,7 +212,7 @@ pub fn compute_block_topology(
 /// `setRefinementMap` (`msbg.cpp:1804-1883`), without the obstacle paths.
 #[allow(clippy::needless_range_loop)]
 pub fn init_cell_flags<const BSX: usize, const N: usize>(
-    sg: &mut SparseGrid<CellFlags, BSX, N>,
+    lv: &mut LevelData<BSX, N>,
     level: usize,
     map: &RefinementMap,
     dims: &BlockGridDims,
@@ -226,22 +226,17 @@ pub fn init_cell_flags<const BSX: usize, const N: usize>(
     let bymax = dims.ny as isize - 1;
     let bzmax = dims.nz as isize - 1;
 
-    // Phase 1 (serial): materialize the blocks and resolve raw data pointers.
-    let mut data: Vec<usize> = vec![0; dims.n_blocks];
-    for bid in 0..dims.n_blocks {
-        if store.level0[bid] as usize != level {
-            continue;
-        }
-        sg.ensure_block(bid);
-        data[bid] = match sg.blockmap[bid] {
-            Some(p) => unsafe { (*p.as_ptr()).data.as_mut_ptr() as usize },
-            None => unreachable!("ensure_block left a block unmaterialized"),
-        };
+    // Phase 1 (serial): materialize the blocks at this level.
+    let bids: Vec<usize> = (0..dims.n_blocks)
+        .filter(|&bid| store.level0[bid] as usize == level)
+        .collect();
+    for &bid in &bids {
+        lv.ensure_block(bid);
     }
 
     // Phase 2 (parallel): fill each block's cell flags.
-    data.par_iter().enumerate().for_each(|(bid, &ptr)| {
-        let ptr = ptr as *mut CellFlags;
+    bids.par_iter().for_each(|&bid| {
+        let ptr = lv.cell_flags_ptr_mut(bid);
         if ptr.is_null() {
             return;
         }
@@ -342,7 +337,7 @@ pub fn init_cell_flags<const BSX: usize, const N: usize>(
 /// `msbg.cpp:1892-1963`, but SIMD-vectorized across x (the C++ `Vec4f` path).
 #[allow(clippy::needless_range_loop)]
 pub fn init_dist_fine_coarse<const BSX: usize, const N: usize>(
-    sg: &mut SparseGrid<DistFineCoarse, BSX, N>,
+    lv: &mut LevelData<BSX, N>,
     dtrans_res: usize,
     map: &RefinementMap,
     dims: &BlockGridDims,
@@ -356,21 +351,17 @@ pub fn init_dist_fine_coarse<const BSX: usize, const N: usize>(
     let dtrans = dtrans_res as f32;
     let scale = 1024.0f32;
 
-    // Phase 1 (serial): materialize the FINE_COARSE blocks and resolve pointers.
-    let mut data: Vec<usize> = vec![0; dims.n_blocks];
-    for bid in 0..dims.n_blocks {
-        if store.flags(bid, 0).contains(BlockFlags::FINE_COARSE) {
-            sg.ensure_block(bid);
-            data[bid] = match sg.blockmap[bid] {
-                Some(p) => unsafe { (*p.as_ptr()).data.as_mut_ptr() as usize },
-                None => unreachable!("ensure_block left a block unmaterialized"),
-            };
-        }
+    // Phase 1 (serial): materialize the FINE_COARSE blocks.
+    let bids: Vec<usize> = (0..dims.n_blocks)
+        .filter(|&bid| store.flags(bid, 0).contains(BlockFlags::FINE_COARSE))
+        .collect();
+    for &bid in &bids {
+        lv.ensure_block(bid);
     }
 
     // Phase 2 (parallel): per voxel distance to the coarser neighbor boxes.
-    data.par_iter().enumerate().for_each(|(bid, &ptr)| {
-        let ptr = ptr as *mut DistFineCoarse;
+    bids.par_iter().for_each(|&bid| {
+        let ptr = lv.dfc_ptr_mut(bid);
         if ptr.is_null() {
             return;
         }
@@ -475,13 +466,13 @@ pub fn init_dist_fine_coarse<const BSX: usize, const N: usize>(
 /// side of the interface (adjacent to a same-level `BLK_FINE_COARSE` block) as
 /// full so the distance field's interpolation stencil is defined there too.
 pub fn propagate_dist_fine_coarse_full<const BSX: usize, const N: usize>(
-    sg: &mut SparseGrid<DistFineCoarse, BSX, N>,
+    lv: &mut LevelData<BSX, N>,
     level: usize,
     dtrans_res: usize,
     dims: &BlockGridDims,
     store: &BlockInfoStore,
 ) {
-    sg.set_full_value(DistFineCoarse((dtrans_res * 1024) as u16));
+    let full = DistFineCoarse((dtrans_res * 1024) as u16);
 
     let blocks: Vec<usize> = (0..dims.n_blocks)
         .into_par_iter()
@@ -490,7 +481,7 @@ pub fn propagate_dist_fine_coarse_full<const BSX: usize, const N: usize>(
             if lvl > level || lvl + 1 < level {
                 return None;
             }
-            if sg.is_value_block(bid) {
+            if lv.is_value_block(bid) {
                 return None;
             }
             let (bx, by, bz) = dims.coords(bid);
@@ -518,7 +509,13 @@ pub fn propagate_dist_fine_coarse_full<const BSX: usize, const N: usize>(
         .collect();
 
     for bid in blocks {
-        sg.set_full_block(bid);
+        lv.ensure_block(bid);
+        let p = lv.dfc_ptr_mut(bid);
+        if !p.is_null() {
+            unsafe {
+                std::slice::from_raw_parts_mut(p, N).fill(full);
+            }
+        }
     }
 }
 

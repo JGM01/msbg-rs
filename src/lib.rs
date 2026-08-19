@@ -33,6 +33,7 @@
 #![feature(portable_simd)]
 #![feature(adt_const_params)]
 
+pub mod blockmap;
 pub mod blockpool;
 pub mod channel;
 pub mod io;

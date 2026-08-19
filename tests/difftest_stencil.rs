@@ -13,7 +13,7 @@ use msbg_rs::{
     math::stencil::SimdRng,
     math::BoundaryCondition,
     multires::halo::HaloBlock,
-    sparse_grid::{BlockPtr, SparseGrid},
+    sparse_grid::SparseGrid,
 };
 use std::sync::Arc;
 
@@ -38,21 +38,19 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
         for by in 0..grid.ny {
             for bx in 0..grid.nx {
                 let bid = bx + by * grid.nx + bz * grid.nxy;
-                let ptr = BlockPtr(grid.block_pool.alloc_block());
-                unsafe {
-                    for z in 0..BSX {
-                        for y in 0..BSX {
-                            for x in 0..BSX {
-                                let gx = bx * BSX + x;
-                                let gy = by * BSX + y;
-                                let gz = bz * BSX + z;
-                                (*ptr.as_ptr()).data[x + y * BSX + z * BSX * BSX] =
-                                    field(gx as i32, gy as i32, gz as i32);
-                            }
+                grid.ensure_block(bid);
+                let data = grid.get_block_data_mut(bid).unwrap();
+                for z in 0..BSX {
+                    for y in 0..BSX {
+                        for x in 0..BSX {
+                            let gx = bx * BSX + x;
+                            let gy = by * BSX + y;
+                            let gz = bz * BSX + z;
+                            data[x + y * BSX + z * BSX * BSX] =
+                                field(gx as i32, gy as i32, gz as i32);
                         }
                     }
                 }
-                grid.blockmap[bid] = Some(ptr);
             }
         }
     }

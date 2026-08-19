@@ -165,8 +165,8 @@ impl SurfaceConfig {
 /// Placed particles plus the exact (footprint) active-block set.
 pub struct Placed {
     pub positions: Vec<[f32; 3]>,
-    pub bids: Vec<u32>,
-    pub active: Vec<u32>,
+    pub bids: Vec<usize>,
+    pub active: Vec<usize>,
 }
 
 /// Domain bounds used by the placement `isInDomainRange` check, replicating the
@@ -221,7 +221,7 @@ pub fn reconstruct_surface<D, const BSX: usize, const N: usize, const MSX: usize
     cfg: &SurfaceConfig,
     ply: &[u8],
     pool: Arc<BlockPool<D, BSX, N>>,
-) -> io::Result<(SparseGrid<D, BSX, N>, Vec<u32>)>
+) -> io::Result<(SparseGrid<D, BSX, N>, Vec<usize>)>
 where
     D: Quant + Copy + Default + Send + Sync,
 {
@@ -267,9 +267,7 @@ where
     );
     for &bid in &active {
         grid.ensure_block(bid as usize);
-        if let Some(p) = grid.blockmap[bid as usize] {
-            unsafe { (*p.as_ptr()).data.fill(D::full()) };
-        }
+        grid.get_block_data_mut(bid as usize).unwrap().fill(D::full());
     }
 
     splat::splat::<D, BSX, N, MSX>(&grid, &bucketed, cfg);
@@ -287,7 +285,7 @@ pub fn reconstruct_and_smooth<D, const BSX: usize, const N: usize, const HSX: us
     pool: Arc<BlockPool<D, BSX, N>>,
     num_threads: usize,
     fence: Fence,
-) -> io::Result<(SparseGrid<D, BSX, N>, Vec<u32>)>
+) -> io::Result<(SparseGrid<D, BSX, N>, Vec<usize>)>
 where
     D: Quant + StoreBack<LANES> + Copy + Default + Send + Sync,
 {

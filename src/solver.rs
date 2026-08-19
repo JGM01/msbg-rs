@@ -16,7 +16,7 @@
 //!
 //! let pool = Arc::new(BlockPool::<f32, 16, 4096>::new(8, 64));
 //! let grid = SparseGrid::new("phi".into(), 32, 32, 32, 0.0, 1.0, pool);
-//! let active: Vec<u32> = (0..grid.n_blocks as u32).collect();
+//! let active: Vec<usize> = (0..grid.n_blocks).collect();
 //!
 //! let sweeper = Sweeper::<f32, 16, 4096, 18>::new(&grid, 1, Fence::Sfence);
 //! let params = PdeParams { dt: 0.05, iterations: 4, do_constr_zero_one: true };
@@ -163,7 +163,7 @@ where
     ///
     /// `active` is the finest-level value-block list (the demo's `activeBlocks`).
     /// Blocks not in a writable (allocated) state are skipped.
-    pub fn sweep(&self, active: &[u32], stencil: Stencil, params: &PdeParams)
+    pub fn sweep(&self, active: &[usize], stencil: Stencil, params: &PdeParams)
     where
         D: Dequant<f32> + StoreBack<LANES>,
     {
@@ -186,7 +186,7 @@ where
 
     fn run<const HALO: usize, const FULL: bool, K>(
         &self,
-        buckets: &[Vec<u32>; 8],
+        buckets: &[Vec<usize>; 8],
         params: &PdeParams,
         kernel: K,
     ) where
@@ -204,7 +204,7 @@ where
                     }
                     slot.halo.fill::<{ HALO }, { FULL }, D, N>(
                         self.grid,
-                        bid as usize,
+                        bid,
                         BoundaryCondition::Neumann,
                     );
                     kernel(&slot.halo, params.dt, params.do_constr_zero_one, out, &mut slot.rng);
@@ -219,21 +219,15 @@ where
     /// Raw writable data pointer for `bid`, or null if the block is a dummy or
     /// unallocated (not a value block).
     #[inline(always)]
-    fn block_data_ptr(&self, bid: u32) -> *mut D {
-        let bid = bid as usize;
-        match self.grid.blockmap[bid] {
-            Some(p) if p != self.grid.empty_block && p != self.grid.full_block => {
-                unsafe { (*p.as_ptr()).data.as_mut_ptr() }
-            }
-            _ => std::ptr::null_mut(),
-        }
+    fn block_data_ptr(&self, bid: usize) -> *mut D {
+        self.grid.value_block_ptr_mut(bid)
     }
 }
 
 /// Convenience wrapper: build a [`Sweeper`] and run one solve.
 pub fn apply_pde<D, const BSX: usize, const N: usize, const HSX: usize>(
     grid: &SparseGrid<D, BSX, N>,
-    active: &[u32],
+    active: &[usize],
     stencil: Stencil,
     params: &PdeParams,
     num_threads: usize,
@@ -252,21 +246,21 @@ pub fn apply_pde<D, const BSX: usize, const N: usize, const HSX: usize>(
 /// in-place update.
 fn build_color_buckets<D, const BSX: usize, const N: usize>(
     grid: &SparseGrid<D, BSX, N>,
-    active: &[u32],
-) -> [Vec<u32>; 8]
+    active: &[usize],
+) -> [Vec<usize>; 8]
 where
     D: Copy + Default + Send + Sync,
 {
-    let mut buckets: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::new());
+    let mut buckets: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
     for &bid in active {
-        let (bx, by, bz) = grid.get_block_coords_by_id(bid as usize);
+        let (bx, by, bz) = grid.get_block_coords_by_id(bid);
         let color = (bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2);
         buckets[color].push(bid);
     }
     for bucket in &mut buckets {
         bucket.sort_unstable_by_key(|&bid| {
-            let (bx, by, bz) = grid.get_block_coords_by_id(bid as usize);
-            morton3(bx as u32, by as u32, bz as u32)
+            let (bx, by, bz) = grid.get_block_coords_by_id(bid);
+            morton3(bx, by, bz)
         });
     }
     buckets
@@ -289,21 +283,21 @@ mod tests {
 
     fn all_active<const BSX: usize, const N: usize, D: Copy + Default + Send + Sync>(
         g: &SparseGrid<D, BSX, N>,
-    ) -> Vec<u32> {
-        (0..g.n_blocks as u32).collect()
+    ) -> Vec<usize> {
+        (0..g.n_blocks).collect()
     }
 
     // Serial color-ordered Gauss-Seidel reference: processes blocks color 0..7
     // in order, gathering the halo from the *current* grid and writing back.
     fn serial_reference(
         g: &mut SparseGrid<f32, BSX, N>,
-        active: &[u32],
+        active: &[usize],
         stencil: Stencil,
         params: &PdeParams,
     ) {
-        let mut buckets: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::new());
+        let mut buckets: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
         for &bid in active {
-            let (bx, by, bz) = g.get_block_coords_by_id(bid as usize);
+            let (bx, by, bz) = g.get_block_coords_by_id(bid);
             let color = (bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2);
             buckets[color].push(bid);
         }
@@ -312,21 +306,19 @@ mod tests {
         for _ in 0..params.iterations {
             for color in 0..8 {
                 for &bid in &buckets[color] {
-                    let out = match g.blockmap[bid as usize] {
-                        Some(p) if p != g.empty_block && p != g.full_block => unsafe {
-                            (*p.as_ptr()).data.as_mut_ptr()
-                        },
-                        _ => continue,
-                    };
+                    let out = g.value_block_ptr_mut(bid);
+                    if out.is_null() {
+                        continue;
+                    }
                     match stencil {
                         Stencil::Laplacian => {
-                            halo.fill::<1, false, f32, N>(g, bid as usize, BoundaryCondition::Neumann);
+                            halo.fill::<1, false, f32, N>(g, bid, BoundaryCondition::Neumann);
                             kernel_laplacian::<LANES, BSX, HSX, f32>(
                                 &halo, params.dt, params.do_constr_zero_one, out, &mut rng,
                             );
                         }
                         Stencil::MeanCurvature => {
-                            halo.fill::<1, true, f32, N>(g, bid as usize, BoundaryCondition::Neumann);
+                            halo.fill::<1, true, f32, N>(g, bid, BoundaryCondition::Neumann);
                             kernel_meancurv::<LANES, BSX, HSX, f32>(
                                 &halo, params.dt, params.do_constr_zero_one, out, &mut rng,
                             );
@@ -409,7 +401,7 @@ mod tests {
         g.set_voxel(0, 0, 0, 0.5); // block 0
         g.set_voxel(16, 16, 16, 0.7); // block 7
         g.set_full_block(g.get_block_id(0, 16, 0)); // block 2 -> dummy full
-        let active: Vec<u32> = vec![0, 7, g.get_block_id(0, 16, 0) as u32, 5];
+        let active: Vec<usize> = vec![0, 7, g.get_block_id(0, 16, 0), 5];
         let params = PdeParams { dt: 0.05, iterations: 1, do_constr_zero_one: true };
         let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&active, Stencil::Laplacian, &params);

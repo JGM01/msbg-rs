@@ -1,5 +1,6 @@
 use std::{ptr::NonNull, sync::Arc};
 
+use crate::blockmap::BlockMap;
 use crate::blockpool::{Block, BlockPool};
 
 /// Thread-safe wrapper.
@@ -78,9 +79,11 @@ where
     pub nxy: usize,
     pub n_blocks: usize,
 
-    /// Flat array mapping a 1D Block ID (bid) to an allocated memory block.
-    /// `Option<NonNull>` is guaranteed by Rust to have the exact same 8-byte footprint as a C++ pointer.
-    pub blockmap: Vec<Option<BlockPtr<D, BSX, N>>>,
+    /// Sparse block-id → block map. Cost scales with *active* blocks, not the
+    /// virtual block count (at 32,768³/block-16 a dense map is 68.7 GB; this
+    /// open-addressed map is ~0.4 GB). Absent = empty; the full dummy is stored
+    /// as a real entry; the empty dummy is not stored at all.
+    blockmap: BlockMap<BlockPtr<D, BSX, N>>,
 
     /// Memory pool for spatial regions.
     pub block_pool: Arc<BlockPool<D, BSX, N>>,
@@ -142,7 +145,7 @@ where
             nz,
             nxy,
             n_blocks,
-            blockmap: vec![None; n_blocks],
+            blockmap: BlockMap::new(),
             block_pool,
             empty_block,
             full_block,
@@ -174,8 +177,7 @@ where
     /// Immutably resolve a block's value state.
     #[inline(always)]
     pub fn get_block(&self, bid: usize) -> BlockRef<'_, D, BSX, N> {
-        match self.blockmap[bid] {
-            Some(ptr) if ptr == self.empty_block => BlockRef::Empty,
+        match self.blockmap.get(bid) {
             Some(ptr) if ptr == self.full_block => BlockRef::Full,
             Some(ptr) => unsafe { BlockRef::Allocated(&*ptr.as_ptr()) },
             None => BlockRef::Empty,
@@ -185,8 +187,7 @@ where
     /// Mutably resolve a block's value state.
     #[inline(always)]
     pub fn get_block_mut(&mut self, bid: usize) -> BlockRefMut<'_, D, BSX, N> {
-        match self.blockmap[bid] {
-            Some(ptr) if ptr == self.empty_block => BlockRefMut::Empty,
+        match self.blockmap.get(bid) {
             Some(ptr) if ptr == self.full_block => BlockRefMut::Full,
             Some(ptr) => unsafe { BlockRefMut::Allocated(&mut *ptr.as_ptr()) },
             None => BlockRefMut::Empty,
@@ -269,7 +270,7 @@ where
     pub fn set_empty_block(&mut self, bid: usize) {
         debug_assert!(bid < self.n_blocks);
         debug_assert!(!matches!(self.get_block(bid), BlockRef::Allocated(_)));
-        self.blockmap[bid] = Some(self.empty_block);
+        self.blockmap.remove(bid);
     }
 
     /// Mark a block as entirely full (no data allocated).
@@ -277,7 +278,7 @@ where
     pub fn set_full_block(&mut self, bid: usize) {
         debug_assert!(bid < self.n_blocks);
         debug_assert!(!matches!(self.get_block(bid), BlockRef::Allocated(_)));
-        self.blockmap[bid] = Some(self.full_block);
+        self.blockmap.insert(bid, self.full_block);
     }
 
     /// Get a single voxel value without allocating memory.
@@ -319,7 +320,7 @@ where
         unsafe {
             (*new_block.as_ptr()).data.fill(self.empty_value);
         }
-        self.blockmap[bid] = Some(new_block);
+        self.blockmap.insert(bid, new_block);
     }
 
     /// Set a voxel value. Allocates the block on demand (over `None` or a dummy).
@@ -336,14 +337,14 @@ where
     pub fn set_value_in_block(&mut self, bid: usize, vid: usize, val: D) {
         debug_assert!(vid < N);
 
-        let block_ptr = match self.blockmap[bid] {
-            Some(ptr) if ptr != self.empty_block && ptr != self.full_block => ptr,
+        let block_ptr = match self.blockmap.get(bid) {
+            Some(ptr) if ptr != self.full_block => ptr,
             _ => {
                 let new_block = BlockPtr(self.block_pool.alloc_block());
                 unsafe {
                     (*new_block.as_ptr()).data.fill(self.empty_value);
                 }
-                self.blockmap[bid] = Some(new_block);
+                self.blockmap.insert(bid, new_block);
                 new_block
             }
         };
@@ -351,6 +352,40 @@ where
         unsafe {
             *(*block_ptr.as_ptr()).data.get_unchecked_mut(vid) = val;
         }
+    }
+
+    /// Raw storage pointer for `bid`, resolving absent/empty to the empty dummy
+    /// and full to the full dummy, so reads are unconditional (gather/halo).
+    #[inline(always)]
+    pub fn block_data_ptr(&self, bid: usize) -> *const D {
+        match self.blockmap.get(bid) {
+            Some(p) if p == self.full_block => unsafe { (*self.full_block.as_ptr()).data.as_ptr() },
+            Some(p) => unsafe { (*p.as_ptr()).data.as_ptr() },
+            None => unsafe { (*self.empty_block.as_ptr()).data.as_ptr() },
+        }
+    }
+
+    /// Raw storage pointer for an allocated value block, else null.
+    #[inline(always)]
+    pub fn value_block_ptr(&self, bid: usize) -> *const D {
+        match self.blockmap.get(bid) {
+            Some(p) if p != self.full_block => unsafe { (*p.as_ptr()).data.as_ptr() },
+            _ => std::ptr::null(),
+        }
+    }
+
+    /// Raw writable pointer for an allocated value block, else null.
+    #[inline(always)]
+    pub fn value_block_ptr_mut(&self, bid: usize) -> *mut D {
+        match self.blockmap.get(bid) {
+            Some(p) if p != self.full_block => unsafe { (*p.as_ptr()).data.as_mut_ptr() },
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    /// Iterate the block ids of every materialized block (map order, not sorted).
+    pub fn active_block_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.blockmap.iter().map(|(bid, _)| bid)
     }
 }
 
@@ -561,8 +596,8 @@ mod tests {
         assert!(matches!(grid.get_block(bid), BlockRef::Allocated(_)));
         assert_eq!(grid.get_voxel(5, 5, 5), 123.4);
 
-        // The dummy pointer itself must no longer be present
-        assert_ne!(grid.blockmap[bid], Some(grid.empty_block));
+        // The block must now be a real allocated block (not a dummy marker).
+        assert!(!grid.value_block_ptr(bid).is_null());
     }
 
     #[test]
@@ -577,7 +612,7 @@ mod tests {
         grid.set_voxel(20, 20, 20, 55.5);
         assert!(matches!(grid.get_block(bid), BlockRef::Allocated(_)));
         assert_eq!(grid.get_voxel(20, 20, 20), 55.5);
-        assert_ne!(grid.blockmap[bid], Some(grid.full_block));
+        assert!(!grid.value_block_ptr(bid).is_null());
     }
 
     #[test]
@@ -616,20 +651,27 @@ mod tests {
     }
 
     #[test]
-    fn test_grd_17_blockmap_length_matches_n_blocks() {
-        // Awkward sizes
+    fn test_grd_17_blockmap_starts_empty() {
+        // Awkward sizes: the block grid dims are correct, and a fresh grid has
+        // no map entries (the sparse map scales with active blocks).
         for &(sx, sy, sz) in &[(1, 1, 1), (16, 16, 16), (17, 1, 33), (100, 50, 7)] {
             let grid = setup_grid(sx, sy, sz);
-            assert_eq!(
-                grid.blockmap.len(),
-                grid.n_blocks,
-                "blockmap length mismatch for {}×{}×{}",
-                sx,
-                sy,
-                sz
-            );
             assert_eq!(grid.n_blocks, grid.nx * grid.ny * grid.nz);
+            for bid in 0..grid.n_blocks {
+                assert!(matches!(grid.get_block(bid), BlockRef::Empty));
+            }
         }
+    }
+
+    #[test]
+    fn test_grd_17b_sparse_map_scales_with_active() {
+        // A grid over a huge virtual block count must not allocate a dense map:
+        // materializing one block leaves the map far smaller than n_blocks.
+        let mut grid = setup_grid(256, 256, 256); // 16^3 = 4096 virtual blocks
+        assert_eq!(grid.n_blocks, 4096);
+        grid.set_voxel(0, 0, 0, 1.0);
+        assert!(grid.is_value_block(0));
+        assert!(matches!(grid.get_block(4095), BlockRef::Empty));
     }
 
     #[test]

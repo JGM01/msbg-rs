@@ -59,7 +59,7 @@ impl MultiresGrid {
             let sy = sy0 >> l;
             let sz = sz0 >> l;
             let bsx = block_size0 >> l;
-            levels.push(level_from_block_size(&format!("{name}:L{l}"), bsx, sx, sy, sz));
+            levels.push(level_from_block_size(bsx, sx, sy, sz));
         }
 
         let block_info = BlockInfoStore::new(dims.n_blocks, n_levels);
@@ -128,7 +128,7 @@ mod tests {
         let mut g = MultiresGrid::create("t", 64, 64, 64, 16, 3, 6);
         let mut map = RefinementMap::uniform(g.dims.n_blocks, 0);
         let topo = g.set_refinement_map(&mut map);
-        assert_eq!(topo.blocks_fine_coarse[0], Vec::<u32>::new());
+        assert_eq!(topo.blocks_fine_coarse[0], Vec::<usize>::new());
         for bid in 0..g.dims.n_blocks {
             assert_eq!(g.block_level(bid), 0);
         }

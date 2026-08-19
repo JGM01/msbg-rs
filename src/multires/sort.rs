@@ -2,21 +2,23 @@
 
 use crate::multires::BlockGridDims;
 
-/// Spread the low 10 bits of `v` to every third bit (classic Morton interleave).
+/// Spread the low 21 bits of `v` to every third bit (classic Morton interleave).
+/// 21 bits per axis supports block coords up to 2^21 (2048³/block-16 needs 11).
 #[inline(always)]
-fn spread(mut v: u32) -> u32 {
-    v &= 0x3ff;
-    v = (v | (v << 16)) & 0x0300_00ff;
-    v = (v | (v << 8)) & 0x0300_f00f;
-    v = (v | (v << 4)) & 0x030c_30c3;
-    v = (v | (v << 2)) & 0x0924_9249;
+fn spread(mut v: u64) -> u64 {
+    v &= 0x1f_ffff;
+    v = (v | (v << 32)) & 0x001f_0000_0000_ffff;
+    v = (v | (v << 16)) & 0x001f_0000_ff00_00ff;
+    v = (v | (v << 8)) & 0x100f_00f0_0f00_f00f;
+    v = (v | (v << 4)) & 0x10c3_0c30_c30c_30c3;
+    v = (v | (v << 2)) & 0x1249_2492_4924_9249;
     v
 }
 
-/// 30-bit 3D Morton code (10 bits per axis).
+/// 63-bit 3D Morton code (21 bits per axis).
 #[inline(always)]
-pub fn morton3(x: u32, y: u32, z: u32) -> u32 {
-    spread(x) | (spread(y) << 1) | (spread(z) << 2)
+pub fn morton3(x: usize, y: usize, z: usize) -> u64 {
+    spread(x as u64) | (spread(y as u64) << 1) | (spread(z as u64) << 2)
 }
 
 /// Sort a block list by a level-scaled Morton key so a coarse block and its
@@ -31,26 +33,26 @@ pub fn morton3(x: u32, y: u32, z: u32) -> u32 {
 ///
 /// C++ has the same idea (`sortBlockListMorton`) but it is `#ifdef`'d out.
 pub fn sort_block_list_morton(
-    blocks: &mut [u32],
+    blocks: &mut [usize],
     dims: &BlockGridDims,
     levels: &[u8],
     n_levels: usize,
 ) {
     debug_assert!(n_levels >= 1);
-    let ref_shift = (n_levels - 1) as u32;
-    let mask = (1u32 << ref_shift) - 1;
+    let ref_shift = (n_levels - 1) as usize;
+    let mask = (1usize << ref_shift) - 1;
+    let fine_bits = (3 * ref_shift) as u64;
 
     blocks.sort_unstable_by_key(|&bid| {
-        let bid = bid as usize;
         let (bx, by, bz) = dims.coords(bid);
-        let lvl = levels[bid] as u32;
+        let lvl = levels[bid] as usize;
 
-        let coarse = morton3(bx as u32 >> ref_shift, by as u32 >> ref_shift, bz as u32 >> ref_shift);
+        let coarse = morton3(bx >> ref_shift, by >> ref_shift, bz >> ref_shift);
         // Coarser first: a block at the reference level gets priority 0.
         let priority = ref_shift - lvl;
-        let fine = morton3(bx as u32 & mask, by as u32 & mask, bz as u32 & mask);
+        let fine = morton3(bx & mask, by & mask, bz & mask);
 
-        ((coarse as u64) << 34) | ((priority as u64) << 30) | (fine as u64)
+        (coarse << (fine_bits + ref_shift as u64)) | ((priority as u64) << fine_bits) | fine
     });
 }
 
@@ -74,14 +76,26 @@ mod tests {
 
     #[test]
     fn test_morton_03_bijective_low_bits() {
-        for x in 0..8u32 {
-            for y in 0..8u32 {
-                for z in 0..8u32 {
+        for x in 0..8usize {
+            for y in 0..8usize {
+                for z in 0..8usize {
                     // Distinct inputs -> distinct codes over 3 low bits.
                     let code = morton3(x, y, z);
                     assert_eq!(code & 0b111_111_111, code, "low bits collide");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_morton_03b_bijective_wide() {
+        // Above the old 10-bit-per-axis limit (which overflowed u32): a
+        // 12-bit coordinate must still interleave bijectively in 64 bits.
+        for (x, y, z) in [(0usize, 0, 2047), (2047, 0, 0), (1024, 1024, 1024), (2047, 2047, 2047)] {
+            let code = morton3(x, y, z);
+            assert!(code != 0 || (x, y, z) == (0, 0, 0), "wide morton collided");
+            // 63-bit code fits.
+            assert!(code < (1u64 << 63));
         }
     }
 
@@ -92,14 +106,14 @@ mod tests {
         let dims = BlockGridDims::new(4, 4, 4);
         let mut levels = vec![0u8; dims.n_blocks];
         levels[21] = 1; // block (1,1,1) is coarse
-        let mut blocks: Vec<u32> = vec![];
+        let mut blocks: Vec<usize> = vec![];
         // All blocks under coarse cell (1,1,1): coarse block 21 + children
         // (2..4)^3 -> blocks (2,2,2)=42? Let's just collect the coarse block and its children.
         blocks.push(21);
         for bz in 2..4 {
             for by in 2..4 {
                 for bx in 2..4 {
-                    blocks.push((bx + by * 4 + bz * 16) as u32);
+                    blocks.push(bx + by * 4 + bz * 16);
                 }
             }
         }

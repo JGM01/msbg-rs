@@ -8,7 +8,7 @@ use msbg_rs::{
     math::stencil::SimdRng,
     multires::halo::{HaloBlock, HaloBlockPool},
     solver::{Fence, PdeParams, Stencil, Sweeper},
-    sparse_grid::{BlockPtr, SparseGrid},
+    sparse_grid::SparseGrid,
 };
 use rayon::iter::{
     IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -264,13 +264,8 @@ fn build_sparse_grid(active_target: usize) -> (Arc<SparseGrid<f32, BSX, N>>, Vec
     let active = generate_active_blocks(grid.nx, grid.ny, grid.nz);
 
     for &bid in &active {
-        if grid.blockmap[bid].is_none() {
-            let ptr = BlockPtr(grid.block_pool.alloc_block());
-            unsafe {
-                (*ptr.as_ptr()).data.fill(0.5);
-            }
-            grid.blockmap[bid] = Some(ptr);
-        }
+        grid.ensure_block(bid);
+        grid.get_block_data_mut(bid).unwrap().fill(0.5);
     }
 
     (Arc::new(grid), active)
@@ -509,7 +504,7 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
 
     for target in active_targets(m, s) {
         let (grid, active_usize) = build_sparse_grid(target);
-        let active: Vec<u32> = active_usize.iter().map(|&b| b as u32).collect();
+        let active: Vec<usize> = active_usize.clone();
         let n_active = active.len();
         let num_threads = rayon::current_num_threads();
         let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&grid, num_threads, Fence::Sfence);
@@ -556,7 +551,7 @@ fn bench_smoothing_fence(c: &mut Criterion) {
         Size::Big | Size::XBig => 50_000,
     };
     let (grid, active_usize) = build_sparse_grid(target);
-    let active: Vec<u32> = active_usize.iter().map(|&b| b as u32).collect();
+    let active: Vec<usize> = active_usize.clone();
     let num_threads = rayon::current_num_threads();
     let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
 

@@ -117,12 +117,9 @@ fn splat_matches_cpp_golden_samples() {
 fn dump_full_field(g: &SparseGrid<Density, BSX, N>) -> Vec<u16> {
     let mut out = Vec::with_capacity(g.n_blocks * N);
     for bid in 0..g.n_blocks {
-        match g.blockmap[bid] {
-            Some(p) if p != g.empty_block && p != g.full_block => {
-                let d = unsafe { (*p.as_ptr()).data };
-                out.extend(d.iter().map(|x| x.0));
-            }
-            _ => out.extend(std::iter::repeat(0u16).take(N)),
+        match g.get_block_data(bid) {
+            Some(d) => out.extend(d.iter().map(|x| x.0)),
+            None => out.extend(std::iter::repeat(0u16).take(N)),
         }
     }
     out

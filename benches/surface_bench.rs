@@ -74,10 +74,10 @@ fn iters() -> usize {
     }
 }
 
-fn fill_active_full(grid: &mut SparseGrid<Density, BSX, N>, active: &[u32]) {
+fn fill_active_full(grid: &mut SparseGrid<Density, BSX, N>, active: &[usize]) {
     for &bid in active {
-        if let Some(p) = grid.blockmap[bid as usize] {
-            unsafe { (*p.as_ptr()).data.fill(Density(u16::MAX)) };
+        if let Some(data) = grid.get_block_data_mut(bid) {
+            data.fill(Density(u16::MAX));
         }
     }
 }
@@ -138,7 +138,7 @@ fn main() {
             pool,
         );
         for &bid in &active {
-            grid.ensure_block(bid as usize);
+            grid.ensure_block(bid);
         }
         fill_active_full(&mut grid, &active);
 

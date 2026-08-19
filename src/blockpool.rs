@@ -62,15 +62,12 @@ where
     }
 }
 
-/// Lock-free & monotonic allocator
-pub struct BlockPool<D, const BSX: usize, const N: usize>
-where
-    D: Copy + Default + Send + Sync,
-{
+/// Lock-free & monotonic allocator of `T` items.
+pub struct Pool<T> {
     /// Atomic monotonic pointer for allocation tracking.
     next_free: AtomicUsize,
 
-    /// Number of blocks per pre-allocated segment.
+    /// Number of items per pre-allocated segment.
     blocks_per_seg: usize,
 
     /// Log2 shift factor for segment routing.
@@ -80,16 +77,13 @@ where
     blocks_per_seg_mask: usize,
 
     /// Lock-free atomic segment pointer table.
-    segments: Vec<AtomicPtr<Block<D, BSX, N>>>,
+    segments: Vec<AtomicPtr<T>>,
 
     /// Fallback lock for OS heap allocation/extensions.
     extend_lock: Mutex<()>,
 }
 
-impl<D, const BSX: usize, const N: usize> BlockPool<D, BSX, N>
-where
-    D: Copy + Default + Send + Sync,
-{
+impl<T> Pool<T> {
     pub fn new(max_segments: usize, blocks_per_seg: usize) -> Self {
         assert!(
             blocks_per_seg.is_power_of_two(),
@@ -112,9 +106,9 @@ where
         }
     }
 
-    /// Allocate a block, or `None` once the pool is exhausted.
+    /// Allocate an item, or `None` once the pool is exhausted.
     #[inline]
-    pub fn try_alloc_block(&self) -> Option<NonNull<Block<D, BSX, N>>> {
+    pub fn try_alloc_block(&self) -> Option<NonNull<T>> {
         let index = self.next_free.fetch_add(1, Ordering::Relaxed);
         let seg_idx = index >> self.blocks_per_seg_log2;
 
@@ -131,19 +125,19 @@ where
 
     /// Infallible allocation; panics when the pool is exhausted.
     #[inline]
-    pub fn alloc_block(&self) -> NonNull<Block<D, BSX, N>> {
+    pub fn alloc_block(&self) -> NonNull<T> {
         self.try_alloc_block()
             .expect("BlockPool memory limit exhausted")
     }
 
-    /// Blocks handed out since the last `reset` (monotonic cursor).
+    /// Items handed out since the last `reset` (monotonic cursor).
     #[inline]
     pub fn allocated(&self) -> usize {
         self.next_free.load(Ordering::Relaxed)
     }
 
     #[cold]
-    fn extend_pool(&self, seg_idx: usize) -> *mut Block<D, BSX, N> {
+    fn extend_pool(&self, seg_idx: usize) -> *mut T {
         let _guard = self.extend_lock.lock().unwrap();
 
         let existing_ptr = self.segments[seg_idx].load(Ordering::Acquire);
@@ -151,12 +145,12 @@ where
             return existing_ptr;
         }
 
-        // Create a memory layout for `blocks_per_seg` contiguous blocks
-        let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg).unwrap();
+        // Create a memory layout for `blocks_per_seg` contiguous items
+        let layout = Layout::array::<T>(self.blocks_per_seg).unwrap();
 
         // Ask OS for memory (uninitialized: callers that need defined
-        // values must initialize the block themselves)
-        let raw_ptr = unsafe { alloc(layout) } as *mut Block<D, BSX, N>;
+        // values must initialize the item themselves)
+        let raw_ptr = unsafe { alloc(layout) } as *mut T;
 
         if raw_ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
@@ -172,12 +166,10 @@ where
     }
 }
 
-impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> Drop
-    for BlockPool<D, BSX, N>
-{
+impl<T> Drop for Pool<T> {
     fn drop(&mut self) {
         // Reconstruct the memory layout used during extend_pool
-        let layout = Layout::array::<Block<D, BSX, N>>(self.blocks_per_seg)
+        let layout = Layout::array::<T>(self.blocks_per_seg)
             .expect("Failed to create memory layout for deallocation");
 
         for atomic_ptr in &self.segments {
@@ -191,6 +183,9 @@ impl<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize> Drop
         }
     }
 }
+
+/// A `Pool` of aligned `Block<D, BSX, N>` items.
+pub type BlockPool<D, const BSX: usize, const N: usize> = Pool<Block<D, BSX, N>>;
 
 #[cfg(test)]
 mod block_tests {

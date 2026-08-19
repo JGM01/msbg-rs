@@ -9,16 +9,15 @@ pub struct BlockSimdContext {
 }
 
 pub struct BlockIterator<'a, const BSX: usize, const N: usize> {
-    grid: &'a mut SparseGrid<f32, BSX, N>,
-    current_bid: usize,
+    grid: &'a SparseGrid<f32, BSX, N>,
+    bids: Vec<usize>,
+    pos: usize,
 }
 
 impl<'a, const BSX: usize, const N: usize> BlockIterator<'a, BSX, N> {
-    pub fn new(grid: &'a mut SparseGrid<f32, BSX, N>) -> Self {
-        Self {
-            grid,
-            current_bid: 0,
-        }
+    pub fn new(grid: &'a SparseGrid<f32, BSX, N>) -> Self {
+        let bids = grid.active_block_ids().collect();
+        Self { grid, bids, pos: 0 }
     }
 }
 
@@ -27,21 +26,16 @@ impl<'a, const BSX: usize, const N: usize> Iterator for BlockIterator<'a, BSX, N
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        while self.current_bid < self.grid.n_blocks {
-            let bid = self.current_bid;
-            self.current_bid += 1;
+        while self.pos < self.bids.len() {
+            let bid = self.bids[self.pos];
+            self.pos += 1;
 
-            if let Some(ptr) = self.grid.blockmap[bid] {
-                // Filter out the static sentinel blocks (Empty/Full)
-                if ptr != self.grid.empty_block && ptr != self.grid.full_block {
-                    // data is asserted to be at offset 0 and 64-byte aligned.
-                    let data_ptr = unsafe { (*ptr.as_ptr()).data.as_mut_ptr() as *mut f32x8 };
-
-                    return Some(BlockSimdContext {
-                        bid,
-                        data: data_ptr,
-                    });
-                }
+            let data_ptr = self.grid.value_block_ptr(bid) as *mut f32x8;
+            if !data_ptr.is_null() {
+                return Some(BlockSimdContext {
+                    bid,
+                    data: data_ptr,
+                });
             }
         }
         None
@@ -74,9 +68,9 @@ mod iterator_tests {
     fn test_i_02_only_dummies_are_skipped() {
         let mut grid = setup_grid(32, 32, 32);
         // Force a few slots to the sentinel blocks
-        grid.blockmap[0] = Some(grid.empty_block);
-        grid.blockmap[1] = Some(grid.full_block);
-        grid.blockmap[2] = Some(grid.empty_block);
+        grid.set_empty_block(0);
+        grid.set_full_block(1);
+        grid.set_empty_block(2);
 
         let mut iter = BlockIterator::new(&mut grid);
         assert!(iter.next().is_none());
@@ -88,8 +82,8 @@ mod iterator_tests {
         // Allocate only the middle block
         grid.set_voxel(16, 0, 0, 42.0);
         // Force the other two to dummies
-        grid.blockmap[0] = Some(grid.empty_block);
-        grid.blockmap[2] = Some(grid.full_block);
+        grid.set_empty_block(0);
+        grid.set_full_block(2);
 
         let mut iter = BlockIterator::new(&mut grid);
         let ctx = iter.next().expect("should yield the real block");
@@ -139,18 +133,16 @@ mod iterator_tests {
     }
 
     #[test]
-    fn test_i_06_yields_in_ascending_bid_order() {
+    fn test_i_06_yields_exactly_the_value_blocks() {
         let mut grid = setup_grid(48, 16, 16); // three blocks
         // Allocate 0 and 2, leave 1 empty
         grid.set_voxel(0, 0, 0, 10.0);
         grid.set_voxel(32, 0, 0, 30.0);
 
-        let mut iter = BlockIterator::new(&mut grid);
-        let first = iter.next().unwrap();
-        let second = iter.next().unwrap();
-        assert_eq!(first.bid, 0);
-        assert_eq!(second.bid, 2);
-        assert!(first.bid < second.bid);
-        assert!(iter.next().is_none());
+        // Map order, not sorted — collect and compare as a set.
+        let iter = BlockIterator::new(&grid);
+        let mut bids: Vec<usize> = iter.map(|ctx| ctx.bid).collect();
+        bids.sort_unstable();
+        assert_eq!(bids, vec![0, 2]);
     }
 }

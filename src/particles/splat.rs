@@ -51,12 +51,7 @@ fn block_data_ptr<D, const BSX: usize, const N: usize>(
 where
     D: Copy + Default + Send + Sync,
 {
-    match grid.blockmap[bid] {
-        Some(p) if p != grid.empty_block && p != grid.full_block => {
-            unsafe { (*p.as_ptr()).data.as_mut_ptr() }
-        }
-        _ => std::ptr::null_mut(),
-    }
+    grid.value_block_ptr_mut(bid)
 }
 
 /// Thread-local staging buffer for one block's splat.
@@ -116,9 +111,9 @@ pub fn splat<D, const BSX: usize, const N: usize, const MSX: usize>(
 
     let dims = GridDims::new(grid.sx, grid.sy, grid.sz, BSX);
 
-    let mut by_color: [Vec<u32>; 8] = std::array::from_fn(|_| Vec::new());
+    let mut by_color: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
     for &bid in &bucketed.particle_blocks {
-        let (bx, by, bz) = dims.coords(bid as usize);
+        let (bx, by, bz) = dims.coords(bid);
         let color = (bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2);
         by_color[color].push(bid);
     }
@@ -127,15 +122,15 @@ pub fn splat<D, const BSX: usize, const N: usize, const MSX: usize>(
 
     for bucket in &by_color {
         bucket.par_iter().for_each(|&bid| {
-            let start = bucketed.block_start[bid as usize] as usize;
-            let end = bucketed.block_start[bid as usize + 1] as usize;
+            let start = bucketed.block_start[bid];
+            let end = bucketed.block_start[bid + 1];
             let pts = &bucketed.positions[start..end];
             let slot = unsafe { pool.get_mut() };
             stage_and_commit::<D, BSX, N, MSX>(
                 grid,
                 &dims,
                 slot,
-                bid as usize,
+                bid,
                 pts,
                 r_scan,
                 dist_sq_max,
@@ -353,12 +348,12 @@ mod tests {
         }
     }
 
-    fn fill_active(grid: &mut SparseGrid<Density, BSX, N>, active: &[u32]) {
+    fn fill_active(grid: &mut SparseGrid<Density, BSX, N>, active: &[usize]) {
         for &bid in active {
-            grid.ensure_block(bid as usize);
-            if let Some(p) = grid.blockmap[bid as usize] {
-                unsafe { (*p.as_ptr()).data.fill(Density(u16::MAX)) };
-            }
+            grid.ensure_block(bid);
+            grid.get_block_data_mut(bid)
+                .unwrap()
+                .fill(Density(u16::MAX));
         }
     }
 
@@ -366,7 +361,7 @@ mod tests {
         grid.get_voxel(x, y, z)
     }
 
-    fn do_splat(grid: &SparseGrid<Density, BSX, N>, pts: &[[f32; 3]], bids: Vec<u32>) {
+    fn do_splat(grid: &SparseGrid<Density, BSX, N>, pts: &[[f32; 3]], bids: Vec<usize>) {
         let bucketed =
             crate::particles::sort::bucket_by_block(pts.to_vec(), bids, grid.n_blocks);
         splat::<Density, BSX, N, MSX>(grid, &bucketed, &cfg());
@@ -444,7 +439,7 @@ mod tests {
         let pts = vec![[16.0f32, 16.0, 16.0]];
         let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
-        do_splat(&grid, &pts, vec![grid.get_block_id(16, 16, 16) as u32]);
+        do_splat(&grid, &pts, vec![grid.get_block_id(16, 16, 16)]);
         assert_eq!(get(&grid, 21, 16, 16), Density(u16::MAX));
         assert_eq!(get(&grid, 20, 16, 16), Density(u16::MAX));
     }

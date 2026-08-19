@@ -7,7 +7,7 @@
 use msbg_rs::{
     blockpool::BlockPool,
     solver::{Fence, PdeParams, Stencil, Sweeper},
-    sparse_grid::{BlockPtr, SparseGrid},
+    sparse_grid::SparseGrid,
 };
 use std::sync::Arc;
 
@@ -30,18 +30,16 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
         for by in 0..grid.ny {
             for bx in 0..grid.nx {
                 let bid = bx + by * grid.nx + bz * grid.nxy;
-                let ptr = BlockPtr(grid.block_pool.alloc_block());
-                unsafe {
-                    for z in 0..BSX {
-                        for y in 0..BSX {
-                            for x in 0..BSX {
-                                (*ptr.as_ptr()).data[x + y * BSX + z * BSX * BSX] =
-                                    field((bx * BSX + x) as f32, (by * BSX + y) as f32, (bz * BSX + z) as f32);
-                            }
+                grid.ensure_block(bid);
+                let data = grid.get_block_data_mut(bid).unwrap();
+                for z in 0..BSX {
+                    for y in 0..BSX {
+                        for x in 0..BSX {
+                            data[x + y * BSX + z * BSX * BSX] =
+                                field((bx * BSX + x) as f32, (by * BSX + y) as f32, (bz * BSX + z) as f32);
                         }
                     }
                 }
-                grid.blockmap[bid] = Some(ptr);
             }
         }
     }
@@ -49,17 +47,14 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
 }
 
 fn run_solver(grid: &SparseGrid<f32, BSX, N>, stencil: Stencil) -> Vec<f32> {
-    let active: Vec<u32> = (0..N_BLOCKS as u32).collect();
+    let active: Vec<usize> = (0..N_BLOCKS).collect();
     let sweeper = Sweeper::<f32, BSX, N, HSX>::new(grid, rayon::current_num_threads(), Fence::Sfence);
     let params = PdeParams { dt: DT, iterations: ITERS, do_constr_zero_one: false };
     sweeper.sweep(&active, stencil, &params);
 
     let mut out = Vec::with_capacity(N_VOXELS);
     for bid in 0..N_BLOCKS {
-        unsafe {
-            let d = (*grid.blockmap[bid].unwrap().as_ptr()).data;
-            out.extend_from_slice(&d);
-        }
+        out.extend_from_slice(grid.get_block_data(bid).unwrap());
     }
     out
 }

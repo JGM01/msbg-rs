@@ -28,18 +28,13 @@ fn block_data_ptr<D, const BSX: usize, const N: usize>(
 where
     D: Copy + Default + Send + Sync,
 {
-    match grid.blockmap[bid] {
-        Some(p) if p != grid.empty_block && p != grid.full_block => {
-            unsafe { (*p.as_ptr()).data.as_mut_ptr() }
-        }
-        _ => std::ptr::null_mut(),
-    }
+    grid.value_block_ptr_mut(bid)
 }
 
 /// Convert every active block's splat field into density in place.
 pub fn finalize<D, const BSX: usize, const N: usize>(
     grid: &SparseGrid<D, BSX, N>,
-    active: &[u32],
+    active: &[usize],
     cfg: &SurfaceConfig,
 ) where
     D: Quant + Copy + Default + Send + Sync,
@@ -51,7 +46,7 @@ pub fn finalize<D, const BSX: usize, const N: usize>(
     let linstep_denom = 2.0 * r_particle + cfg.nb_dist;
 
     active.par_iter().for_each(|&bid| {
-        let data = block_data_ptr(grid, bid as usize);
+        let data = block_data_ptr(grid, bid);
         if data.is_null() {
             return;
         }
@@ -117,7 +112,7 @@ mod tests {
         let r = 16.0f32; // distSqMax
         grid.set_voxel(6, 8, 8, Density(((2.5f32 * 2.5) / r * 65535.0).round() as u16)); // dx=2.5
         grid.set_voxel(4, 8, 8, Density(65468)); // ratio ~0.99898, just touched
-        let active = vec![0u32];
+        let active = vec![0usize];
         finalize(&grid, &active, &cfg());
 
         // Center: sqrt(0)-2 = -2 -> f = 1 - clamp(0/6) = 1.
@@ -136,7 +131,7 @@ mod tests {
     fn finalize_02_untouched_is_zero() {
         let mut grid = setup(32, 32, 32);
         grid.set_voxel(3, 3, 3, Density(u16::MAX));
-        let active = vec![0u32];
+        let active = vec![0usize];
         finalize(&grid, &active, &cfg());
         assert_eq!(get(&grid, 3, 3, 3), 0.0);
     }
@@ -149,7 +144,7 @@ mod tests {
         let above = ((0.9991f32) * 65535.0).round() as u16;
         grid.set_voxel(0, 0, 0, Density(below));
         grid.set_voxel(1, 0, 0, Density(above));
-        let active = vec![0u32];
+        let active = vec![0usize];
         finalize(&grid, &active, &cfg());
         assert!(get(&grid, 0, 0, 0) > 0.0, "just below threshold is touched");
         assert_eq!(get(&grid, 1, 0, 0), 0.0, "just above threshold is zero");
@@ -167,7 +162,7 @@ mod tests {
                 }
             }
         }
-        let active = vec![0u32];
+        let active = vec![0usize];
         finalize(&grid, &active, &cfg());
         for z in 0..16 {
             for y in 0..16 {

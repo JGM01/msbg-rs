@@ -25,11 +25,9 @@
 //! single-level; see step 8). It characterizes the substrate that solver will
 //! sit on.
 
-use msbg_rs::blockpool::BlockPool;
 use msbg_rs::math::boundary::BoundaryCondition;
 use msbg_rs::multires::halo::{fill_multires, HaloBlockPool};
-use msbg_rs::multires::{MultiresGrid, RefinementMap, Level};
-use msbg_rs::sparse_grid::SparseGrid;
+use msbg_rs::multires::{Level, LevelData, MultiresGrid, RefinementMap};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{env, hint::black_box, sync::Arc, time::Instant};
 
@@ -38,12 +36,12 @@ const N: usize = 4096;
 const HSX: usize = 18;
 const SHELL_OCCUPANCY: f64 = 0.14;
 
-// Per fine block, empirically calibrated on the M3 Pro (see AGENTS.md): f32
-// density (16 KiB) + u16 cell_flags (8 KiB) + u16 dist_fine_coarse (8 KiB) +
-// blockmaps/BlockInfoStore + ring/coarse channels + the fully-materialized
-// coarse downsample scratch (~14 KiB amortized) ≈ 45 KiB. Verified by the live
-// RSS printout on each run — `MSBG_STRESS_GB` now tracks final RSS to ~10%.
-const BYTES_PER_FINE_BLOCK: f64 = 45.0 * 1024.0;
+// Per fine block, recalibrated for the step-11 SoA layout: one 32 KiB
+// `LevelBlock` (density 16 KiB + cell_flags 8 KiB + dist_fine_coarse 8 KiB) +
+// the shared sparse blockmap (16 B/entry, amortized) + ring/coarse levels +
+// the sparse downsample scratch. Verified by the live RSS printout on each run
+// — `MSBG_STRESS_GB` now tracks final RSS to ~10%.
+const BYTES_PER_FINE_BLOCK: f64 = 34.0 * 1024.0;
 
 fn target_gb() -> f64 {
     match env::var("MSBG_BENCH_SCALE").as_deref() {
@@ -156,11 +154,11 @@ fn main() {
     println!("\n[2/4] materialize fine (f32) + ring density");
     let t0 = Instant::now();
     match &mut grid.levels[0] {
-        Level::B16(lv) => materialize(&mut lv.density, &fine, 0.5f32),
+        Level::B16(lv) => materialize(lv, &fine, 0.5f32),
         _ => unreachable!(),
     }
     match &mut grid.levels[1] {
-        Level::B8(lv) => materialize(&mut lv.density, &ring, 0.5f32),
+        Level::B8(lv) => materialize(lv, &ring, 0.5f32),
         _ => unreachable!(),
     }
     let mat_gb = (fine.len() as f64 * (BSX * BSX * BSX * 4) as f64
@@ -177,7 +175,7 @@ fn main() {
     // ---- [3] multires halo gather ------------------------------------------
     println!("\n[3/4] multires halo gather (fill_multires over fine shell)");
     let (fine_g, coarse_g) = match (&grid.levels[0], &grid.levels[1]) {
-        (Level::B16(l0), Level::B8(l1)) => (&l0.density, &l1.density),
+        (Level::B16(l0), Level::B8(l1)) => (l0, l1),
         _ => unreachable!(),
     };
     let halo_pool = Arc::new(HaloBlockPool::<BSX, HSX>::new(rayon::current_num_threads()));
@@ -186,7 +184,7 @@ fn main() {
     for _ in 0..iters {
         fine.par_iter().for_each(|&bid| {
             let halo = unsafe { halo_pool.get_mut() };
-            fill_multires::<BSX, HSX, 1, true, f32, N, 8, 512>(
+            fill_multires::<BSX, N, HSX, 1, true, 8, 512>(
                 halo,
                 fine_g,
                 coarse_g,
@@ -208,18 +206,7 @@ fn main() {
 
     // ---- [4] downsample -----------------------------------------------------
     println!("\n[4/4] downsample (fine -> coarse restriction)");
-    let mut scratch = SparseGrid::<f32, 8, 512>::new(
-        "scratch".into(),
-        coarse_g.sx,
-        coarse_g.sy,
-        coarse_g.sz,
-        0.0,
-        1.0,
-        Arc::new(BlockPool::new(coarse_g.n_blocks / 4096 + 2, 4096)),
-    );
-    for bid in 0..scratch.n_blocks {
-        scratch.ensure_block(bid);
-    }
+    let mut scratch = LevelData::<8, 512>::new(coarse_g.sx, coarse_g.sy, coarse_g.sz);
     let t0 = Instant::now();
     for _ in 0..iters {
         msbg_rs::multires::downsample::downsample_channel_avg::<16, 4096, 8, 512>(
@@ -230,7 +217,7 @@ fn main() {
     }
     let per = t0.elapsed() / iters as u32;
     let read_gb = fine.len() as f64 * (BSX * BSX * BSX * 4) as f64 / 1e9;
-    let write_gb = scratch.n_blocks as f64 * (8 * 8 * 8 * 4) as f64 / 1e9;
+    let write_gb = fine.len() as f64 * (8 * 8 * 8 * 4) as f64 / 1e9;
     let ds_gbs = (read_gb + write_gb) / per.as_secs_f64();
     println!(
         "      avg per pass: {:.2?} ({:.2} GB/s read+write, {:.2} GB read + {:.2} GB written)",
@@ -250,16 +237,17 @@ fn main() {
     println!("============================================================");
 }
 
-fn materialize<D: Copy + Default + Send + Sync, const B: usize, const N2: usize>(
-    grid: &mut SparseGrid<D, B, N2>,
+fn materialize<const B: usize, const N2: usize>(
+    lv: &mut LevelData<B, N2>,
     bids: &[usize],
-    val: D,
+    val: f32,
 ) {
     for &bid in bids {
-        grid.ensure_block(bid);
-        if let Some(p) = grid.blockmap[bid] {
+        lv.ensure_block(bid);
+        let p = lv.density_ptr_mut(bid);
+        if !p.is_null() {
             unsafe {
-                (*p.as_ptr()).data.fill(val);
+                std::slice::from_raw_parts_mut(p, N2).fill(val);
             }
         }
     }

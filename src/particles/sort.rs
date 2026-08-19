@@ -14,11 +14,11 @@ use super::{footprint_axis, DomainBounds, GridDims, SurfaceConfig};
 
 /// Center block id of a truncated in-domain position.
 #[inline(always)]
-fn center_block(ipos: [i32; 3], dims: &GridDims, bsx_log2: u32) -> u32 {
+fn center_block(ipos: [i32; 3], dims: &GridDims, bsx_log2: u32) -> usize {
     let bx = (ipos[0] >> bsx_log2) as usize;
     let by = (ipos[1] >> bsx_log2) as usize;
     let bz = (ipos[2] >> bsx_log2) as usize;
-    (bx + by * dims.nx + bz * dims.nxy) as u32
+    bx + by * dims.nx + bz * dims.nxy
 }
 
 /// Place every instance's particles, assign each to its center block, and
@@ -46,7 +46,7 @@ pub fn place(
     let bbox = *bbox_min;
 
     // One (positions, bids, footprint-blocks) accumulator per rayon worker.
-    type Acc = (Vec<[f32; 3]>, Vec<u32>, Vec<u32>);
+    type Acc = (Vec<[f32; 3]>, Vec<usize>, Vec<usize>);
     let (positions, bids, mut footprint): Acc = (0..n_instances)
         .into_par_iter()
         .fold(
@@ -97,8 +97,7 @@ pub fn place(
                         for by_ in y1..=y2 {
                             for bx_ in x1..=x2 {
                                 fp.push(
-                                    (bx_ as usize + by_ as usize * dims.nx + bz_ as usize * dims.nxy)
-                                        as u32,
+                                    bx_ as usize + by_ as usize * dims.nx + bz_ as usize * dims.nxy,
                                 );
                             }
                         }
@@ -131,43 +130,42 @@ pub fn place(
 /// offset array (`block b` occupies `positions[start[b]..start[b+1]]`).
 pub struct Bucketed {
     pub positions: Vec<[f32; 3]>,
-    pub block_start: Vec<u32>,
+    pub block_start: Vec<usize>,
     /// Blocks with at least one particle, sorted by block id.
-    pub particle_blocks: Vec<u32>,
+    pub particle_blocks: Vec<usize>,
 }
 
 /// O(n) counting sort of `(positions, bids)` into block-major order, with
 /// `particle_blocks` in ascending block-id order.
-pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<u32>, n_blocks: usize) -> Bucketed {
+pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>, n_blocks: usize) -> Bucketed {
     let n = positions.len();
     debug_assert_eq!(n, bids.len());
 
-    let mut counts = vec![0u32; n_blocks];
+    let mut counts = vec![0usize; n_blocks];
     for &b in &bids {
-        counts[b as usize] += 1;
+        counts[b] += 1;
     }
 
-    let mut block_start = vec![0u32; n_blocks + 1];
-    let mut acc = 0u32;
+    let mut block_start = vec![0usize; n_blocks + 1];
+    let mut acc = 0usize;
     for (b, c) in counts.iter().enumerate() {
         block_start[b] = acc;
         acc += c;
     }
     block_start[n_blocks] = acc;
-    debug_assert_eq!(acc as usize, n);
+    debug_assert_eq!(acc, n);
 
     let mut ordered = vec![[0.0f32; 3]; n];
     let mut cursor = block_start[..n_blocks].to_vec();
     for j in 0..n {
-        let b = bids[j] as usize;
-        let out = cursor[b] as usize;
+        let b = bids[j];
+        let out = cursor[b];
         ordered[out] = positions[j];
         cursor[b] += 1;
     }
 
-    let particle_blocks: Vec<u32> = (0..n_blocks)
+    let particle_blocks: Vec<usize> = (0..n_blocks)
         .filter(|&b| counts[b] > 0)
-        .map(|b| b as u32)
         .collect();
 
     Bucketed {
@@ -282,7 +280,7 @@ mod tests {
         let n = 100_000usize;
         let n_blocks = 64usize;
         let positions: Vec<[f32; 3]> = (0..n).map(|i| [i as f32, 0.0, 0.0]).collect();
-        let bids: Vec<u32> = (0..n).map(|_| next(&mut rng) % n_blocks as u32).collect();
+        let bids: Vec<usize> = (0..n).map(|_| (next(&mut rng) % n_blocks as u32) as usize).collect();
         let b = bucket_by_block(positions.clone(), bids.clone(), n_blocks);
 
         // Reference: stable sort by bid.
@@ -295,10 +293,10 @@ mod tests {
         assert_eq!(b.positions, expected);
         // block_start consistent with the reference.
         for blk in 0..n_blocks {
-            let lo = order.iter().position(|&i| bids[i] as usize == blk).unwrap_or(n);
-            let hi = order.iter().rposition(|&i| bids[i] as usize == blk).map_or(lo, |p| p + 1);
-            assert_eq!(b.block_start[blk], lo as u32);
-            assert_eq!(b.block_start[blk + 1], hi as u32);
+            let lo = order.iter().position(|&i| bids[i] == blk).unwrap_or(n);
+            let hi = order.iter().rposition(|&i| bids[i] == blk).map_or(lo, |p| p + 1);
+            assert_eq!(b.block_start[blk], lo);
+            assert_eq!(b.block_start[blk + 1], hi);
         }
     }
 }

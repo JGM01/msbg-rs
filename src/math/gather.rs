@@ -57,16 +57,7 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
             let bid = ((ix0 as usize) >> bsx_log2)
                 + ((iy0 as usize) >> bsx_log2) * grid.nx
                 + ((iz0 as usize) >> bsx_log2) * grid.nxy;
-            let ptr = match grid.blockmap[bid] {
-                Some(p) if p == grid.empty_block => {
-                    unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() }
-                }
-                Some(p) if p == grid.full_block => {
-                    unsafe { (*grid.full_block.as_ptr()).data.as_ptr() }
-                }
-                Some(p) => unsafe { (*p.as_ptr()).data.as_ptr() },
-                None => unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() },
-            };
+            let ptr = grid.block_data_ptr(bid);
             let mut s = 0;
             for k in 0..span {
                 for j in 0..span {
@@ -88,7 +79,6 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
     let bz0 = ((iz0 >> bsx_log2).max(0)) as usize;
 
     let empty_ptr = unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() };
-    let full_ptr = unsafe { (*grid.full_block.as_ptr()).data.as_ptr() };
 
     let mut slots: [*const D; MAX_SLOTS] = [empty_ptr; MAX_SLOTS];
     for sz in 0..2usize {
@@ -98,12 +88,7 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
                 let byy = (by0 + sy).min(grid.ny - 1);
                 let bzz = (bz0 + sz).min(grid.nz - 1);
                 let bid = bxx + byy * grid.nx + bzz * grid.nxy;
-                slots[sx | (sy << 1) | (sz << 2)] = match grid.blockmap[bid] {
-                    Some(p) if p == grid.empty_block => empty_ptr,
-                    Some(p) if p == grid.full_block => full_ptr,
-                    Some(p) => unsafe { (*p.as_ptr()).data.as_ptr() },
-                    None => empty_ptr,
-                };
+                slots[sx | (sy << 1) | (sz << 2)] = grid.block_data_ptr(bid);
             }
         }
     }

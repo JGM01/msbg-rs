@@ -416,7 +416,7 @@ operator beneath them is difftested against the real library.
 
 ## Step 11 — Sparse blockmap
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Parity target:** C++ `_blockmap` (dense per-block `BlockInfo`, `msbg.cpp`) vs
 our dense per-channel `Vec<Option<BlockPtr>>`.
@@ -429,9 +429,10 @@ them" architectural win that unblocks both goals. Coordinate indexing
 (`get_block_id`/`get_voxel_id`) is unchanged; only the storage changes.
 
 **Decisions (owned):** block 16 (L1-resident, our kernels stay valid) + sparse
-map instead of block 32 + dense map; u64 block keys (2048³ = 8.59B > u32::MAX);
-open-addressing vs `HashMap` chosen on measured hot-path probe cost; the
-multires `LevelData` collapses its 27 maps to one shared map.
+map instead of block 32 + dense map; 64-bit block ids (`usize`; 2048³ = 8.59B >
+`u32::MAX`); hand-rolled open-addressing over `hashbrown` (measured — see
+below); the multires `LevelData` collapses its 9 maps to one shared sparse map
+with a per-block SoA payload (see refactor.md §14).
 
 **Acceptance:**
 - All existing unit + difftests pass unchanged (map sits behind the existing API).
@@ -440,6 +441,25 @@ multires `LevelData` collapses its 27 maps to one shared map.
   interp, splat, surface, multires, render) — step-1..10 ratios must hold.
 - Memory: the multires scale-stress bench (`benches/multires_scale_bench.rs`)
   RSS drops by the map overhead factor at a given domain.
+
+**Measured (Dell 5500U, small scale, 12 threads):**
+
+- `blockmap_lookup` (`benches/blockmap_bench.rs`, real block pointers): dense
+  `Vec` index **0.53 ns/probe** vs `BlockMap::get` **0.88 ns/probe** (1.66×,
+  within the 2× budget); `hashbrown` 1.6–3.1× slower than hand-rolled → rejected.
+  The first cut used a SplitMix64 finalizer (~3.5× over dense); a single
+  odd-constant multiply (`key * 0x9E37…`, a bijection mod 2^k that spreads
+  consecutive `bx` bids uniformly) is what closed the gap.
+- **Interpolation no-regression:** `interp_linear_value` 4.87 ms vs the dense
+  baseline 4.78 ms (+2%, inside the ±15% throttle band) — the gather fast path
+  is one probe per sample and the probe is ~1 ns of a ~48 ns sample.
+- **Multires set_refinement_map:** Rust 98.6 ms vs C++ 94.1 ms (35,937 blocks)
+  — parity *while also* initializing the cell flags the C++ benchmark path
+  (`doInitCellFlags=false`) skips. (A first SoA cut was 2.05× slower: the SoA
+  block co-filled density+flags+dfc 32 KiB/block during flag-only init; see
+  refactor.md §14.)
+- **Multires halo gather:** Rust 3.72 Gvox/s vs C++ 2.10 Gvox/s (~1.77×).
+- `surface` (step-9) and `render` (step-10) benches + difftests pass unchanged.
 
 ---
 

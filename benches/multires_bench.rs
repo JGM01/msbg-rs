@@ -3,10 +3,8 @@
 //! library calls on both sides, no mocks).
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use msbg_rs::blockpool::BlockPool;
 use msbg_rs::multires::halo::{fill_multires, HaloBlockPool};
-use msbg_rs::multires::{Level, MultiresGrid, RefinementMap};
-use msbg_rs::sparse_grid::SparseGrid;
+use msbg_rs::multires::{Level, LevelData, MultiresGrid, RefinementMap};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{env, hint::black_box, sync::Arc};
 
@@ -60,16 +58,17 @@ fn thread_pool() -> &'static msbg_rs::thread_pool::Pool {
     POOL.get_or_init(|| msbg_rs::thread_pool::Pool::new(rayon::current_num_threads()))
 }
 
-fn materialize_blocks<D: Copy + Default + Send + Sync, const B: usize, const N2: usize>(
-    grid: &mut SparseGrid<D, B, N2>,
+fn materialize<const B: usize, const N2: usize>(
+    lv: &mut LevelData<B, N2>,
     bids: &[usize],
-    val: D,
+    val: f32,
 ) {
     for &bid in bids {
-        grid.ensure_block(bid);
-        if let Some(p) = grid.blockmap[bid] {
+        lv.ensure_block(bid);
+        let p = lv.density_ptr_mut(bid);
+        if !p.is_null() {
             unsafe {
-                (*p.as_ptr()).data.fill(val);
+                std::slice::from_raw_parts_mut(p, N2).fill(val);
             }
         }
     }
@@ -100,11 +99,11 @@ fn build_multires_grid(active_target: usize) -> (MultiresGrid, Vec<usize>) {
     let ring: Vec<usize> = (0..n_blocks).filter(|&b| levels[b] == 1).collect();
 
     match &mut grid.levels[0] {
-        Level::B16(lv) => materialize_blocks(&mut lv.density, &fine, 0.5),
+        Level::B16(lv) => materialize(lv, &fine, 0.5),
         _ => unreachable!("level 0 block size"),
     }
     match &mut grid.levels[1] {
-        Level::B8(lv) => materialize_blocks(&mut lv.density, &ring, 0.5),
+        Level::B8(lv) => materialize(lv, &ring, 0.5),
         _ => unreachable!("level 1 block size"),
     }
 
@@ -152,7 +151,7 @@ fn bench_multires_halo(c: &mut Criterion) {
             let levels = grid.block_info.level0.clone();
 
             let (fine, coarse) = match (&grid.levels[0], &grid.levels[1]) {
-                (Level::B16(l0), Level::B8(l1)) => (&l0.density, &l1.density),
+                (Level::B16(l0), Level::B8(l1)) => (l0, l1),
                 _ => unreachable!("level 0/1 block sizes"),
             };
 
@@ -161,7 +160,7 @@ fn bench_multires_halo(c: &mut Criterion) {
                 thread_pool().install(|| {
                     active.par_iter().for_each(|&bid| {
                         let halo = unsafe { pool.get_mut() };
-                        fill_multires::<BSX, HSX, 1, true, f32, N, 8, 512>(
+                        fill_multires::<BSX, N, HSX, 1, true, 8, 512>(
                             halo, fine, coarse, &levels, bid,
                             msbg_rs::math::BoundaryCondition::Neumann,
                         );
@@ -182,22 +181,11 @@ fn bench_multires_downsample(c: &mut Criterion) {
         let (grid, _active) = build_multires_grid(target);
         group.throughput(Throughput::Elements((grid.dims.n_blocks * 512) as u64));
         group.bench_with_input(BenchmarkId::new("avg_2x2x2", target), &target, |b, &_t| {
-            let (fine, coarse) = match (&grid.levels[0], &grid.levels[1]) {
-                (Level::B16(l0), Level::B8(l1)) => (&l0.density, &l1.density),
-                _ => unreachable!("level 0/1 block sizes"),
+            let (fine, coarse_sx, coarse_sy, coarse_sz) = match &grid.levels[0] {
+                Level::B16(l0) => (l0, l0.sx / 2, l0.sy / 2, l0.sz / 2),
+                _ => unreachable!(),
             };
-            let mut scratch = SparseGrid::<f32, 8, 512>::new(
-                "scratch".into(),
-                coarse.sx,
-                coarse.sy,
-                coarse.sz,
-                0.0,
-                1.0,
-                Arc::new(BlockPool::new(coarse.n_blocks / 4096 + 2, 4096)),
-            );
-            for bid in 0..scratch.n_blocks {
-                scratch.ensure_block(bid);
-            }
+            let mut scratch = LevelData::<8, 512>::new(coarse_sx, coarse_sy, coarse_sz);
             b.iter(|| {
                 msbg_rs::multires::downsample::downsample_channel_avg::<16, 4096, 8, 512>(
                     &mut scratch, fine,

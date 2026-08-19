@@ -9,13 +9,13 @@ use rayon::prelude::*;
 use super::{footprint_axis, GridDims, SurfaceConfig};
 
 /// Union of all particles' footprint blocks, sorted and deduplicated.
-pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfig) -> Vec<u32> {
+pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfig) -> Vec<usize> {
     let r_scan_bsx = cfg.r_scan() / dims.bsx as f32;
     let chunk = dims.nxy;
 
-    let mut merged: Vec<u32> = positions
+    let mut merged: Vec<usize> = positions
         .par_chunks(4096)
-        .fold(Vec::new, |mut local: Vec<u32>, chunk_| {
+        .fold(Vec::new, |mut local: Vec<usize>, chunk_| {
             for p in chunk_ {
                 let (x1, x2) = footprint_axis(p[0], r_scan_bsx, dims.bsx, dims.nx);
                 let (y1, y2) = footprint_axis(p[1], r_scan_bsx, dims.bsx, dims.ny);
@@ -24,7 +24,7 @@ pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfi
                     for by in y1..=y2 {
                         for bx in x1..=x2 {
                             let bid = (bx as usize) + (by as usize) * dims.nx + (bz as usize) * chunk;
-                            local.push(bid as u32);
+                            local.push(bid);
                         }
                     }
                 }
