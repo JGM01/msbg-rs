@@ -323,6 +323,51 @@ where
         self.blockmap.insert(bid, new_block);
     }
 
+    /// Allocate + zero `bids` in parallel, then insert the pointers into the
+    /// blockmap. The serial `ensure_block` loop spends its wall-clock on
+    /// first-touch page faults + zeroing (the dominant cost when materializing a
+    /// ~215 GB density field); this spreads that across all rayon threads. The
+    /// blockmap insert — the only `&mut self` part — is deferred to a fast
+    /// serial pass. `bids` must be unique (the active block list is sorted and
+    /// deduplicated); a duplicate would race on `get` and leak a block.
+    pub fn ensure_blocks_parallel(&mut self, bids: &[usize]) {
+        use rayon::prelude::*;
+        let full = self.full_block;
+        let empty = self.empty_value;
+        let pool = &self.block_pool;
+        let newly: Vec<(usize, BlockPtr<D, BSX, N>)> = bids
+            .par_iter()
+            .filter_map(|&bid| {
+                match self.blockmap.get(bid) {
+                    Some(p) if p != full => return None, // already a value block
+                    _ => {}
+                }
+                let new_block = BlockPtr(pool.alloc_block());
+                unsafe {
+                    (*new_block.as_ptr()).data.fill(empty);
+                }
+                Some((bid, new_block))
+            })
+            .collect();
+        for (bid, ptr) in newly {
+            self.blockmap.insert(bid, ptr);
+        }
+    }
+
+    /// Fill every materialized value block in `bids` with `value`, in parallel.
+    /// Empty/full dummy blocks resolve to a null pointer and are skipped.
+    pub fn fill_blocks_parallel(&self, bids: &[usize], value: D) {
+        use rayon::prelude::*;
+        bids.par_iter().for_each(|&bid| {
+            let p = self.value_block_ptr_mut(bid);
+            if !p.is_null() {
+                unsafe {
+                    std::slice::from_raw_parts_mut(p, N).fill(value);
+                }
+            }
+        });
+    }
+
     /// Set a voxel value. Allocates the block on demand (over `None` or a dummy).
     #[inline(always)]
     pub fn set_voxel(&mut self, x: usize, y: usize, z: usize, val: D) {

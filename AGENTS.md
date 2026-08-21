@@ -171,7 +171,42 @@ cd ../msbg-rs && nix-shell
 MSBG_BENCH_SCALE=big MSBG_RENDER_W=960 MSBG_RENDER_H=540 cargo bench -p msbg-render --bench render_bench
 ```
 
+### Surface reconstruction benchmark (step 12) + AWS
+
+`benches/surface_bench.rs` times each phase of the REAL `msbg_test_sparse`
+pipeline (parse / place / sparse bucket / 8-color splat / finalize / e2e) and
+reports peak RSS (VmHWM) per phase. Mirrors C++ `benchmark.cpp surface`:
+
+```bash
+# side-by-side (Dell, 512^3 / 64 instances)
+cd ../MSBG && nix-shell && MSBG_BENCH_SCALE=big ./build/bench_executable surface && exit
+cd ../msbg-rs && nix-shell
+MSBG_BENCH_SCALE=big cargo bench --bench surface_bench
+```
+
+`MSBG_BENCH_MACHINE=dell|macbook|aws` picks the default sizes (`surface_bench`
+and `allocator_benches` both honor it); `MSBG_BENCH_SCALE=small|big|xbig` picks
+the scale. `MSBG_SURFACE_RES` / `MSBG_SURFACE_NINST` / `MSBG_SURFACE_SCALE` /
+`MSBG_SURFACE_PLY` override the per-phase defaults. The `aws` machine defaults
+to `bun_zipper.ply` (35,947 verts) — `big` = 4096³/35,947 (~1.29B particles),
+`xbig` = 8192³/35,947.
+
+The paper-scale showcase (reconstruct **and** write the teaser image in one
+process, with per-phase throughput + RSS) is the `bunny_of_bunnies` example:
+
+```bash
+# testCase 2 at 32,768³ (~1.29B particles, ~100B active voxels, ~200 GB) on the 256 GB AWS box:
+cargo run -p msbg-render --release --example bunny_of_bunnies -- \
+    ../MSBG/data/bun_zipper.ply 32768 32768 32768 35947 0.005 out_msbg_aws 3840 2160
+```
+
+It writes `out_msbg_aws/bunny_of_bunnies.png` (ESS-DDA raymarch) + `slice_z.png`
+(whole-domain downsampled slice) and prints `[Rust] <phase>: …ms (…/s, rss=… MiB)`
+for parse/place/bucket/splat/finalize/mean_curvature/render — the throughput /
+memory / wall-clock numbers to compare against the paper's ~10B unknowns/s.
+
 ## Debugging
+
 
 The shell ships both Rust-specific tooling (`cargo miri`, `cargo asm`,
 `cargo bloat`, `cargo llvm-lines`, `cargo flamegraph`, `cargo geiger`,

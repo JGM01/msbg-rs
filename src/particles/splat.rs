@@ -111,19 +111,19 @@ pub fn splat<D, const BSX: usize, const N: usize, const MSX: usize>(
 
     let dims = GridDims::new(grid.sx, grid.sy, grid.sz, BSX);
 
-    let mut by_color: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
-    for &bid in &bucketed.particle_blocks {
+    let mut by_color: [Vec<(usize, usize)>; 8] = std::array::from_fn(|_| Vec::new());
+    for (i, &bid) in bucketed.particle_blocks.iter().enumerate() {
         let (bx, by, bz) = dims.coords(bid);
         let color = (bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2);
-        by_color[color].push(bid);
+        by_color[color].push((i, bid));
     }
 
     let pool = SplatPool::<D, MSX>::new(rayon::current_num_threads());
 
     for bucket in &by_color {
-        bucket.par_iter().for_each(|&bid| {
-            let start = bucketed.block_start[bid];
-            let end = bucketed.block_start[bid + 1];
+        bucket.par_iter().for_each(|&(i, bid)| {
+            let start = bucketed.starts[i];
+            let end = bucketed.starts[i + 1];
             let pts = &bucketed.positions[start..end];
             let slot = unsafe { pool.get_mut() };
             stage_and_commit::<D, BSX, N, MSX>(
@@ -363,7 +363,7 @@ mod tests {
 
     fn do_splat(grid: &SparseGrid<Density, BSX, N>, pts: &[[f32; 3]], bids: Vec<usize>) {
         let bucketed =
-            crate::particles::sort::bucket_by_block(pts.to_vec(), bids, grid.n_blocks);
+            crate::particles::sort::bucket_by_block(pts.to_vec(), bids);
         splat::<Density, BSX, N, MSX>(grid, &bucketed, &cfg());
     }
 

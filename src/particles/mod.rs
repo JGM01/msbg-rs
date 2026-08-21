@@ -253,7 +253,7 @@ where
         &DomainBounds::new(&dims),
         cfg,
     );
-    let bucketed = sort::bucket_by_block(placed.positions, placed.bids, dims.n_blocks());
+    let bucketed = sort::bucket_by_block(placed.positions, placed.bids);
     let active = placed.active;
 
     let mut grid = SparseGrid::new(
@@ -265,11 +265,8 @@ where
         D::full(),
         pool,
     );
-    for &bid in &active {
-        grid.ensure_block(bid as usize);
-        grid.get_block_data_mut(bid as usize).unwrap().fill(D::full());
-    }
-
+    grid.ensure_blocks_parallel(&active);
+    grid.fill_blocks_parallel(&active, D::full());
     splat::splat::<D, BSX, N, MSX>(&grid, &bucketed, cfg);
     finalize::finalize::<D, BSX, N>(&grid, &active, cfg);
 

@@ -1,10 +1,13 @@
 //! Active-block determination: the union of every placed particle's footprint
 //! block range, replicated exactly from the C++ `msbg_test_sparse` marking
-//! (`trunc(bpos ± rScan/bsx)` clipped to the block grid). Per-thread local
-//! lists are sorted and merged — no atomics (C++ uses one `InterlockedIncrement`
-//! per footprint block per particle).
+//! (`trunc(bpos ± rScan/bsx)` clipped to the block grid). Per-thread sparse
+//! sets are merged and sorted — no atomics (C++ uses one `InterlockedIncrement`
+//! per footprint block per particle into a dense `blockActive` array, which is
+//! 68.7 GB at 32,768³/block-16), and no per-particle `Vec`.
 
 use rayon::prelude::*;
+
+use crate::blockmap::BlockSet;
 
 use super::{footprint_axis, GridDims, SurfaceConfig};
 
@@ -13,9 +16,9 @@ pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfi
     let r_scan_bsx = cfg.r_scan() / dims.bsx as f32;
     let chunk = dims.nxy;
 
-    let mut merged: Vec<usize> = positions
+    let set: BlockSet = positions
         .par_chunks(4096)
-        .fold(Vec::new, |mut local: Vec<usize>, chunk_| {
+        .fold(BlockSet::new, |mut local: BlockSet, chunk_| {
             for p in chunk_ {
                 let (x1, x2) = footprint_axis(p[0], r_scan_bsx, dims.bsx, dims.nx);
                 let (y1, y2) = footprint_axis(p[1], r_scan_bsx, dims.bsx, dims.ny);
@@ -24,21 +27,23 @@ pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfi
                     for by in y1..=y2 {
                         for bx in x1..=x2 {
                             let bid = (bx as usize) + (by as usize) * dims.nx + (bz as usize) * chunk;
-                            local.push(bid);
+                            local.insert(bid, ());
                         }
                     }
                 }
             }
             local
         })
-        .reduce(Vec::new, |mut a, mut b| {
-            a.append(&mut b);
+        .reduce(BlockSet::new, |mut a, b| {
+            for (k, _) in b.iter() {
+                a.insert(k, ());
+            }
             a
         });
 
-    merged.par_sort_unstable();
-    merged.dedup();
-    merged
+    let mut active: Vec<usize> = set.iter().map(|(k, _)| k).collect();
+    active.par_sort_unstable();
+    active
 }
 
 #[cfg(test)]
@@ -127,5 +132,78 @@ mod tests {
         // Footprint x: 17/16=1.0625 ± 0.25 -> trunc gives 0..1; y: 33/16=2.0625
         // ± 0.25 -> 1..2; z stays 0. Blocks {0,1}x{1,2}x{0} = 2,3,4,5.
         assert_eq!(a, vec![2, 3, 4, 5]);
+    }
+
+    // Block ids exceeding u32::MAX (64-bit addressing) must survive the sparse
+    // set round-trip without truncation.
+    #[test]
+    fn active_08_u64_scale_bids() {
+        let d = GridDims::new(1 << 21, 1 << 21, 1 << 21, 16); // 2^51 virtual blocks
+        let positions = [[(1 << 21) as f32 - 8.0; 3]];
+        let a = active_blocks(&positions, &d, &cfg());
+        assert!(!a.is_empty());
+        assert!(a.iter().any(|&b| b > u32::MAX as usize));
+    }
+
+    // The merged union must be identical regardless of how many rayon threads
+    // split the work (no per-thread non-determinism leaks into the result).
+    #[test]
+    fn active_09_deterministic_across_thread_counts() {
+        let d = dims(64);
+        let positions: Vec<[f32; 3]> = (0..4096)
+            .map(|i| {
+                [
+                    (i % 64) as f32 + 0.5,
+                    ((i / 64) % 64) as f32 + 0.5,
+                    (i / 4096) as f32 + 0.5,
+                ]
+            })
+            .collect();
+        let single = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let multi = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let a1 = single.install(|| active_blocks(&positions, &d, &cfg()));
+        let a8 = multi.install(|| active_blocks(&positions, &d, &cfg()));
+        assert_eq!(a1, a8);
+    }
+
+    // Equivalence oracle: the sparse union matches the dense footprint Vec +
+    // sort/dedup reference (kept below) on randomized input.
+    #[test]
+    fn active_10_sparse_equals_dense_reference() {
+        let mut rng = 0x1234_5678u32;
+        let next = |rng: &mut u32| {
+            *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            *rng >> 8
+        };
+        let d = dims(128);
+        let positions: Vec<[f32; 3]> = (0..5000)
+            .map(|_| [
+                (next(&mut rng) % 128) as f32,
+                (next(&mut rng) % 128) as f32,
+                (next(&mut rng) % 128) as f32,
+            ])
+            .collect();
+        assert_eq!(active_blocks(&positions, &d, &cfg()), active_blocks_dense(&positions, &d, &cfg()));
+    }
+
+    /// Dense footprint Vec + sort/dedup reference (the pre-step-12 path).
+    fn active_blocks_dense(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfig) -> Vec<usize> {
+        let r_scan_bsx = cfg.r_scan() / dims.bsx as f32;
+        let mut merged: Vec<usize> = Vec::new();
+        for p in positions {
+            let (x1, x2) = footprint_axis(p[0], r_scan_bsx, dims.bsx, dims.nx);
+            let (y1, y2) = footprint_axis(p[1], r_scan_bsx, dims.bsx, dims.ny);
+            let (z1, z2) = footprint_axis(p[2], r_scan_bsx, dims.bsx, dims.nz);
+            for bz in z1..=z2 {
+                for by in y1..=y2 {
+                    for bx in x1..=x2 {
+                        merged.push((bx as usize) + (by as usize) * dims.nx + (bz as usize) * dims.nxy);
+                    }
+                }
+            }
+        }
+        merged.par_sort_unstable();
+        merged.dedup();
+        merged
     }
 }

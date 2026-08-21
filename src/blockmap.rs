@@ -150,6 +150,42 @@ impl<V: Copy> BlockMap<V> {
         }
     }
 
+    /// If `key` is present, replace its value with `f(old)` (single probe on
+    /// the hit path); otherwise insert `default` (without calling `f`). Returns
+    /// the new value. The sparse-histogram hot loop (`count[key] += 1`).
+    #[inline]
+    pub fn update(&mut self, key: usize, default: V, mut f: impl FnMut(V) -> V) -> V {
+        debug_assert!(key != EMPTY && key != TOMBSTONE, "key collides with a sentinel");
+        let mut i = self.slot(key);
+        loop {
+            let k = self.keys[i];
+            if k == key {
+                let old = unsafe { self.vals[i].assume_init() };
+                let new = f(old);
+                self.vals[i].write(new);
+                return new;
+            }
+            if k == EMPTY {
+                break;
+            }
+            i = (i + 1) & self.mask;
+        }
+        self.insert(key, default);
+        default
+    }
+
+    /// All live `(key, value)` pairs sorted by key (for the k-way merges of the
+    /// parallel sparse histogram).
+    pub fn sorted_pairs(&self) -> Vec<(usize, V)>
+    where
+        V: Sync + Send,
+    {
+        use rayon::slice::ParallelSliceMut;
+        let mut v: Vec<(usize, V)> = self.iter().collect();
+        v.par_sort_unstable_by_key(|&(k, _)| k);
+        v
+    }
+
     /// Iterate live `(key, value)` pairs (map order, not sorted).
     pub fn iter(&self) -> impl Iterator<Item = (usize, V)> + '_ {
         (0..self.keys.len()).filter_map(|i| {
@@ -177,6 +213,10 @@ impl<V: Copy> Default for BlockMap<V> {
         Self::new()
     }
 }
+
+/// A sparse set of block ids (`V = ()` keeps the value array zero-cost). Used
+/// for the active-block / footprint unions where only membership matters.
+pub type BlockSet = BlockMap<()>;
 
 #[cfg(test)]
 mod tests {
@@ -307,5 +347,40 @@ mod tests {
         let mut seen: Vec<(usize, u64)> = m.iter().collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..100usize).map(|i| (i * 7, i as u64)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_bm_11_update_increment_and_insert() {
+        let mut m = BlockMap::new();
+        // Missing key -> default (f not applied).
+        assert_eq!(m.update(7, 1u32, |v| v + 1), 1);
+        assert_eq!(m.update(7, 1, |v| v + 1), 2);
+        assert_eq!(m.update(7, 100, |v| v + 1), 3); // default ignored on hit
+        assert_eq!(m.get(7), Some(3));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn test_bm_12_blockset_membership() {
+        let mut s: BlockSet = BlockSet::new();
+        assert!(s.get(5).is_none());
+        s.insert(5, ());
+        s.insert(5, ()); // idempotent
+        assert!(s.get(5).is_some());
+        assert_eq!(s.len(), 1);
+        s.remove(5);
+        assert!(s.get(5).is_none());
+    }
+
+    #[test]
+    fn test_bm_13_sorted_pairs_order() {
+        let mut m = BlockMap::new();
+        for k in [40usize, 0, 20, u32::MAX as usize, 10] {
+            m.insert(k, k as u64);
+        }
+        let p = m.sorted_pairs();
+        let keys: Vec<usize> = p.iter().map(|&(k, _)| k).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(keys.len(), 5);
     }
 }

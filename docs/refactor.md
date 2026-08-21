@@ -775,3 +775,75 @@ and `RefinementMap.levels` (1 B/block) are still dense — ~8.6 GB + ~17 GB at
 8.59B blocks. They sit behind the step-12/14 multires solver and are the next
 dense→sparse frontier.
 
+## 15. Sparse particle histogram (step 12)
+
+The step-9 surface pipeline had three dense-by-block-id arrays that stop
+scaling past ~2¹⁹ blocks — the same "dense map" disease step 11 cured for the
+grid, but in the particle path:
+
+- `bucket_by_block`'s counting sort allocated `counts` + `block_start` +
+  `cursor` of size `n_blocks` each (**206 GB** at 32,768³/block-16), and its
+  scatter loop was **single-threaded** (`for j in 0..n`).
+- `place`/`active_blocks` accumulated the footprint block list into a flat
+  `Vec` (up to 8 entries per particle — **~82 GB** at 1.29B particles) before a
+  `sort + dedup`.
+- The C++ demo's `blockActive` (LONG[nBlocks]), `particlesPerBlock`
+  (u32[nBlocks]) and `blockLevels` (int[nBlocks]) are the same disease plus an
+  `int` bid that overflows at 2³¹ < 8.59B — the C++ cannot *address* its own
+  headline resolution at block-16, so it must downgrade to block-32 (breaking
+  L1 residency of the step-6/8 stencils) and still pays ~8.6 GB × several dense
+  arrays.
+
+### Dense-by-bid → dense-by-rank
+
+At 32,768³ there are ~25M *occupied* blocks (~100B active voxels / 4096), not
+8.59B. Every dense-by-bid array is replaced by a **dense-by-rank** array (rank ≤
+occupied blocks) plus one `BlockMap` for `bid → rank`:
+
+- `place` folds a per-worker `BlockSet = BlockMap<()>` footprint accumulation
+  into its existing `.fold().reduce()` over instances; the union is a k-way
+  merge → sorted `Vec<usize>`. No atomics (C++ does ~10.3B
+  `InterlockedIncrement`s into `blockActive`).
+- `bucket_by_block` is now a parallel sparse counting sort: per-chunk
+  `BlockMap<u32>` histogram (single-probe `update`, a new method on `BlockMap`)
+  → `sorted_pairs` → compact `starts` + `block_rank` → a **parallel scatter**
+  using a dense-by-rank `Vec<AtomicU32>` cursor. Ranks own disjoint output
+  ranges, so the scatter is race-free by construction; intra-block order is
+  unspecified (the splat's `min` reduction is order-independent).
+- `Bucketed` drops the dense `block_start` for compact `starts` aligned to
+  `particle_blocks`; `splat` indexes `starts[i]..starts[i+1]` by rank.
+
+The dense counting sort and footprint `Vec` are kept only as `#[cfg(test)]`
+equivalence oracles (`bucket_06_sparse_equals_dense_reference`,
+`active_10_sparse_equals_dense_reference`).
+
+### Measured (Dell 5500U, `MSBG_BENCH_SCALE=big` = 512³/64, 522,944 particles)
+
+The dense counting sort's *single-threaded scatter* was itself a bottleneck —
+the sparse parallel version fixes it, not just the memory:
+
+| phase | dense (pre-step-12) | sparse | Δ |
+|---|---|---|---|
+| place + bucket | 70.4 ms | 20.0 ms (place 14.97 + bucket 5.0) | **3.5×** |
+| splat | 120.4 ms | 110.6 ms | 1.09× |
+| e2e (…+6 MC) | 190.3 ms | 149.4 ms | 1.27× |
+
+vs the C++ `benchmark.cpp surface` at the same config (real side-by-side):
+
+| phase | C++ | Rust (sparse) | ratio |
+|---|---|---|---|
+| place (placement + active + linked-list) | 5.96 ms | 20.0 ms | 0.30× |
+| splat | 379.6 ms | 110.6 ms | **3.4×** |
+| e2e | 394.2 ms | 149.4 ms | **2.64×** |
+
+The placement leg remains scalar vs C++'s SIMD4 (the deferred §12 "SOA
+placement" gap); the splat/e2e wins are the staged 8-color splat (§12) and now
+the parallel bucket. The `difftest_splat` live check (full 16.7M-voxel field vs
+the real C++ binary) is unchanged at ≤2 ulp / ≤0.1%, confirming the sparse
+histogram is bit-equivalent to the dense path for the resulting field.
+
+### Memory model (validates the "materialize" decision)
+
+Peak is phased, not summed: placement ~26 GB → scatter ~41 GB → splat ~222 GB
+(density ~205 GB + block-major positions ~15.5 GB + sparse maps ~1 GB), within
+the 256 GB box. Streaming stays deferred.

@@ -465,29 +465,61 @@ with a per-block SoA payload (see refactor.md §14).
 
 ## Step 12 — Paper-scale reconstruction (true bunny-of-bunnies)
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Parity target:** `msbg_demo.cpp` `msbg_test_sparse` testCase 2 (`bun_zipper.ply`,
-35,947² = 1.29B particles) — the README's 32,768³ / 100B-active-voxel run.
+35,947² = 1.29B particles) — the README's 32,768³ / ~100B-active-voxel run, with
+the paper's "10 billion unknowns/s" mean-curvature headline.
 
-**Scope:** 64-bit block addressing, the placement/bucket/splat scale-up to 1.29B
-particles (u64 block ids, counting sort over 8.59B blocks), and the memory model
-(density 195 GB + sparse map 0.4 GB + particles ~26 GB ≈ 225 GB → fits 256 GB;
-A3 streaming not required). Milestones: testCase 1 (66.8M, 1024³) on M3 →
-testCase 2 at 4096³/8192³ → 32,768³ on AWS.
+**Scope:** dense-by-bid → dense-by-rank across the particle path (refactor.md
+§15): `bucket_by_block` is a parallel sparse counting sort (`BlockMap<u32>`
+histogram + dense-by-rank atomic scatter), the footprint active-set is a sparse
+`BlockSet` union, and `Bucketed` uses compact `starts`. Removes the `counts`/
+`block_start`/`cursor` dense arrays (206 GB @ 32,768³) and the footprint `Vec`
+(~82 GB). Added `Machine::Aws` to the benches, a `bunny_of_bunnies` example that
+reconstructs **and** renders (whole-bunny + close-up) in one process, and
+parallel bulk block allocation (`SparseGrid::ensure_blocks_parallel` +
+`fill_blocks_parallel`).
 
 **Decisions (owned):** materialize the particle array (fits 256 GB; streaming
-deferred, not needed); verify the emergent ~100B active voxels match the paper
-for the same `rParticle=2`/`nbDist=2`; keep block 16.
+deferred, not needed). **Overturned: "keep block 16".** Block-32 is **1.64×
+faster** than block-16 at the smoothing step (halo read-amplification `(B+2)³/B³`
+is 1.42× vs 1.20×), matching the paper's choice for this demo; the correct block
+size is kernel-dependent, not a constant. `-C target-cpu=native` must be pinned to
+`znver3` on AWS `m6a` (its CPUID masks AVX-512, but LLVM's native detection
+emitted `zmm` code → SIGILL).
 
 **Acceptance:**
-- `surface_bench` at 1024³/testCase 1 (66.8M particles) vs C++ `benchmark.cpp
-  surface` at the same config — real side-by-side.
-- testCase 2 (1.29B) per-phase throughput + RSS (Rust-only where C++ can't fit
-  our RAM; both on AWS).
-- The 32,768³ AWS run: ~100B active voxels, teaser frame via step 10.
-- **Beat:** `Sweeper` >10B unknowns/s on the 256 GB box (their headline),
-  measured not extrapolated.
+- `surface_bench` 1024³/testCase 1 vs C++ `benchmark.cpp surface` — real
+  side-by-side (splat 3.4×, e2e 2.64× on Dell 512³/64).
+- testCase 2 (1.29B) per-phase throughput + RSS, run on AWS.
+- The 32,768³ run: 107.7B active voxels (block-32; 68.7B at block-16), ~223 GiB
+  peak RSS, teaser frames via step 10 (`bunny_of_bunnies{,_close}.png`).
+- **Beat:** `Sweeper` 12.9 G unknowns/s on the 32c/64t box (their headline is
+  10 G/s on the same class) — 1.29×, *without* AVX-512; 16.5 G/s on 64-core
+  Genoa with AVX-512.
+
+**Measured:**
+
+| machine | threads | AVX-512 | block | mean_curvature |
+|---|---|---|---|---|
+| paper (Threadripper) | 32c/64t | ? | 32 | 10.0 G unknowns/s |
+| m6a (Zen 3) | 32c/64t | no | 16 | 7.85 G/s |
+| m6a (Zen 3) | 32c/64t | no | 32 | **12.9 G/s** |
+| Genoa (Zen 4) | 64c | yes | 16 | 16.5 G/s |
+
+- **Bucket** (`m6a`, block-32): 375 s → 6.5 s (**58×**) after replacing the
+  scheduler-dependent histogram (rayon `fold` thief-splitting made 2,685
+  accumulators; see the post-mortem) with explicit one-map-per-thread + a
+  pre-sized merge. Dell small-scale: place+bucket 70.4 → 20.0 ms (**3.5×**,
+  also fixing the old counting sort's single-threaded scatter).
+- **alloc_fill** (block-32, ~215 GB): 110.7 s → 16.3 s (**6.8×**) by
+  parallelizing first-touch allocation + fill.
+- Full pipeline (m6a, block-32, 32,768³): place 35.6 s, bucket 3.3 s, alloc_fill
+  16.3 s, splat 22.6 s, finalize 3.7 s, mean_curvature 51.1 s, render 10.6 s.
+- Every optimization held the live `difftest_splat` (full field vs the real C++
+  binary) at ≤2 ulp / ≤0.1% — bit-equivalent throughout. Narrative in
+  `docs/step_12_story.md`.
 
 ---
 

@@ -29,6 +29,7 @@ enum Machine {
     Dell,
     Macbook,
     Windows,
+    Aws,
 }
 
 /// Parsed `--scale`/`--machine` flags plus the benchmark FILTER.
@@ -103,7 +104,8 @@ fn machine() -> Machine {
         Some("dell") => Machine::Dell,
         Some("macbook") => Machine::Macbook,
         Some("windows") => Machine::Windows,
-        Some(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows)"),
+        Some("aws") => Machine::Aws,
+        Some(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows|aws)"),
         None => {
             if cfg!(target_os = "macos") {
                 Machine::Macbook
@@ -140,8 +142,8 @@ fn size() -> Size {
 fn resolve() -> (Machine, Size) {
     let m = machine();
     let s = size();
-    if s == Size::XBig && m != Machine::Macbook {
-        panic!("MSBG_BENCH_SCALE=xbig needs >=32GB RAM (MacBook); use big on this machine");
+    if s == Size::XBig && m != Machine::Macbook && m != Machine::Aws {
+        panic!("MSBG_BENCH_SCALE=xbig needs >=32GB RAM (MacBook/AWS); use big on this machine");
     }
     (m, s)
 }
@@ -164,6 +166,8 @@ fn blockpool_hot_counts(m: Machine, s: Size) -> Vec<usize> {
         (Machine::Windows, Size::Big) => vec![10_000, 100_000, 250_000],
         (Machine::Macbook, Size::Big) => vec![100_000, 500_000, 1_000_000],
         (Machine::Macbook, Size::XBig) => vec![100_000, 1_000_000, 1_500_000],
+        (Machine::Aws, Size::Big) => vec![1_000_000, 4_000_000, 8_000_000],
+        (Machine::Aws, Size::XBig) => vec![1_000_000, 8_000_000, 16_000_000],
         (Machine::Dell | Machine::Windows, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
 }
@@ -175,6 +179,8 @@ fn compute_only_counts(m: Machine, s: Size) -> Vec<usize> {
         (Machine::Windows, Size::Big) => vec![1_000, 10_000, 50_000],
         (Machine::Macbook, Size::Big) => vec![1_000, 10_000, 50_000],
         (Machine::Macbook, Size::XBig) => vec![10_000, 50_000, 100_000],
+        (Machine::Aws, Size::Big) => vec![10_000, 50_000, 100_000],
+        (Machine::Aws, Size::XBig) => vec![50_000, 100_000, 250_000],
         (Machine::Dell | Machine::Windows, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
 }
@@ -187,6 +193,8 @@ fn active_targets(m: Machine, s: Size) -> Vec<usize> {
         (Machine::Windows, Size::Big) => vec![10_000, 50_000, 100_000],
         (Machine::Macbook, Size::Big) => vec![50_000, 250_000, 500_000],
         (Machine::Macbook, Size::XBig) => vec![50_000, 250_000, 750_000],
+        (Machine::Aws, Size::Big) => vec![500_000, 1_000_000, 2_000_000],
+        (Machine::Aws, Size::XBig) => vec![500_000, 2_000_000, 4_000_000],
         (Machine::Dell | Machine::Windows, Size::XBig) => unreachable!("xbig guarded in resolve()"),
     }
 }
