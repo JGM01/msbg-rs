@@ -7,6 +7,9 @@ use std::{
     },
 };
 
+/// 64-byte alignment: keeps every block on an x86 cache-line boundary, so a block
+/// never straddles two lines (no split-line loads at the block edge) and neighboring
+/// blocks can't falsely share a line under concurrent access.
 #[repr(align(64))]
 #[derive(Clone)]
 pub struct Block<D, const BSX: usize, const N: usize>
@@ -19,7 +22,11 @@ where
     /// Block status metadata.
     pub flags: u16,
 
-    /// Block has to be 64-bytes.
+    /// Block has to be 64-bytes. Also serves as the **tail padding** contract for
+    /// the SIMD gather (`Dequant::dequant_at`): `flags` + `_pad` are 64 bytes of
+    /// initialized, zeroed memory immediately after `data`, so a 16-byte unaligned
+    /// load of the last voxel reads 4 bytes into this tail instead of out of
+    /// bounds. Keep this field after `data` and ≥ 4 bytes total with `flags`.
     _pad: [u8; 62],
 }
 

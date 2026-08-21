@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "surface_bench"
 harness = false
+
+[[bench]]
+name = "velocity_bench"
+harness = false

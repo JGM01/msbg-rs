@@ -32,10 +32,12 @@
 
 #![feature(portable_simd)]
 #![feature(adt_const_params)]
+#![feature(core_intrinsics)]
 
 pub mod blockmap;
 pub mod blockpool;
 pub mod channel;
+pub mod fluid;
 pub mod io;
 pub mod math;
 pub mod multires;

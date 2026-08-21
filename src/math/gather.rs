@@ -10,6 +10,33 @@ const MAX_SLOTS: usize = 8;
 pub trait Dequant<O>: Copy + Default + Send + Sync {
     fn dequant(self) -> O;
 
+    /// Dequantize the element at `src + idx`, given the total element count
+    /// `len` of the contiguous run `src` points into. The default copies the
+    /// element and dequantizes it; vector types may override this to issue a
+    /// single wider load that reads `Self`'s trailing bytes / the successor
+    /// element, which is only in-bounds when a successor exists (`idx + 1 < len`).
+    ///
+    /// # Safety
+    ///
+    /// `src` must point at `len` valid `Self` elements and `idx < len`.
+    ///
+    /// **Contract for wide-load overrides.** An override that reads *past* the
+    /// element (`idx`'s) allocation — e.g. a 16-byte load of a 12-byte `Vec3` —
+    /// is only sound when `src` is the `data` field of a
+    /// [`crate::blockpool::Block`], whose `flags: u16` + `_pad: [u8; 62]` tail
+    /// is 64 bytes of initialized memory immediately after `data`. That
+    /// guarantee is *by construction of the caller*, not a runtime check:
+    /// [`gather_map`] is the sole caller of `dequant_at`, and it only ever
+    /// passes [`SparseGrid::block_data_ptr`], which resolves real, full, and
+    /// empty blocks alike to a `Block::data` pointer. The
+    /// `debug_assert!(idx < len)` bounds the *index*; it does **not** detect a
+    /// caller handing over an unpadded `[Self; N]` slice or stack array.
+    #[inline]
+    unsafe fn dequant_at(src: *const Self, idx: usize, len: usize) -> O {
+        debug_assert!(idx < len);
+        unsafe { (*src.add(idx)).dequant() }
+    }
+
     /// Dequantize `n` contiguous elements from `src` into `dst`. The default is
     /// a scalar loop; `f32` overrides it with a memcpy.
     #[inline]
@@ -65,7 +92,7 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
                         let vid = (vx0 + i as usize)
                             | ((vy0 + j as usize) << bsx_log2)
                             | ((vz0 + k as usize) << (2 * bsx_log2));
-                        out[s] = (unsafe { *ptr.add(vid) }).dequant();
+                        out[s] = unsafe { D::dequant_at(ptr, vid, N) };
                         s += 1;
                     }
                 }
@@ -74,9 +101,9 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
         }
     }
 
-    let bx0 = ((ix0 >> bsx_log2).max(0)) as usize;
-    let by0 = ((iy0 >> bsx_log2).max(0)) as usize;
-    let bz0 = ((iz0 >> bsx_log2).max(0)) as usize;
+    let bx0 = ((ix0 >> bsx_log2).max(0).min(grid.nx as i32 - 1)) as usize;
+    let by0 = ((iy0 >> bsx_log2).max(0).min(grid.ny as i32 - 1)) as usize;
+    let bz0 = ((iz0 >> bsx_log2).max(0).min(grid.nz as i32 - 1)) as usize;
 
     let empty_ptr = unsafe { (*grid.empty_block.as_ptr()).data.as_ptr() };
 
@@ -120,7 +147,7 @@ pub fn gather_map<D, O, const BSX: usize, const N: usize>(
                         let vid = (x & bsx_mask)
                             | ((y & bsx_mask) << bsx_log2)
                             | ((z & bsx_mask) << (2 * bsx_log2));
-                        (unsafe { *slots[slot].add(vid) }).dequant()
+                        unsafe { D::dequant_at(slots[slot], vid, N) }
                     }
                     _ => empty.dequant(),
                 };

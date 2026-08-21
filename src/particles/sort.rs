@@ -154,21 +154,30 @@ pub struct Bucketed {
     pub starts: Vec<usize>,
 }
 
-/// Sparse counting sort of `(positions, bids)` into block-major order.
+/// Bucket plan: `perm[i]` is the original index of the i-th particle in
+/// block-major order; `particle_blocks`/`starts` index into `perm`. The caller
+/// gathers its own per-particle payloads (position, velocity, mass, ...) through
+/// `perm`, so one sort serves any particle layout.
+pub struct BucketPlan {
+    pub particle_blocks: Vec<usize>,
+    pub starts: Vec<usize>,
+    pub perm: Vec<usize>,
+}
+
+/// Sparse counting sort of block ids into a block-major permutation.
 ///
 /// Unlike the dense C++/first-cut approach (a `counts`/`block_start` array of
 /// size `n_blocks` — 68.7 GB each at 32,768³/block-16), the histogram is keyed
 /// by block id in an open-addressed `BlockMap`, so cost scales with *occupied*
 /// blocks (~25M at paper scale, not 8.59B). The parallel scatter uses a
 /// dense-by-rank `AtomicU32` cursor — rank ≤ occupied blocks, ~100 MB.
-pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>) -> Bucketed {
-    let n = positions.len();
-    debug_assert_eq!(n, bids.len());
+pub fn bucket_indices(bids: &[usize]) -> BucketPlan {
+    let n = bids.len();
     if n == 0 {
-        return Bucketed {
-            positions,
+        return BucketPlan {
             particle_blocks: Vec::new(),
             starts: vec![0],
+            perm: Vec::new(),
         };
     }
 
@@ -222,28 +231,25 @@ pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>) -> Bucketed {
     debug_assert_eq!(acc, n);
     let t3 = std::time::Instant::now();
 
-    // Parallel scatter into block-major order. Ranks own disjoint output
-    // ranges (`starts[rank] + [0, count)`), so the atomic cursor is race-free
-    // by construction; intra-block order is unspecified (the splat's `min`
-    // reduction is order-independent).
-    let mut ordered = vec![[0.0f32; 3]; n];
+    // Parallel scatter of *indices* into block-major order. Ranks own disjoint
+    // output ranges (`starts[rank] + [0, count)`), so the atomic cursor is
+    // race-free by construction; intra-block order is unspecified (reductions
+    // are order-independent).
+    let mut perm = vec![0usize; n];
     let cursors: Vec<AtomicU32> = (0..nblk).map(|_| AtomicU32::new(0)).collect();
-    let out_ptr = ordered.as_mut_ptr() as usize;
-    positions
-        .par_iter()
-        .zip(bids.par_iter())
-        .for_each(|(&pos, &bid)| {
-            let rank = block_rank
-                .get(bid)
-                .unwrap_or_else(|| panic!("block {bid} missing from the histogram")) as usize;
-            let off = cursors[rank].fetch_add(1, Ordering::Relaxed) as usize;
-            // SAFETY: `starts[rank] + off` is a unique index per (rank, off);
-            // ranges across ranks are disjoint, so no two writes alias.
-            let out_ptr = out_ptr as *mut [f32; 3];
-            unsafe {
-                *out_ptr.add(starts[rank] + off) = pos;
-            }
-        });
+    let perm_ptr = perm.as_mut_ptr() as usize;
+    bids.par_iter().enumerate().for_each(|(i, &bid)| {
+        let rank = block_rank
+            .get(bid)
+            .unwrap_or_else(|| panic!("block {bid} missing from the histogram")) as usize;
+        let off = cursors[rank].fetch_add(1, Ordering::Relaxed) as usize;
+        // SAFETY: `starts[rank] + off` is a unique index per (rank, off);
+        // ranges across ranks are disjoint, so no two writes alias.
+        let perm_ptr = perm_ptr as *mut usize;
+        unsafe {
+            *perm_ptr.add(starts[rank] + off) = i;
+        }
+    });
     if profile {
         let t4 = std::time::Instant::now();
         eprintln!(
@@ -255,10 +261,26 @@ pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>) -> Bucketed {
         );
     }
 
-    Bucketed {
-        positions: ordered,
+    BucketPlan {
         particle_blocks,
         starts,
+        perm,
+    }
+}
+
+/// Sparse counting sort of `(positions, bids)` into block-major order (the
+/// step-9 surface-reconstruction path). Gathers positions through the
+/// [`bucket_indices`] permutation.
+pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>) -> Bucketed {
+    let n = positions.len();
+    debug_assert_eq!(n, bids.len());
+    let plan = bucket_indices(&bids);
+    let ordered: Vec<[f32; 3]> = plan.perm.par_iter().map(|&i| positions[i]).collect();
+    debug_assert_eq!(ordered.len(), n);
+    Bucketed {
+        positions: ordered,
+        particle_blocks: plan.particle_blocks,
+        starts: plan.starts,
     }
 }
 

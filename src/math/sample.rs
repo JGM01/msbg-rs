@@ -29,6 +29,7 @@
 
 use std::simd::f32x4;
 use std::simd::num::SimdFloat;
+use std::simd::StdFloat;
 
 use crate::channel::{Density, Density8, FaceDensity, Vec3, Velocity};
 use crate::math::boundary::{BoundaryCondition, GridAlignment, Interpolation};
@@ -88,6 +89,64 @@ impl Dequant<Vec3> for FaceDensity {
     }
 }
 
+// SIMD gather targets: `dequant` packs the (x, y, z) triplet into an `f32x4`
+// (4th lane zero) so `gather_map` fills a `[f32x4; N]` directly — no
+// intermediate `[Vec3; N]` AoS array and no per-corner `pack3` step.
+
+impl Dequant<f32x4> for Velocity {
+    #[inline(always)]
+    fn dequant(self) -> f32x4 {
+        pack3(self.0)
+    }
+
+    /// `Velocity` is `#[repr(transparent)]` over `[f32; 3]` (12 bytes); issue a
+    /// single 16-byte load whose 4th lane reads the *next* 4 bytes — for every
+    /// element except the last that's the successor element's first float, and
+    /// for the last it's the block's zeroed `flags`/`_pad` tail. Either way the
+    /// 4th lane is discarded by the trilinear, so the value is irrelevant. This
+    /// matches C++ `Vec4f::load` on the 12-byte `Vec3Float` and removes the
+    /// 3× `movss`+insert of `pack3`.
+    ///
+    /// # Safety
+    ///
+    /// Unconditional: every `src` passed here is the `data` field of a
+    /// `Block<Velocity, BSX, N>`, which is *immediately followed* by `flags:
+    /// u16` + `_pad: [u8; 62]` — 64 bytes of initialized tail. A 16-byte load at
+    /// `3*idx` reads bytes `[12*idx, 12*idx+16)`; for the last element
+    /// (`idx = len-1`) the upper bound is `12*(len-1)+16 = 12*len + 4`, which is
+    /// ≤ `12*len + 64` — in-bounds for every `idx < len`. No branch needed.
+    ///
+    /// The `debug_assert!(idx < len)` bounds the *index*; it does **not** verify
+    /// the tail exists. The tail is guaranteed by construction of the sole
+    /// caller, `gather_map`, which only receives `SparseGrid::block_data_ptr`
+    /// output (a `Block::data` pointer for real, full, and empty blocks alike).
+    /// A caller handing this an unpadded `[Velocity; N]` slice would be unsound
+    /// here — see `Dequant::dequant_at`'s contract.
+    #[inline(always)]
+    unsafe fn dequant_at(src: *const Velocity, idx: usize, len: usize) -> f32x4 {
+        debug_assert!(idx < len);
+        // SAFETY: see above — `Velocity` is transparent over `[f32; 3]`, so
+        // `data` is a contiguous `[f32; 3*len]` followed by 64 bytes of
+        // initialized `flags`/`_pad`; the 4-float read `[3*idx, 3*idx+4)` stays
+        // within the block allocation (and `f32` accepts any bit pattern).
+        let p = unsafe { (src as *const f32).add(3 * idx) };
+        unsafe { f32x4::from_slice(std::slice::from_raw_parts(p, 4)) }
+    }
+}
+
+impl Dequant<f32x4> for FaceDensity {
+    #[inline(always)]
+    fn dequant(self) -> f32x4 {
+        let inv = 1.0 / u16::MAX as f32;
+        f32x4::from_array([
+            self.0[0] as f32 * inv,
+            self.0[1] as f32 * inv,
+            self.0[2] as f32 * inv,
+            0.0,
+        ])
+    }
+}
+
 /// Second-order derivatives of a scalar field, ordered `[fxx, fyy, fzz, fxy,
 /// fxz, fyz]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -137,8 +196,8 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 #[inline(always)]
-fn lerp_v(a: Vec3, b: Vec3, t: f32) -> Vec3 {
-    a + (b - a) * t
+fn pack3(v: Vec3) -> f32x4 {
+    f32x4::from_array([v.0[0], v.0[1], v.0[2], 0.0])
 }
 
 fn trilinear_value(c: &[f32; 8], u: f32, v: f32, w: f32) -> f32 {
@@ -292,30 +351,50 @@ fn cubic_value_grad_hess(
     )
 }
 
-fn trilinear_value_vec3(c: &[Vec3; 8], u: f32, v: f32, w: f32) -> Vec3 {
-    let c00 = lerp_v(c[0], c[1], u);
-    let c10 = lerp_v(c[2], c[3], u);
-    let c01 = lerp_v(c[4], c[5], u);
-    let c11 = lerp_v(c[6], c[7], u);
-    let c0 = lerp_v(c00, c10, v);
-    let c1 = lerp_v(c01, c11, v);
-    lerp_v(c0, c1, w)
+fn trilinear_value_vec3(c: &[f32x4; 8], u: f32, v: f32, w: f32) -> Vec3 {
+    // The corners arrive already packed (x, y, z, 0) in f32x4; run the
+    // trilinear as a 4-lane SIMD tree. Written as seven `mul_add` lerps
+    // (`(b − a)·t + a`) rather than the `(1−u)`-factored form: fewer
+    // instructions (7 FMA + 7 sub vs ~24 mul/add) and it emits hardware FMA
+    // (`vfmadd`), matching the C++ `interpolateVec3Float` tree (which g++ fuses)
+    // and the scalar `lerp` helper below.
+    let c0 = c[0];
+    let c1 = c[1];
+    let c2 = c[2];
+    let c3 = c[3];
+    let c4 = c[4];
+    let c5 = c[5];
+    let c6 = c[6];
+    let c7 = c[7];
+    let u = f32x4::splat(u);
+    let v = f32x4::splat(v);
+    let w = f32x4::splat(w);
+    let c00 = (c1 - c0).mul_add(u, c0);
+    let c10 = (c3 - c2).mul_add(u, c2);
+    let c01 = (c5 - c4).mul_add(u, c4);
+    let c11 = (c7 - c6).mul_add(u, c6);
+    let c0 = (c10 - c00).mul_add(v, c00);
+    let c1 = (c11 - c01).mul_add(v, c01);
+    let out = (c1 - c0).mul_add(w, c0);
+    let [x, y, z, _] = out.to_array();
+    Vec3([x, y, z])
 }
 
-fn cubic_value_vec3(win: &[Vec3; 64], tx: f32, ty: f32, tz: f32) -> Vec3 {
+fn cubic_value_vec3(win: &[f32x4; 64], tx: f32, ty: f32, tz: f32) -> Vec3 {
     let wx = cubic_weights(tx);
     let wy = cubic_weights(ty);
     let wz = cubic_weights(tz);
 
-    let mut acc = Vec3::default();
+    let mut acc = f32x4::splat(0.0);
     for k in 0..4 {
         for j in 0..4 {
             for i in 0..4 {
-                acc = acc + win[16 * k + 4 * j + i] * (wx[i] * wy[j] * wz[k]);
+                acc = win[16 * k + 4 * j + i].mul_add(f32x4::splat(wx[i] * wy[j] * wz[k]), acc);
             }
         }
     }
-    acc
+    let [x, y, z, _] = acc.to_array();
+    Vec3([x, y, z])
 }
 
 // Gather + dispatch helpers
@@ -346,28 +425,28 @@ fn gather_cubic_f32<T: InterpElem, const BSX: usize, const N: usize>(
 }
 
 #[inline(always)]
-fn gather_linear_vec3<T: InterpVec3Elem, const BSX: usize, const N: usize>(
+fn gather_linear_vec3<T: InterpVec3Elem + Dequant<f32x4>, const BSX: usize, const N: usize>(
     grid: &SparseGrid<T, BSX, N>,
     ix: i32,
     iy: i32,
     iz: i32,
     bc: BoundaryCondition,
-) -> [Vec3; 8] {
-    let mut c = [Vec3::default(); 8];
-    gather_map::<T, Vec3, BSX, N>(grid, ix, iy, iz, bc, 1, &mut c);
+) -> [f32x4; 8] {
+    let mut c = [f32x4::splat(0.0); 8];
+    gather_map::<T, f32x4, BSX, N>(grid, ix, iy, iz, bc, 1, &mut c);
     c
 }
 
 #[inline(always)]
-fn gather_cubic_vec3<T: InterpVec3Elem, const BSX: usize, const N: usize>(
+fn gather_cubic_vec3<T: InterpVec3Elem + Dequant<f32x4>, const BSX: usize, const N: usize>(
     grid: &SparseGrid<T, BSX, N>,
     ix: i32,
     iy: i32,
     iz: i32,
     bc: BoundaryCondition,
-) -> [Vec3; 64] {
-    let mut c = [Vec3::default(); 64];
-    gather_map::<T, Vec3, BSX, N>(grid, ix, iy, iz, bc, 3, &mut c);
+) -> [f32x4; 64] {
+    let mut c = [f32x4::splat(0.0); 64];
+    gather_map::<T, f32x4, BSX, N>(grid, ix, iy, iz, bc, 3, &mut c);
     c
 }
 
@@ -391,7 +470,19 @@ fn cell_centered(pos: Vec3) -> (f32, f32, f32) {
 #[inline(always)]
 fn cubic_base(x: f32) -> (f32, i32) {
     let xf = x.floor();
-    (x - xf, xf as i32 - 1)
+    (x - xf, floor_to_i32(xf) - 1)
+}
+
+/// Floored grid coordinate to `i32`, unchecked. The saturating `as i32` cast
+/// adds a NaN/overflow branch per axis (visible as `vucomiss`/`cmov` chains in
+/// the hot loop); grid coordinates are finite and far below `i32` range, so the
+/// unchecked conversion matches C++ `(int)floorf(x)`.
+#[inline(always)]
+fn floor_to_i32(f: f32) -> i32 {
+    // SAFETY: `f` is a floored, finite grid coordinate (bounded by the grid
+    // extent, ~2^21 per axis at paper scale); `float_to_int_unchecked` is UB
+    // only for NaN or out-of-range values, neither of which occurs here.
+    unsafe { std::intrinsics::float_to_int_unchecked(f) }
 }
 
 // Trait impls
@@ -413,7 +504,7 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 trilinear_value(
-                    &gather_linear_f32::<T, BSX, N>(self, ix as i32, iy as i32, iz as i32, bc),
+                    &gather_linear_f32::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -448,7 +539,7 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 let (_, g) = trilinear_value_grad(
-                    &gather_linear_f32::<T, BSX, N>(self, ix as i32, iy as i32, iz as i32, bc),
+                    &gather_linear_f32::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -490,7 +581,7 @@ where
 
 impl<T, const BSX: usize, const N: usize> SampleVec3<BSX, N> for SparseGrid<T, BSX, N>
 where
-    T: InterpVec3Elem,
+    T: InterpVec3Elem + Dequant<f32x4>,
 {
     #[inline]
     fn sample_vec3<const IP: Interpolation>(
@@ -506,7 +597,7 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 trilinear_value_vec3(
-                    &gather_linear_vec3::<T, BSX, N>(self, ix as i32, iy as i32, iz as i32, bc),
+                    &gather_linear_vec3::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -567,13 +658,15 @@ impl<'a, T: InterpElem, const BSX: usize, const N: usize> Sampler<'a, T, BSX, N>
 }
 
 /// A stateful vector-field sampler.
-pub struct SamplerVec3<'a, T: InterpVec3Elem, const BSX: usize, const N: usize> {
+pub struct SamplerVec3<'a, T: InterpVec3Elem + Dequant<f32x4>, const BSX: usize, const N: usize> {
     grid: &'a SparseGrid<T, BSX, N>,
     align: GridAlignment,
     bc: BoundaryCondition,
 }
 
-impl<'a, T: InterpVec3Elem, const BSX: usize, const N: usize> SamplerVec3<'a, T, BSX, N> {
+impl<'a, T: InterpVec3Elem + Dequant<f32x4>, const BSX: usize, const N: usize>
+    SamplerVec3<'a, T, BSX, N>
+{
     pub fn new(
         grid: &'a SparseGrid<T, BSX, N>,
         align: GridAlignment,

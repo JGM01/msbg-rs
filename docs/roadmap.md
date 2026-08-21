@@ -406,11 +406,37 @@ droplet-crown then a dam-break animation at paper scale.
 
 Decisions locked: **sparse blockmap + block 16** (not the paper's block-32 dense
 map); single-level FLIP first, then adaptive; single-phase first, then 2-phase;
-geometric multigrid pressure solver (their relaxed-Jacobi scheme); difftest each
-operator vs C++. The FLIP driver loop and the scenarios have no C++ counterpart
-in the repo (their sim driver is closed-source), so those steps verify against
-the paper's *published* throughput (~10B unknowns/s) + physical laws, while every
-operator beneath them is difftested against the real library.
+**MAC staggered face-velocity** (the paper's representation — splat to faces, not
+cell centers); **adaptive algebraic-aggregation multigrid + flexible PCG** (the
+paper's *actual* pressure solver — NOT the geometric multigrid in the C++
+library). Two facts re-orient steps 13–15 vs. the original draft:
+
+- The C++ *pressure* machinery (`multiplyLaplacianMatrixOpt`, `relax`,
+  `relaxBlockList`, `downsampleChannel`, `downsampleVelocity`,
+  `downsampleFaceDensity`, `dotProdChannel`, `AXPBY*`, dense coarse MG levels)
+  is **complete but dead** — zero call sites in `../MSBG` (see refactor.md §8).
+  Its `_blocksRelax` list is never populated, `_mgSmType` is written but never
+  read, and `_mgSmOmegaSched1 = 1.7319` is gated behind an undefined macro.
+- The paper's real solver (its "3× fewer CG iterations" headline) is the
+  adaptive scheme in §6, which shares only the *operators* (7-pt matvec/relax)
+  with that dead code — the coarsening, smoothing, and outer loop are different.
+
+So steps 13–15 verify their *operators* against the real-but-dead C++ library
+(operator-level difftests), while the driver (step 18+) verifies against the
+paper's *published* throughput (~10B unknowns/s) + physical laws, since the FLIP
+driver loop and the scenarios have no C++ counterpart in the repo (their sim
+driver is closed-source).
+
+Paper source: PDF at `../MSBG/Adaptive Phase-Field-FLIP for Very Large Scale
+Two-Phase Fluid Simulation - Adaptive_Phase_Field_FLIP_preprint.pdf`; its
+extracted text (with the line numbers cited below) is at `/tmp/msbg_paper.txt`.
+If that file is gone (it lives in `/tmp`), regenerate it with:
+
+```bash
+nix shell nixpkgs#poppler-utils --command pdftotext -layout \
+  "../MSBG/Adaptive Phase-Field-FLIP for Very Large Scale Two-Phase Fluid Simulation - Adaptive_Phase_Field_FLIP_preprint.pdf" \
+  /tmp/msbg_paper.txt
+```
 
 ---
 
@@ -523,80 +549,155 @@ emitted `zmm` code → SIGILL).
 
 ---
 
-## Step 13 — Implicit Laplacian operator (matvec + relaxation)
+## Step 13 — MAC face-velocity transfer (P2G splat + G2P gather)
+
+**Status:** DONE — `src/fluid/` (MacGrid, P2G splat, G2P sampler, divergence),
+12 boundary/awkward tests, `benches/velocity_bench.rs` + `../MSBG/velocitytest.cpp`.
+Benchmarks (5500U, res=128): P2G splat ~5.8 Mparts/s, staggered G2P ~3.6
+Msamples/s, cell-centered Vec3 gather **10.2 Msamples/s vs C++
+`interpolateVec3Float` 14.3** (1.4×, same result to FMA). The cell-centered
+gather started 2.7× behind and was closed via SIMD trilinear + an unsafe
+16-byte slop load (matching C++ `Vec4f::load`) + an unchecked `floor→i32`; the
+remaining 1.4× is the generic gather's structure vs C++'s hand-specialized
+interior-only path. Full narrative in `../stories/step_13_story.md`.
+
+**Build order:** FIRST of the three pressure steps. The face mass accumulators
+this step produces *are* the phase-field raw density (Eq. 7) *and* the Poisson
+coefficient `β = 1/ρ` (Eq. 9) that steps 14/15 consume — so this step precedes
+them.
+
+**Paper:** §3.2–3.6 (`/tmp/msbg_paper.txt:373–526`). P2G splats mass `M_a` and
+momentum `P_a` to **cell faces** (staggered MAC), not cell centers, with a
+cubic-falloff kernel `w = max(1 − (‖x_c + e_a/2 − x_p‖/r_p)², 0)³` (Eq. 6,
+line 414 — no sqrt, spherical support). Face velocity is `ũ* = P/M`. The face
+mass *is* the raw phase-field density (Eq. 7, line 437) *and* the variable
+coefficient `β = 1/ρ` (Eq. 9, line 472). G2P is `u_new = α_FLIP·u_old + I(Δu) +
+(1−α_FLIP)·I(u)` (Eq. 12, line 524), `Δu = u − ũ*` (Eq. 11).
+
+**Parity target:** none in the demo (it splats *density* only, as a min-SDF to
+cell centers). This is a **new** primitive — a *sum*-reduction `Vec3` splat to
+faces — so there is no C++ velocity-splat counterpart to diff against; verify by
+physics + the density-component difftest.
+
+**Scope:**
+- An `Accum` trait (sum-reduction, `Vec3` payload) generalizing the step-9
+  `Quant`-min pattern, plus a 3-component staged splat reusing the 8-color +
+  thread-local staging + 3×3×3 commit decomposition from `particles/splat.rs`.
+- The cubic-falloff kernel (Eq. 6) — replaces the step-9 min-SDF weight.
+- Three staggered face-velocity channels + face-mass/face-density channels.
+- A **staggered G2P sampler** (trilinear per face component at the `+e_a/2`
+  offset, reusing the step-4 trilinear kernel) + the FLIP/PIC blend (Eq. 12).
+- Divergence `∇·u*` (the RHS for steps 14/15).
+
+**Decisions (owned):** MAC face-velocity now (matches the paper end-to-end; the
+face mass feeds both the phase field and `β = 1/ρ`; `SampleVec3` is reused
+per-face with a half-cell offset); velocity splat reuses the density staging
+(3× bandwidth, still L1-resident); `α_FLIP` per particle type (liquid/air) per
+§3.7 (Eq. 13, line 534).
+
+**Acceptance:**
+- `velocity_splat` bench: GB/s at 3 channels vs the density splat — bandwidth
+  scaling is the regression check.
+- Physical: rigid translation splats/gathers back exactly; momentum
+  conservation; face vs cell consistency.
+- Unit tests: 8-color race-freedom, cross-block splats, kernel `d > r` cull,
+  FLIP/PIC `α ∈ {0,1}` endpoints.
+
+---
+
+## Step 14 — Matrix-free variable-coefficient Poisson operator (matvec + relaxation)
 
 **Status:** HAVEN'T STARTED
 
-**Parity target:** `multiplyLaplacianMatrixOpt` / `processBlockLaplacian`
-(7-pt Poisson matvec) + `relax` / `relaxBlockList` (Jacobi/relaxed-Jacobi),
-`msbg3.cpp`.
+**Build order:** SECOND. Consumes the step-13 face coefficients (`β = 1/ρ`) and
+divergence; produces the operator that step 15's multigrid smooths.
 
-**Scope:** the *implicit* operator — `A·x` and Jacobi/Gauss-Seidel updates — on
-the sparse grid, distinct from the step-6/8 *explicit* smoother. Reuses the
-step-5 halo + step-6 stencil plumbing. The pressure solver's building block.
+**Paper:** §3.5 (`/tmp/msbg_paper.txt:534–556`), Eq. 8–10 (lines 469–481): the
+variable-coefficient Poisson `Δt·∇·(β∇p) = ∇·u* + DIVCORR`, discretized on the
+MAC grid as a symmetric 7-point stencil with coefficients sampled at faces (Eq.
+10). §6.3 (`:847–875`): the smoother is a **two-stage red-black hybrid
+GS-Jacobi** — block-outer red-black + in-block GS on whole SIMD words, `ω = 6/7`,
+in-place (no destination buffer).
 
-**Decisions (owned):** 8-color in-place Gauss-Seidel (matches our sweeper infra)
-+ relaxed-Jacobi `ω` (their `_mgSmOmegaSched1 = 1.7319f`, Yang et al. 2017); no
-scratch channels (in-place, per step 8); operator-level difftest because the
-full multigrid setup is hard to isolate in a C++ harness.
+**Parity target:** C++ `IprocessBlockLaplacian`/`processBlockLaplacian` +
+`multiplyLaplacianMatrixOpt`/`relaxBlockList` (`msbg3.cpp`) — **operator level
+only**; these are dead in the repo (refactor.md §8) and the driver is
+closed-source. The matvec/relax updates are identical to C++'s:
+matvec `y = D·x − Σ_nb`, relax `y = ω(b + Σ_nb)·D + (1−ω)x`, with `D = 1/diag`.
+
+**Scope:** the *implicit* operator over the step-5 halo + step-6 kernel infra:
+- 7-point matvec + relaxed-GS update, with the **face-coefficient weighting**
+  (the C++ `blockHasFaceCoeffs` branch, `S = Σ w_i·F_i`) from day one — `β = 1/ρ`
+  from step 13.
+- Inverse-diagonal precompute (`D = 1/Σ face_coeff`; the `Diagonal` channel type
+  already exists).
+- Mixed-resolution neighbors via the existing `fill_multires` coarse-ghost path
+  + the paper's `k_CF = 1/(4Δx)`, `k_FC = 2·k_CF` resolution-transition scalars
+  (§6.1 / Algorithm 1, lines 763–796).
+
+**Decisions (owned):** 8-color in-place GS (convergence == GS, no scratch —
+matches the paper's "halve the memory" claim, §6.3); `ω = 6/7` default, exposed
+(skip `_mgSmOmegaSched1 = 1.7319` — dead even in C++, gated behind an undefined
+macro); matrix-free (no assembled `L`).
 
 **Acceptance:**
-- `difftest_pressure.rs` + `../MSBG/pressuretest.cpp`: matvec and one Jacobi
-  sweep match C++ `multiplyLaplacianMatrixOpt`/`relax` (golden + live).
+- `difftest_pressure.rs` + `../MSBG/pressuretest.cpp`: matvec + one relax sweep
+  match C++ on the **constant-coefficient** branch (golden + live). The C++
+  harness must call `relaxBlockList` directly — `relax()`'s `_blocksRelax` list
+  is never populated. (The weighted branch is verified by the step-18/19
+  physical tests + a scalar-reference oracle; wiring C++'s face-area channels
+  for a live weighted diff is heavy and low-value.)
 - `pressure_matvec` / `pressure_relax` benches vs the C++ harness.
 - Unit tests: matvec on affine fields (Laplacian = 0), BC handling, GS vs
-  Jacobi convergence rate.
+  Jacobi convergence rate, `ω` clamp endpoints, empty/full dummy neighbors.
 
 ---
 
-## Step 14 — Geometric multigrid V-cycle (pressure solve)
+## Step 15 — Adaptive algebraic-aggregation multigrid + flexible PCG (pressure solve)
 
 **Status:** HAVEN'T STARTED
 
-**Parity target:** the C++ multigrid (`relax` over `_mgLevels`,
-`downsampleChannel` restriction, coarse solves), `msbg3.cpp`.
+**Build order:** THIRD. Builds the paper's actual pressure solver on the step-14
+operator + the step-11 `BlockMap` (for the lock-free active FIFO).
 
-**Scope:** V-cycle over the step-7 levels: smooth (step 13) → restrict
-(step-7 downsample) → coarse solve → prolongate (`sample_coarse`) → smooth.
-Converges the Poisson in O(n) vs O(n²) for plain relaxation.
+**Paper:** §6 (`/tmp/msbg_paper.txt:748–950`). This is **not** the geometric
+multigrid in the C++ library. Three pieces:
+1. **Galerkin (algebraic-aggregation) coarsening** of the *face coefficients* —
+   Algorithm 1 (`:763–796`): per MG level / block / face-direction, coarsen the
+   3 face coefficients from the fine level; copy-by-reference when no finer child
+   exists; `k_CF`/`k_FC` resolution-transition scalars.
+2. **Two-stage-red-black adaptive relaxation** — Algorithm 2 (`:885–936`):
+   block-outer red-black (Jacobi half-passes) + in-block 8-color GS (our step-8
+   sweeper), `ω = 6/7`; adaptive active-block FIFO reinserting blocks whose
+   **contrast-equalizing** residual (`max Δ·diag`, §6.4 `:819–846`) exceeds `τ`;
+   terminate after 10–20 steps; `τ` from a log-histogram (mean + 2σ).
+3. **Flexible PCG** (Polak–Ribière) as the outer loop — adaptive relaxation makes
+   the preconditioner asymmetric, so standard CG is invalid (`:922–950`). Reuses
+   the existing `CgP`/`CgQ`/`Divergence` channel types.
 
-**Decisions (owned):** their relaxed-Jacobi smoother; reuse our already-faster
-downsample for restriction; target their convergence rate and beat it on
-throughput via our restriction + 8-color.
+**Parity target:** none in the C++ repo (its `_mgLevels`/`relax`/
+`downsampleChannel` geometric-MG machinery is dead; the adaptive/FCG driver is
+closed-source). The benchmark is the paper's *published* result: ~30 CG
+iterations/step and pressure ≤ ~30% of sim time (Table 6, `:1156–1168`), 3×
+fewer iterations than Galerkin MG + boundary relax (`:1091–1105`), and 4-point
+stencil vs BoxMG's 14-point (Table 5, `:1136–1153`).
 
-**Acceptance:**
-- `multigrid_vcycle` bench vs C++: iterations-to-convergence (parity) +
-  unknowns/s per V-cycle (expect > C++ — our downsample is ~1.8× their
-  `downsampleChannel`).
-- Unit tests: constant-field solve, a known analytical Poisson (sphere),
-  multigrid == direct solve to tolerance.
-- Difftest one V-cycle vs the C++ harness where isolatable.
+**Scope:** the three pieces above over the step-7 levels; `D = 1/diag` from step
+14; the step-13 divergence as RHS.
 
----
-
-## Step 15 — Velocity transfer (P2G splat + G2P gather)
-
-**Status:** HAVEN'T STARTED
-
-**Parity target:** none in the demo (it splats only density) — generalizes step
-9 to `Vec3` velocity (P2G) and pairs it with step-4 `SampleVec3` (G2P FLIP/PIC
-blend, C++ `G2P_FLIP_ALPHA_USE_GRID_LEVEL`).
-
-**Scope:** staged velocity splat (3 channels, same 8-color + L1 staging,
-race-free), the velocity gather with FLIP/PIC blending, and the particle→face
-velocity projection the step-20 MAC grid builds on.
-
-**Decisions (owned):** velocity splat reuses the density staging (3× buffer,
-3× bandwidth, still L1-resident); FLIP/PIC alpha per the C++ scheme; verify via
-the density-component difftest + physical round-trip (no C++ velocity-splat
-counterpart).
+**Decisions (owned):** go straight to the adaptive scheme (skipping a geometric
+V-cycle deliverable); the verification anchor is operator-level difftests (step
+14) + convergence/physical tests, not a C++ driver diff; measure
+iterations-to-convergence against the paper's numbers rather than a live C++
+side-by-side.
 
 **Acceptance:**
-- `velocity_splat` bench: GB/s at 3 channels vs our (and C++'s) density splat —
-  the bandwidth scaling is the regression check.
-- Physical: a rigidly-translating field splats/gathers back exactly; momentum
-  conservation; face vs cell velocity consistency.
-- Unit tests: 8-color race-freedom, cross-block splats.
+- `multigrid_vcycle` bench: iterations-to-1e-6-residual + unknowns/s per cycle,
+  compared against the paper's ~30 iters/step and ~10B-unknown-class throughput.
+- Unit tests: constant-field solve, analytic sphere Poisson, MG == direct solve,
+  the rising-bubble "difficult scenario" (§8.3) ~30-CG-iter target.
+- Difftest the *operators* (matvec/relax, step 14) — the V-cycle itself has no
+  C++ counterpart.
 
 ---
 
@@ -671,20 +772,26 @@ stays flat alpha (the deferred step-10 volumetric mode stays deferred).
 **Parity target:** none in the repo (their FLIP loop is closed-source) — steps
 13/14/15 compose into the driver.
 
-**Scope:** the timestep loop: P2G (density + velocity) → phase-field
-mean-curvature smoothing (step 8) → pressure projection (step 14) → G2P (step
-15) → particle + velocity advection. Single-level, single-phase (water in a box).
+**Paper:** §3 (`/tmp/msbg_paper.txt:351–557`) + §5.4 dual particle-grid
+adaptivity algorithm (`:710–749`). The per-step breakdown target is Table 6
+(`:1156–1168`): P2G 27% / pressure 30% / advect 13% / other 30%.
+
+**Scope:** the timestep loop: P2G (step 13) → phase-field mean-curvature
+smoothing (step 8) + phase-field compression Eq. 7 (`:422–495`) → pressure
+projection (step 15) → G2P (step 13) → RK3 advection with CFL-limited adaptive
+timestep (§3.7, `:526–557`). Single-level, single-phase (water in a box),
+constant density — `β` collapses to a constant but the MAC grid +
+variable-coefficient machinery still runs.
 
 **Decisions (owned):** phase-field (no level-set reinit — `solveEikonalFIM`
-skipped); explicit mean-curvature keeps the interface narrow; CFL-limited
-explicit advection.
+skipped); explicit mean-curvature keeps the interface narrow.
 
 **Acceptance:**
 - Physical: a translating droplet doesn't deform; divergence-free to tolerance;
   volume/energy conservation over N steps.
 - `flip_timestep` bench: full-timestep throughput (particles/s, voxels/s) with
-  the operator breakdown — internal (no C++ driver), but each operator already
-  parity-benchmarked in 13–15.
+  the operator breakdown vs Table 6 — internal (no C++ driver), but each
+  operator already parity-benchmarked in 13–15.
 - A dam-break preview frame via the step-16 flat renderer (visual sanity).
 
 ---
@@ -693,20 +800,26 @@ explicit advection.
 
 **Status:** HAVEN'T STARTED
 
-**Parity target:** `downsampleVelocity` / `downsampleFaceDensity` (multires
-velocity restriction), the multires pressure solve.
+**Parity target:** C++ `downsampleVelocity` / `downsampleFaceDensity` (multires
+velocity/face restriction, `msbg4.cpp`); the multires pressure solve (our step
+15 over step-7 levels).
 
-**Scope:** refine from the phase-field (interface = fine, bulk = coarse),
-velocity/density restriction to coarse levels, multires pressure V-cycle (step
-14 over step-7 levels), and the fine-coarse transfer each timestep.
+**Paper:** §5 adaptivity (`/tmp/msbg_paper.txt:559–749`), §6.2 leveraging MSBG
+(`:799–815`). Refinement driven by the phase-field (interface = fine, bulk =
+coarse).
+
+**Scope:** refine from the phase-field (step-7 `RefinementMap`),
+velocity/face-density restriction to coarse levels, multires pressure V-cycle
+(step 15 over step-7 levels), and the fine-coarse transfer each timestep.
 
 **Decisions (owned):** adaptivity driven by the phase-field (the "adaptive"
-claim); reuse step-7 refinement + step-14 V-cycle; *measure* whether adaptive
+claim); reuse step-7 refinement + step-15 V-cycle; *measure* whether adaptive
 beats single-level for the target scenario before committing to it (don't pay
 transfer cost for a marginal win).
 
 **Acceptance:**
-- `downsample_velocity` difftest + bench vs C++ `downsampleVelocity`.
+- `downsample_velocity` / `downsample_face_density` difftest + bench vs C++
+  `downsampleVelocity` / `downsampleFaceDensity`.
 - Adaptive vs single-level timestep throughput on the same scenario (the "is
   adaptivity worth it" evidence).
 - Unit tests: restriction/prolongation round-trip, refinement consistency
@@ -721,6 +834,23 @@ transfer cost for a marginal win).
 **Parity target:** `computeCellFaceAreaFractionsGhost` / `getFaceAreaGen` /
 `getFaceCoeffRightDomBorder` / `getGhostPressure_` — the sub-voxel air/water
 face-area machinery, `msbg.cpp`.
+
+**Note — two distinct face-coefficient concepts, don't conflate them:**
+- The **fluid density coefficient** `β = 1/ρ` (paper Eq. 9, `/tmp/msbg_paper.txt:472`)
+  lives in step 14's matvec; it comes from the step-13 face mass. That is the
+  two-fluid density contrast.
+- This step's `face_area`/`face_coeff` are the **solid cut-cell** fractions
+  (sub-voxel obstacle geometry) — a *different* quantity, already scaffolded as
+  `FaceBlock { face_area, face_coeff }` + `LevelData::ensure_faces` (step 7).
+  Both multiply into the same 7-point stencil (the C++ `blockHasFaceCoeffs`
+  branch uses the solid face areas; the paper's density coefficient is separate).
+
+Also: the C++ parity targets here are themselves dead — `computeCellFaceAreaFractionsGhost`
+is *declared but never defined*, `getFaceCoeffRightDomBorder` is an
+`UT_ASSERT0(FALSE)` stub, and `getFaceAreaGen`/`getGhostPressure_` have zero call
+sites. The only live "2-phase" code is `getGhostPressure_`'s *logic*, which the
+paper describes but the repo never invokes. Port from the paper's §3.5/§6, treat
+the C++ as a naming reference only.
 
 **Scope:** air/water cell classification (`CELL_IS_LIQUID`/`CELL_AIR`/
 `CELL_SOLID`/`CELL_VOID`), face-area fractions for the cut-cell MAC pressure
