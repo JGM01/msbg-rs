@@ -1,5 +1,5 @@
 //! MAC-grid fluid transfer (step 13): the particles-to-grid (P2G) splat of mass
-//! + momentum to staggered faces, and the grid-to-particles (G2P) FLIP/PIC
+//! and momentum to staggered faces, and the grid-to-particles (G2P) FLIP/PIC
 //! gather.
 //!
 //! The paper's core unification (§3.2–3.6): a single cubic-falloff splat to
@@ -18,7 +18,7 @@ pub mod p2g;
 
 pub use g2p::{g2p_blend, MacSampler};
 pub use mac::{MacGrid, X, Y, Z};
-pub use p2g::particles_to_grid;
+pub use p2g::{particles_to_grid, P2gResult};
 
 /// Particle kinds (Eq. 5: `m_p = ρ_kind · V`).
 pub const KIND_LIQUID: u8 = 0;

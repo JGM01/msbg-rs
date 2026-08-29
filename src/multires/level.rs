@@ -30,35 +30,33 @@ pub struct DensityBlock<const N: usize> {
     pub data: [f32; N],
 }
 
-/// The 2-phase MAC face channels (C++ `face_area` / `face_coeff`, three
-/// directional components each), allocated lazily by [`LevelData::ensure_faces`]
-/// so the single-phase steps (7..19) don't pay their ~6× f32 footprint per block.
+/// Solid cut-cell face-area fractions, allocated lazily by
+/// [`LevelData::ensure_solid_faces`]. Fluid-density coefficients belong to the
+/// compact pressure hierarchy rather than this geometry payload.
 #[repr(C, align(64))]
-pub struct FaceBlock<const BSX: usize, const N: usize> {
+pub struct SolidFaceBlock<const BSX: usize, const N: usize> {
     pub face_area: [[f32; N]; 3],
-    pub face_coeff: [[f32; N]; 3],
 }
 
-impl<const BSX: usize, const N: usize> FaceBlock<BSX, N> {
+impl<const BSX: usize, const N: usize> SolidFaceBlock<BSX, N> {
     fn new() -> Self {
         Self {
             face_area: [[0.0; N]; 3],
-            face_coeff: [[0.0; N]; 3],
         }
     }
 }
 
 /// One block of a resolution level: the per-block metadata (cell flags +
 /// fine-coarse distance) co-resident, plus lazily-materialized density and
-/// 2-phase face payloads.
+/// solid-geometry face payloads.
 #[repr(C, align(64))]
 pub struct LevelBlock<const BSX: usize, const N: usize> {
     pub cell_flags: [CellFlags; N],
     pub dist_fine_coarse: [DistFineCoarse; N],
     /// Lazily-materialized density (step 7+); `None` reads as empty (0.0).
     pub density: Option<NonNull<DensityBlock<N>>>,
-    /// Lazily-materialized 2-phase face payload (step 20).
-    pub faces: Option<NonNull<FaceBlock<BSX, N>>>,
+    /// Lazily-materialized solid cut-cell face payload (step 20).
+    pub solid_faces: Option<NonNull<SolidFaceBlock<BSX, N>>>,
 }
 
 /// A shared, sendable handle to a [`LevelBlock`]. `NonNull` is deliberately
@@ -94,7 +92,7 @@ pub struct LevelData<const BSX: usize, const N: usize> {
     blocks: BlockMap<LevelBlockPtr<BSX, N>>,
     pool: Arc<Pool<LevelBlock<BSX, N>>>,
     density_pool: Arc<Pool<DensityBlock<N>>>,
-    faces_pool: Arc<Pool<FaceBlock<BSX, N>>>,
+    solid_faces_pool: Arc<Pool<SolidFaceBlock<BSX, N>>>,
     empty_density: NonNull<DensityBlock<N>>,
 }
 
@@ -113,7 +111,7 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
         let max_segments = n_blocks / 4096 + 2;
         let pool = Arc::new(Pool::<LevelBlock<BSX, N>>::new(max_segments, 4096));
         let density_pool = Arc::new(Pool::<DensityBlock<N>>::new(max_segments, 4096));
-        let faces_pool = Arc::new(Pool::<FaceBlock<BSX, N>>::new(max_segments, 4096));
+        let solid_faces_pool = Arc::new(Pool::<SolidFaceBlock<BSX, N>>::new(max_segments, 4096));
 
         let empty_density = density_pool.alloc_block();
         unsafe {
@@ -132,13 +130,13 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
             blocks: BlockMap::new(),
             pool,
             density_pool,
-            faces_pool,
+            solid_faces_pool,
             empty_density,
         }
     }
 
     /// Allocate the per-block metadata for `bid` if absent (empty cell flags,
-    /// zero fine-coarse distance, no density/faces). Returns without effect if
+    /// zero fine-coarse distance, no density/solid faces). Returns without effect if
     /// present.
     #[inline(always)]
     pub fn ensure_block(&mut self, bid: usize) {
@@ -152,7 +150,7 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
                 cell_flags: [CellFlags(CELL_EMPTY_VAL); N],
                 dist_fine_coarse: [DistFineCoarse(0); N],
                 density: None,
-                faces: None,
+                solid_faces: None,
             });
         }
         self.blocks.insert(bid, LevelBlockPtr(ptr));
@@ -169,18 +167,18 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
         }
     }
 
-    /// Materialize (once) the 2-phase face payload for `bid` and return it.
-    pub fn ensure_faces(&mut self, bid: usize) -> NonNull<FaceBlock<BSX, N>> {
+    /// Materialize (once) the solid cut-cell face payload for `bid` and return it.
+    pub fn ensure_solid_faces(&mut self, bid: usize) -> NonNull<SolidFaceBlock<BSX, N>> {
         debug_assert!(bid < self.n_blocks);
         self.ensure_block(bid);
         let block = self.blocks.get(bid).expect("ensure_block materialized a block");
-        let faces = unsafe { (*block.0.as_ptr()).faces };
+        let faces = unsafe { (*block.0.as_ptr()).solid_faces };
         match faces {
             Some(f) => f,
             None => {
-                let f = self.faces_pool.alloc_block();
-                unsafe { f.as_ptr().write(FaceBlock::new()) };
-                unsafe { (*block.0.as_ptr()).faces = Some(f) };
+                let f = self.solid_faces_pool.alloc_block();
+                unsafe { f.as_ptr().write(SolidFaceBlock::new()) };
+                unsafe { (*block.0.as_ptr()).solid_faces = Some(f) };
                 f
             }
         }

@@ -3,6 +3,10 @@ name = "msbg-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+cpp-parity = []
+
 [workspace]
 members = ["msbg-render"]
 resolver = "3"
@@ -50,4 +54,8 @@ harness = false
 
 [[bench]]
 name = "velocity_bench"
+harness = false
+
+[[bench]]
+name = "pressure_bench"
 harness = false

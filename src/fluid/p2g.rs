@@ -142,7 +142,7 @@ pub fn particles_to_grid<const BSX: usize, const N: usize, const MSX: usize>(
     mac: &mut MacGrid<BSX, N>,
     particles: &Particles,
     r_p: f32,
-) {
+) -> P2gResult {
     particles.assert_consistent();
     let dims = GridDims::new(mac.sx(), mac.sy(), mac.sz(), BSX);
     let bsx_log2 = BSX.trailing_zeros();
@@ -161,6 +161,12 @@ pub fn particles_to_grid<const BSX: usize, const N: usize, const MSX: usize>(
     mac.zero_blocks(&active);
     splat::<BSX, N, MSX>(mac, &bucketed, r_p);
     mac.normalize_velocity(&active);
+    P2gResult { active_blocks: active }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct P2gResult {
+    pub active_blocks: Vec<usize>,
 }
 
 /// Splat every bucketed particle's mass + momentum into the six face channels,

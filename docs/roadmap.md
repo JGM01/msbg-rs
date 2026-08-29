@@ -607,7 +607,7 @@ per-face with a half-cell offset); velocity splat reuses the density staging
 
 ## Step 14 — Matrix-free variable-coefficient Poisson operator (matvec + relaxation)
 
-**Status:** HAVEN'T STARTED
+**Status:** DONE
 
 **Build order:** SECOND. Consumes the step-13 face coefficients (`β = 1/ρ`) and
 divergence; produces the operator that step 15's multigrid smooths.
@@ -647,9 +647,22 @@ macro); matrix-free (no assembled `L`).
   is never populated. (The weighted branch is verified by the step-18/19
   physical tests + a scalar-reference oracle; wiring C++'s face-area channels
   for a live weighted diff is heavy and low-value.)
-- `pressure_matvec` / `pressure_relax` benches vs the C++ harness.
+- `pressure_matvec` / `pressure_relax` benches vs the **`../MSBG/pressurebench`
+  harness** (new: mirrors the Rust matrix — see `docs/step_14_story.md`).
 - Unit tests: matvec on affine fields (Laplacian = 0), BC handling, GS vs
   Jacobi convergence rate, `ω` clamp endpoints, empty/full dummy neighbors.
+
+**Measured (Dell 5500U, 12 threads):** the original kernels were correct but
+structurally slow (per-row `Vec<Vec<..>>` CSR, serial relax, separate serial
+dot/residual/norm2 passes). Rewritten as block-SIMD halo kernels (raw
+unchecked loads, NT stores, fused dot/`rv−ax`/norm2, parallel 8-color relax):
+matvec c1 went 2.58 ms → 91 µs at 64³ (28×). The per-thread kernel now beats
+C++ (1T matvec 248 µs vs C++ 290 µs), but the 12-thread small-domain matvec is
+1.6–2.9× behind C++ (rayon barrier overhead + weighted-path coefficient reads
+from L2/L3 vs C++'s L1-staged `tmpDataW`); at 192³ the gap narrows to
+1.13–1.45×. Full table + verdicts in `docs/step_14_story.md`. Note: the C++
+`processBlockLaplacian` kernel hard-asserts bsx==32, so block-32 has no C++
+pressure baseline — the Rust b32 cases are Rust-only.
 
 ---
 
@@ -839,9 +852,9 @@ face-area machinery, `msbg.cpp`.
 - The **fluid density coefficient** `β = 1/ρ` (paper Eq. 9, `/tmp/msbg_paper.txt:472`)
   lives in step 14's matvec; it comes from the step-13 face mass. That is the
   two-fluid density contrast.
-- This step's `face_area`/`face_coeff` are the **solid cut-cell** fractions
+- This step's `face_area` values are the **solid cut-cell** fractions
   (sub-voxel obstacle geometry) — a *different* quantity, already scaffolded as
-  `FaceBlock { face_area, face_coeff }` + `LevelData::ensure_faces` (step 7).
+  `SolidFaceBlock { face_area }` + `LevelData::ensure_solid_faces` (step 7).
   Both multiply into the same 7-point stencil (the C++ `blockHasFaceCoeffs`
   branch uses the solid face areas; the paper's density coefficient is separate).
 

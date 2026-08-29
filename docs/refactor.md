@@ -747,9 +747,9 @@ scattered allocations per block:
   materialized only when a block is actually written (the halo/solver density
   stream stays contiguous — the first cut put density *in* the block and paid a
   16 KiB stride).
-- **Faces lazy**: `face_area`/`face_coeff` are a `FaceBlock` behind
-  `ensure_faces`, so the single-phase steps (7..19) don't pay their ~6× f32
-  footprint; step 20 materializes them without a layout change.
+- **Solid faces lazy**: cut-cell `face_area` values are a `SolidFaceBlock`
+  behind `ensure_solid_faces`; fluid-density β stays in the compact pressure
+  hierarchy.
 
 The first cut (full SoA — density+flags+dfc in one 32 KiB block) was **2.05×
 slower** on `set_refinement_map` (Rust 179.5 ms vs C++ 87.4 ms at 35,937
@@ -766,7 +766,7 @@ cell-flag init the C++ `benchmark.cpp` path skips (`doInitCellFlags=false`).
 overflow past 1024³); it is 21-bit-per-axis (`u64`) so the 2048³ paper domain's
 11-bit block coords interleave bijectively. `BlockPool` was generalized to
 `Pool<T>` (`BlockPool<D, BSX, N> = Pool<Block<D, BSX, N>>`) so the SoA
-`LevelBlock`/`DensityBlock`/`FaceBlock` pools share one allocator.
+`LevelBlock`/`DensityBlock`/`SolidFaceBlock` pools share one allocator.
 
 ### Remaining dense structures (not step 11)
 
@@ -847,3 +847,49 @@ histogram is bit-equivalent to the dense path for the resulting field.
 Peak is phased, not summed: placement ~26 GB → scatter ~41 GB → splat ~222 GB
 (density ~205 GB + block-major positions ~15.5 GB + sparse maps ~1 GB), within
 the 256 GB box. Streaming stays deferred.
+
+## 16. Pressure operator (step 14) — from slow CSR to block-SIMD
+
+`src/pressure.rs` started as a correct-but-slow operator: the matvec iterated a
+per-row `Vec<Vec<(usize, usize)>>` CSR (262K separate heap allocations at 64³,
+pointer-chasing every cell), `relax` was serial, and `apply_and_dot`/`residual`
+each did a separate serial O(n) sweep (the dot, the `rv−ax`, the norm2). The
+C++ `multiplyLaplacianMatrixOpt` fuses all of that into one TBB pass over a
+per-thread halo buffer.
+
+### The rewrite (28× on matvec c1, 2.58 ms → 91 µs at 64³/12T)
+
+- **Flat CSR** (`row_offsets`/`col_indices`/`coeff_vals` in one buffer) kills
+  the per-row Vec indirection.
+- **Per-block halo kernel** (`apply_block_simd`/`relax_block_simd`): assemble a
+  `[bs+2]³` halo (interior copy + six face fills; the ±y/±z faces are
+  contiguous-run copies, the ±x faces strided with software prefetch), then a
+  `Simd<f32, LANES>` 7-pt stencil with a non-temporal store. Face tables
+  (`block_faces`) are built from a fine-origin lookup at pattern-build time and
+  handle periodic wrap and 2:1 coarse neighbors; coarse blocks (and any block
+  with an activity mask) fall back to the scalar CSR path.
+- **Constant fast path**: when every edge coefficient is equal, the stencil
+  sums the six halo neighbors instead of loading six per-cell coefficient
+  arrays (mirrors the C++ `blockHasFaceCoeffs`=false branch). Gated on
+  `transition_links == 0` because transition faces carry the (2/3)·h·2^L scale.
+- **Fused reductions**: the dot, `rv−ax`, and norm2 are computed inside the
+  kernel (`apply_block_simd` takes `Option<&mut f64>` dot/norm2 and
+  `Option<&[f32]>` rv), so matvec_dot/residual are single passes.
+- **Parallel 8-color relax**: the outer-color waves are halo-disjoint, so each
+  wave is a rayon `par_iter` over its blocks with a per-worker scratch slot
+  (`ScratchPool`, `unsafe impl Sync` — each slot is owned by one rayon worker
+  via `current_thread_index()`); the block-local GS runs on the halo exactly
+  like the C++ `RELAX_BLOCK_GAUSS_SEIDEL`, so it is bit-identical to the serial
+  8-color sweep. The `Vec<Vec<..>>` `row_edges` survived only behind
+  `feature = "cpp-parity"` (it was 1.6 GB of heap Vecs at 256³ — gated).
+
+### Bench findings (Dell 5500U; see `docs/step_14_story.md`)
+
+The per-thread kernel **beats C++** (1-thread matvec c1 248 µs vs C++ 290 µs),
+but the 12-thread small-domain matvec is 1.6–2.9× behind: a rayon barrier per
+apply on a 64-block domain, and the weighted path loading six `coeff_dir`
+arrays from L2/L3 where C++ stages them in the L1 `tmpDataW`. At 192³ the gap
+narrows to 1.13–1.45× (memory-bound). Follow-ups: distribute blocks without
+the per-apply barrier (the kernel already wins per-thread), stage weighted
+coefficients in the halo, and document the 8-color two-wave relax cost (C++
+`relaxBlockList` is a single racy parallel pass).

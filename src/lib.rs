@@ -42,6 +42,7 @@ pub mod io;
 pub mod math;
 pub mod multires;
 pub mod particles;
+pub mod pressure;
 pub mod solver;
 pub mod sparse_grid;
 pub mod thread_pool;

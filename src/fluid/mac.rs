@@ -7,7 +7,7 @@
 //! shifted by half a cell along axis `a`; the half-cell shift lives in the
 //! sampling/staging coordinates, not the storage, keeping every grid cell-sized.
 //! The right-most faces (`i = sx`, etc.) lie on the domain boundary and are the
-//! caller's boundary condition (treated as 0 by [`MacGrid::divergence`]).
+//! caller's boundary condition (treated as 0 by [`MacGrid::physical_divergence`]).
 //!
 //! Six scalar `f32` channels (not three `Vec3`) so the P2G splat and the
 //! step-14 Poisson stencil both stream pure scalar lanes — the C++ `Vec3Float`
@@ -131,14 +131,18 @@ impl<const BSX: usize, const N: usize> MacGrid<BSX, N> {
         }
     }
 
-    /// Cell-centered divergence `∇·u* = Σ_a (u_a(right) − u_a(left))`. The
+    /// Cell-centered physical divergence `∇·u* = Σ_a
+    /// (u_a(right) − u_a(left))/h`. The
     /// leftmost faces (`i = 0` per axis) read 0 (the domain boundary); boundary
     /// conditions are a step-18 concern.
-    pub fn divergence(
+    pub fn physical_divergence(
         &self,
         dst: &mut SparseGrid<f32, BSX, N>,
         active: &[usize],
+        spacing: f32,
     ) {
+        assert!(spacing.is_finite() && spacing > 0.0, "spacing must be finite and positive");
+        let inverse_spacing = spacing.recip();
         dst.ensure_blocks_parallel(active);
         let (u, v, w) = (&self.velocity[X], &self.velocity[Y], &self.velocity[Z]);
         let sx = self.sx();
@@ -162,7 +166,7 @@ impl<const BSX: usize, const N: usize> MacGrid<BSX, N> {
                         let vy0 = if y == 0 { 0.0 } else { v.get_voxel(x, y - 1, z) };
                         let wz1 = w.get_voxel(x, y, z);
                         let wz0 = if z == 0 { 0.0 } else { w.get_voxel(x, y, z - 1) };
-                        unsafe { *dp.add(vid) = (ux1 - ux0) + (vy1 - vy0) + (wz1 - wz0) };
+                        unsafe { *dp.add(vid) = ((ux1 - ux0) + (vy1 - vy0) + (wz1 - wz0)) * inverse_spacing };
                         vid += 1;
                     }
                 }
@@ -214,7 +218,7 @@ mod tests {
             0.0,
             mac.velocity(X).block_pool.clone(),
         );
-        mac.divergence(&mut div, &active);
+        mac.physical_divergence(&mut div, &active, 1.0);
         for k in 0..s {
             for j in 0..s {
                 for i in 0..s {
@@ -233,7 +237,7 @@ mod tests {
                 }
             }
         }
-        mac.divergence(&mut div, &active);
+        mac.physical_divergence(&mut div, &active, 1.0);
         for k in 1..s {
             for j in 1..s {
                 for i in 1..s {
