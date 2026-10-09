@@ -1,22 +1,15 @@
-//! MAC-grid fluid transfer (step 13): the particles-to-grid (P2G) splat of mass
-//! + momentum to staggered faces, and the grid-to-particles (G2P) FLIP/PIC
-//! gather.
+//! MAC-grid particle transfer.
 //!
-//! The paper's core unification (§3.2–3.6): a single cubic-falloff splat to
-//! *cell faces* produces the face mass `M` — which is simultaneously the raw
-//! phase-field density (Eq. 7) and the variable Poisson coefficient `β = 1/ρ`
-//! (Eq. 9) — and the face momentum, whose ratio is the face velocity `ũ* = P/M`.
-//! G2P is `u_new = α·u_old + I(Δu) + (1−α)·I(u)` (Eq. 12).
-//!
-//! The splat reuses the step-9 staged 8-color architecture (thread-local
-//! staging + a 3×3×3 commit), but with a *sum* reduction, a *cubic-falloff*
-//! weight, and a half-cell face offset per direction.
+//! P2G splats mass and momentum to staggered faces, then computes velocity `P/M`.
+//! G2P samples the face fields and applies a FLIP/PIC blend.
+//! The splat uses eight colors and per-worker buffers, with a sum reduction and
+//! cubic-falloff weights from Eq. 6 of the paper.
 
 pub mod g2p;
 pub mod mac;
 pub mod p2g;
 
-pub use g2p::{g2p_blend, MacSampler};
+pub use g2p::{MacSampler, g2p_blend};
 pub use mac::{MacGrid, X, Y, Z};
 pub use p2g::particles_to_grid;
 
@@ -52,7 +45,7 @@ impl Particles {
     }
 }
 
-/// Block-major particle payloads (the step-13 analogue of `particles::sort::Bucketed`).
+/// Block-major positions, velocities, kinds, and masses for fluid transfer.
 #[derive(Clone, Debug, Default)]
 pub struct BucketedParticles {
     pub positions: Vec<[f32; 3]>,

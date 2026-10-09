@@ -1,18 +1,18 @@
-//! Step-11 blockmap lookup micro-bench.
+//! Blockmap lookup microbenchmark.
 //!
 //! Compares three block-id→pointer lookup structures on the same key/value
 //! distribution (a spherical-shell active set, the same shape the multires
 //! benches use):
 //!
-//!   * `dense`  — the step-1..10 `Vec<Option<NonNull<Block>>>` layout
+//!   * `dense`  — a `Vec<Option<NonNull<Block>>>` layout
 //!     (baseline, one array index per probe)
-//!   * `hand`   — the new [`msbg_rs::blockmap::BlockMap`] (open addressing)
-//!   * `hashbrown` — `hashbrown::HashMap` with the identical SplitMix hash
+//!   * `hand`   — [`msbg_rs::blockmap::BlockMap`] (open addressing)
+//!   * `hashbrown` — `hashbrown::HashMap` with the same multiplicative hash
 //!
 //! Legs: `hits` (probe only active bids) and `mixed` (~50% active / 50% random).
-//! Acceptance (step 11): the sparse probe within ~2× of the dense index.
+//! The dense index is a lookup-cost baseline, with a larger sparse-domain footprint.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hashbrown::HashMap;
 use msbg_rs::blockmap::BlockMap;
 use msbg_rs::blockpool::Block;
@@ -87,11 +87,12 @@ fn bench_lookup(c: &mut Criterion) {
         let n_blocks = bpd * bpd * bpd;
         let active = shell_blocks(bpd, bpd, bpd);
 
-        // Dense baseline: exact step-1..10 layout.
+        // Dense baseline: one pointer slot per virtual block.
         let mut dense: Vec<Option<NonNull<Block<f32, BSX, N>>>> = vec![None; n_blocks];
         // Hand-rolled sparse map.
-        let mut hand: BlockMap<NonNull<Block<f32, BSX, N>>> = BlockMap::with_capacity(active.len() * 2);
-        // hashbrown with the same SplitMix hash.
+        let mut hand: BlockMap<NonNull<Block<f32, BSX, N>>> =
+            BlockMap::with_capacity(active.len() * 2);
+        // hashbrown with the same multiplicative hash.
         let mut hb: HashMap<usize, NonNull<Block<f32, BSX, N>>, MixBuilder> =
             HashMap::with_capacity_and_hasher(active.len() * 2, MixBuilder::default());
 
@@ -111,7 +112,9 @@ fn bench_lookup(c: &mut Criterion) {
         let mut hits: Vec<usize> = active.clone();
         let mut seed = 0x243f_6a88u64;
         let mut rng = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         for i in (1..hits.len()).rev() {
@@ -162,24 +165,32 @@ fn bench_lookup(c: &mut Criterion) {
                 std::hint::black_box(acc);
             });
         });
-        group.bench_with_input(BenchmarkId::new("hashbrown/hits", bpd), &n_blocks, |b, _| {
-            b.iter(|| {
-                let mut acc = 0usize;
-                for &bid in hits_ref {
-                    acc = acc.wrapping_add(if hb.get(&bid).is_some() { 1 } else { 0 });
-                }
-                std::hint::black_box(acc);
-            });
-        });
-        group.bench_with_input(BenchmarkId::new("hashbrown/mixed", bpd), &n_blocks, |b, _| {
-            b.iter(|| {
-                let mut acc = 0usize;
-                for &bid in mixed_ref {
-                    acc = acc.wrapping_add(if hb.get(&bid).is_some() { 1 } else { 0 });
-                }
-                std::hint::black_box(acc);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("hashbrown/hits", bpd),
+            &n_blocks,
+            |b, _| {
+                b.iter(|| {
+                    let mut acc = 0usize;
+                    for &bid in hits_ref {
+                        acc = acc.wrapping_add(if hb.get(&bid).is_some() { 1 } else { 0 });
+                    }
+                    std::hint::black_box(acc);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("hashbrown/mixed", bpd),
+            &n_blocks,
+            |b, _| {
+                b.iter(|| {
+                    let mut acc = 0usize;
+                    for &bid in mixed_ref {
+                        acc = acc.wrapping_add(if hb.get(&bid).is_some() { 1 } else { 0 });
+                    }
+                    std::hint::black_box(acc);
+                });
+            },
+        );
     }
     group.finish();
 }

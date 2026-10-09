@@ -1,9 +1,7 @@
-//! Pinhole camera + ray generation, native `Vec3` (no `glam`).
+//! Pinhole camera and ray generation with `Vec3`.
 //!
-//! Positions are in *voxel space* (the grid is `[0, sx]×[0, sy]×[0, sz]`); to
-//! place the camera with the demo's normalized `[0,1]³` coordinates, scale each
-//! component by the corresponding grid extent. The basis and NDC mapping match
-//! the C++ `RaymarchRenderer::setCamera` / ray loop bit-for-bit.
+//! Positions use voxel coordinates in `[0, sx]×[0, sy]×[0, sz]`.
+//! Scale normalized camera coordinates by the corresponding grid extent.
 
 use msbg_rs::channel::Vec3;
 
@@ -48,7 +46,13 @@ impl Camera {
         let forward = normalize(look_at - position);
         let right = normalize(cross(forward, world_up));
         let up = cross(right, forward);
-        Camera { position, forward, right, up, focal_len }
+        Camera {
+            position,
+            forward,
+            right,
+            up,
+            focal_len,
+        }
     }
 
     /// Primary ray for pixel `(x, y)` of a `width × height` image.
@@ -59,6 +63,9 @@ impl Camera {
         let ndc_x = ((x + 0.5) * inv_w - 0.5) * 2.0 * aspect;
         let ndc_y = (0.5 - (y + 0.5) * inv_h) * 2.0;
         let dir = normalize(self.forward * self.focal_len + self.right * ndc_x + self.up * ndc_y);
-        Ray { origin: self.position, direction: dir }
+        Ray {
+            origin: self.position,
+            direction: dir,
+        }
     }
 }

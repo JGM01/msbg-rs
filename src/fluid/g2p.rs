@@ -32,12 +32,10 @@ impl<'a, const BSX: usize, const N: usize> MacSampler<'a, BSX, N> {
     }
 }
 
-/// FLIP/PIC blend (Eq. 12): the standard Bridson form
-/// `u_new = α·(u_old + Δu) + (1−α)·u`, with `Δu = u − ũ*`. `u` is the
-/// post-projection face velocity, `u_tilde` the pre-projection one (both
-/// already sampled at the particle); `α = 0` is pure PIC (`u`), `α = 1` is pure
-/// FLIP (`u_old + Δu`). Linear interpolation makes `I(u) − I(ũ*) = I(Δu)`, so
-/// the two fields are sampled separately here and combined.
+/// FLIP/PIC blend: `u_new = α·(u_old + Δu) + (1−α)·u`.
+/// `Δu = u − u_tilde`, using velocities sampled at the particle.
+/// `u` is post-projection velocity; `u_tilde` is pre-projection velocity.
+/// `α = 0` selects PIC. `α = 1` selects FLIP.
 #[inline]
 pub fn g2p_blend(u_old: Vec3, u: Vec3, u_tilde: Vec3, alpha: f32) -> Vec3 {
     let delta = u - u_tilde;

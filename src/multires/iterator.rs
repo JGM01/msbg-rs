@@ -86,7 +86,7 @@ mod iterator_tests {
         grid.set_full_block(2);
 
         let mut iter = BlockIterator::new(&mut grid);
-        let ctx = iter.next().expect("should yield the real block");
+        let ctx = iter.next().expect("expected allocated block");
         assert_eq!(ctx.bid, 1);
         assert!(iter.next().is_none());
     }
@@ -103,14 +103,14 @@ mod iterator_tests {
         }
 
         let mut iter = BlockIterator::new(&mut grid);
-        let ctx = iter.next().expect("one real block expected");
+        let ctx = iter.next().expect("expected one allocated block");
         assert_eq!(ctx.bid, 0);
 
         // Pointer must be 32-byte aligned (f32x8)
         let addr = ctx.data as usize;
         assert_eq!(addr % 32, 0, "SIMD pointer not 32-byte aligned");
 
-        // And it must really point at the block data
+        // The pointer must refer to the allocated block data
         unsafe {
             let first = *ctx.data; // first f32x8
             // Just check the very first lane matches what we wrote

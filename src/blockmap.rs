@@ -1,19 +1,10 @@
-//! Sparse, block-id-keyed map (open addressing, linear probing).
+//! Sparse block-ID map with open addressing and linear probing.
 //!
-//! Replaces the dense per-grid `Vec<Option<BlockPtr>>` blockmap so lookup cost
-//! scales with *active* blocks, not *virtual* blocks. At 32,768³/block-16 the
-//! dense map is 68.7 GB per grid; this map is ~0.4 GB for the same domain.
-//!
-//! Keys are block ids (`usize`, 64-bit on all supported targets — 2048³ =
-//! 8.59B blocks > `u32::MAX`). The table is SoA (`keys: Vec<usize>` +
-//! `vals: Vec<MaybeUninit<V>>`) so a probe walks 8-byte key slots only, and
-//! linear probing keeps the working set within one or two cache lines for
-//! clustered block sets. Power-of-two capacity, ~3/4 load factor, tombstones
-//! on delete (cleared on rehash).
-//!
-//! `V` is the payload pointer (a `BlockPtr` or an SoA level-block pointer);
-//! `V: Copy` means entries never need dropping, so the `MaybeUninit` slots can
-//! be left untouched.
+//! Separate key and value arrays let probes read keys without loading values.
+//! Capacity is a power of two. The maximum load factor is about 3/4.
+//! Deletion leaves tombstones, which are removed during rehashing.
+//! Keys use `usize`; supported targets are 64-bit.
+//! `V: Copy` lets unused value slots remain uninitialized.
 
 use std::mem::MaybeUninit;
 
@@ -22,11 +13,8 @@ const EMPTY: usize = usize::MAX;
 /// Deleted slot marker (entry removed; probe chains continue past it).
 const TOMBSTONE: usize = usize::MAX - 1;
 
-/// Multiplicative hash: one odd-constant multiply. Multiplication by an odd
-/// constant is a bijection mod 2^k, so consecutive bid clusters (the low bits
-/// are the fastest-varying block axis) spread uniformly across a power-of-two
-/// table — ideal for linear probing. Far cheaper than a SplitMix finalizer on
-/// the per-probe hot path (measured: ~3.5x faster probe).
+/// Multiplicative hash for power-of-two tables.
+/// An odd multiplier preserves distinct low-bit patterns modulo the capacity.
 #[inline(always)]
 fn mix(key: usize) -> usize {
     (key as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize
@@ -108,7 +96,10 @@ impl<V: Copy> BlockMap<V> {
 
     #[inline]
     fn insert_no_grow(&mut self, key: usize, val: V) {
-        debug_assert!(key != EMPTY && key != TOMBSTONE, "block id collides with a sentinel");
+        debug_assert!(
+            key != EMPTY && key != TOMBSTONE,
+            "block id collides with a sentinel"
+        );
         let mut i = self.slot(key);
         loop {
             let k = self.keys[i];
@@ -155,7 +146,10 @@ impl<V: Copy> BlockMap<V> {
     /// the new value. The sparse-histogram hot loop (`count[key] += 1`).
     #[inline]
     pub fn update(&mut self, key: usize, default: V, mut f: impl FnMut(V) -> V) -> V {
-        debug_assert!(key != EMPTY && key != TOMBSTONE, "key collides with a sentinel");
+        debug_assert!(
+            key != EMPTY && key != TOMBSTONE,
+            "key collides with a sentinel"
+        );
         let mut i = self.slot(key);
         loop {
             let k = self.keys[i];
@@ -322,10 +316,22 @@ mod tests {
         // Block ids straddling u32::MAX must round-trip (proves the 64-bit
         // key path the paper-scale domain needs).
         let mut m = BlockMap::new();
-        for k in [0usize, u32::MAX as usize - 1, u32::MAX as usize, u32::MAX as usize + 1, 0x1_0000_0000] {
+        for k in [
+            0usize,
+            u32::MAX as usize - 1,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+            0x1_0000_0000,
+        ] {
             m.insert(k, k as u64);
         }
-        for k in [0usize, u32::MAX as usize - 1, u32::MAX as usize, u32::MAX as usize + 1, 0x1_0000_0000] {
+        for k in [
+            0usize,
+            u32::MAX as usize - 1,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+            0x1_0000_0000,
+        ] {
             assert_eq!(m.get(k), Some(k as u64));
         }
     }
@@ -346,7 +352,10 @@ mod tests {
         }
         let mut seen: Vec<(usize, u64)> = m.iter().collect();
         seen.sort_unstable();
-        assert_eq!(seen, (0..100usize).map(|i| (i * 7, i as u64)).collect::<Vec<_>>());
+        assert_eq!(
+            seen,
+            (0..100usize).map(|i| (i * 7, i as u64)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

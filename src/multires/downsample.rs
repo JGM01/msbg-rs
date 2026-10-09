@@ -3,14 +3,16 @@
 use crate::multires::level::LevelData;
 use rayon::prelude::*;
 
-/// 2^3 box average downsample: each coarse voxel is the mean of its 8 fine
-/// children. Mirrors the C++ `OPT_SIMPLE_AVERAGE` path of `downsampleChannel`
-/// (`krnDownWidth = 2`, `krn = 1/8`). `src` is the finer level (block size
-/// `BSX`), `dst` the coarser (block size `BSX / 2`); both share the same block
-/// grid, so coarse block `bid` is the average of fine block `bid`. Only the
-/// fine level's present blocks are visited (the sparse map), so the cost scales
-/// with active blocks, not the virtual block count.
-pub fn downsample_channel_avg<const BSX: usize, const N: usize, const BSC: usize, const NC: usize>(
+/// Average each group of eight fine voxels into one coarse voxel.
+/// `src` uses block size `BSX`; `dst` uses `BSX / 2`.
+/// Both levels share block IDs. Only present fine blocks are visited.
+/// This matches the C++ `OPT_SIMPLE_AVERAGE` path.
+pub fn downsample_channel_avg<
+    const BSX: usize,
+    const N: usize,
+    const BSC: usize,
+    const NC: usize,
+>(
     dst: &mut LevelData<BSC, NC>,
     src: &LevelData<BSX, N>,
 ) {
@@ -33,7 +35,10 @@ pub fn downsample_channel_avg<const BSX: usize, const N: usize, const BSC: usize
     jobs.into_par_iter().for_each(|(_bid, sp, dp)| {
         let sp = sp as *const f32;
         let dp = dp as *mut f32;
-        debug_assert!(!sp.is_null() && !dp.is_null(), "downsample pointers must be live");
+        debug_assert!(
+            !sp.is_null() && !dp.is_null(),
+            "downsample pointers must be live"
+        );
         let mut vid = 0usize;
         for cz in 0..BSC {
             for cy in 0..BSC {
@@ -45,7 +50,9 @@ pub fn downsample_channel_avg<const BSX: usize, const N: usize, const BSC: usize
                     for dz in 0..2usize {
                         for dy in 0..2usize {
                             for dx in 0..2usize {
-                                let i = (fx + dx) | ((fy + dy) << fine_log2) | ((fz + dz) << (2 * fine_log2));
+                                let i = (fx + dx)
+                                    | ((fy + dy) << fine_log2)
+                                    | ((fz + dz) << (2 * fine_log2));
                                 sum += unsafe { *sp.add(i) };
                             }
                         }
@@ -76,8 +83,9 @@ pub fn sample_coarse<const BSC: usize, const NC: usize>(
     let coarse_log2 = BSC.trailing_zeros();
     let coarse_mask = BSC - 1;
     let bid = (x >> coarse_log2) + (y >> coarse_log2) * coarse.nx + (z >> coarse_log2) * coarse.nxy;
-    let vid =
-        (x & coarse_mask) | ((y & coarse_mask) << coarse_log2) | ((z & coarse_mask) << (2 * coarse_log2));
+    let vid = (x & coarse_mask)
+        | ((y & coarse_mask) << coarse_log2)
+        | ((z & coarse_mask) << (2 * coarse_log2));
     unsafe { *coarse.density_ptr(bid).add(vid) }
 }
 

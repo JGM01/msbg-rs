@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::Vec3;
 use msbg_rs::math::{BoundaryCondition, GridAlignment, Interpolation, Sample};
@@ -13,9 +13,16 @@ const CLAMP: BoundaryCondition = BoundaryCondition::Clamp;
 const NSAMPLES: u64 = 100_000;
 
 fn field(x: f32, y: f32, z: f32) -> f32 {
-    0.002 * x * x + 0.003 * y * y + 0.004 * z * z
-        + 0.005 * x * y + 0.006 * x * z + 0.007 * y * z
-        + 0.1 * x + 0.05 * y - 0.02 * z + 0.75
+    0.002 * x * x
+        + 0.003 * y * y
+        + 0.004 * z * z
+        + 0.005 * x * y
+        + 0.006 * x * z
+        + 0.007 * y * z
+        + 0.1 * x
+        + 0.05 * y
+        - 0.02 * z
+        + 0.75
 }
 
 fn build_grid() -> SparseGrid<f32, BSX, N> {
@@ -39,9 +46,7 @@ fn positions() -> Vec<Vec3> {
         seed as f32 / u32::MAX as f32
     };
     (0..NSAMPLES)
-        .map(|_| {
-            Vec3::new(2.0 + rng() * 92.0, 2.0 + rng() * 92.0, 2.0 + rng() * 92.0)
-        })
+        .map(|_| Vec3::new(2.0 + rng() * 92.0, 2.0 + rng() * 92.0, 2.0 + rng() * 92.0))
         .collect()
 }
 

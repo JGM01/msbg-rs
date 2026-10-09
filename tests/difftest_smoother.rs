@@ -1,8 +1,7 @@
-//! Differential test for the step-8 8-color in-place smoother against the C++
-//! baseline (`../MSBG/smoothertest.cpp`). Both sides run the REAL solver — C++
-//! `applyChannelPdeFast` with `-(laplTyp + OPT_8_COLOR_SCHEME)`, Rust
-//! `Sweeper` — for 4 iterations over the same smooth field, and the full level-0
-//! field is compared within tolerance (f32 + FMA -> not bit-exact).
+//! Eight-color smoothing comparison with C++ golden samples.
+//! The optional live test compares full fields after four iterations.
+//! Its C++ harness uses `applyChannelPdeFast` with the eight-color option.
+//! See docs/development.md for harness availability and tolerances.
 
 use msbg_rs::{
     blockpool::BlockPool,
@@ -35,8 +34,11 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
                 for z in 0..BSX {
                     for y in 0..BSX {
                         for x in 0..BSX {
-                            data[x + y * BSX + z * BSX * BSX] =
-                                field((bx * BSX + x) as f32, (by * BSX + y) as f32, (bz * BSX + z) as f32);
+                            data[x + y * BSX + z * BSX * BSX] = field(
+                                (bx * BSX + x) as f32,
+                                (by * BSX + y) as f32,
+                                (bz * BSX + z) as f32,
+                            );
                         }
                     }
                 }
@@ -48,8 +50,13 @@ fn build_grid() -> SparseGrid<f32, BSX, N> {
 
 fn run_solver(grid: &SparseGrid<f32, BSX, N>, stencil: Stencil) -> Vec<f32> {
     let active: Vec<usize> = (0..N_BLOCKS).collect();
-    let sweeper = Sweeper::<f32, BSX, N, HSX>::new(grid, rayon::current_num_threads(), Fence::Sfence);
-    let params = PdeParams { dt: DT, iterations: ITERS, do_constr_zero_one: false };
+    let sweeper =
+        Sweeper::<f32, BSX, N, HSX>::new(grid, rayon::current_num_threads(), Fence::Sfence);
+    let params = PdeParams {
+        dt: DT,
+        iterations: ITERS,
+        do_constr_zero_one: false,
+    };
     sweeper.sweep(&active, stencil, &params);
 
     let mut out = Vec::with_capacity(N_VOXELS);
@@ -61,21 +68,46 @@ fn run_solver(grid: &SparseGrid<f32, BSX, N>, stencil: Stencil) -> Vec<f32> {
 
 /// Golden sample values (indices into the 262144-voxel level-0 field), produced
 /// by `../MSBG/build/smoothertest`.
-const SAMPLE_IDX: [usize; 12] = [0, 1, 15, 16, 255, 256, 272, 4095, 100_000, 200_000, 262_143, 131_072];
+const SAMPLE_IDX: [usize; 12] = [
+    0, 1, 15, 16, 255, 256, 272, 4095, 100_000, 200_000, 262_143, 131_072,
+];
 
 const GOLDEN: [[f32; 12]; 2] = [
     // laplTyp 1 (Laplacian)
-    [6.35691917e-15, 7.16737929e-07, 7.1486691e-05, 6.27597627e-15, 9.39214442e-06, 7.16738782e-07, 7.1216067e-07, 0.283120126, -0.00017801064, -4.40651129e-05, -0.00321645429, 0.000175741952],
+    [
+        6.35691917e-15,
+        7.16737929e-07,
+        7.1486691e-05,
+        6.27597627e-15,
+        9.39214442e-06,
+        7.16738782e-07,
+        7.1216067e-07,
+        0.283120126,
+        -0.00017801064,
+        -4.40651129e-05,
+        -0.00321645429,
+        0.000175741952,
+    ],
     // laplTyp 4 (mean-curvature)
-    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.282928258, 0.0, 0.0, -0.00317776599, 0.0],
+    [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.282928258,
+        0.0,
+        0.0,
+        -0.00317776599,
+        0.0,
+    ],
 ];
 
-/// Mean-curvature is compared at a looser tolerance than Laplacian: its mixed
-/// partials are factored `0.25*(a-b-c+d)` (fewer FLOPs than C++'s two-stage
-/// `0.5` form, see `docs/refactor.md`), and near the `gradMagSq > 1e-7` guard
-/// cliff that ~1-ulp difference in `H` flips a voxel between `H = hnum/grad`
-/// and `H = 0`. Four Gauss-Seidel iterations propagate the resulting
-/// discontinuity into the neighborhood.
+/// Mean curvature uses a larger tolerance than Laplacian.
+/// Arithmetic order can change whether `gradMagSq` crosses the `1e-7` guard.
+/// Repeated updates propagate that difference to neighboring voxels.
 fn tol(stencil: Stencil) -> f32 {
     match stencil {
         Stencil::Laplacian => 1e-4,
@@ -85,7 +117,10 @@ fn tol(stencil: Stencil) -> f32 {
 
 #[test]
 fn smoother_matches_cpp_golden_samples() {
-    for (t, stencil) in [Stencil::Laplacian, Stencil::MeanCurvature].iter().enumerate() {
+    for (t, stencil) in [Stencil::Laplacian, Stencil::MeanCurvature]
+        .iter()
+        .enumerate()
+    {
         let grid = build_grid();
         let out = run_solver(&grid, *stencil);
         for (k, &idx) in SAMPLE_IDX.iter().enumerate() {
@@ -117,7 +152,11 @@ fn smoother_against_cpp_binary_if_available() {
     let mut lines = text.lines();
 
     for stencil in [Stencil::Laplacian, Stencil::MeanCurvature] {
-        let header = lines.next().expect("expected laplTyp header").trim().to_string();
+        let header = lines
+            .next()
+            .expect("expected laplTyp header")
+            .trim()
+            .to_string();
         let want_lapl = match stencil {
             Stencil::Laplacian => "1",
             Stencil::MeanCurvature => "4",
@@ -127,7 +166,14 @@ fn smoother_against_cpp_binary_if_available() {
 
         let mut want = Vec::with_capacity(N_VOXELS);
         for _ in 0..N_VOXELS {
-            want.push(lines.next().expect("truncated C++ output").trim().parse::<f32>().expect("bad float"));
+            want.push(
+                lines
+                    .next()
+                    .expect("truncated C++ output")
+                    .trim()
+                    .parse::<f32>()
+                    .expect("bad float"),
+            );
         }
 
         let grid = build_grid();

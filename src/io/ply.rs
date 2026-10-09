@@ -1,25 +1,16 @@
 //! PLY point-cloud loading.
 //!
-//! The demo's `bun_zipper*.ply` files are `format ascii` with five float
-//! properties per vertex (`x y z confidence intensity`) plus a `face` element
-//! that is skipped entirely. We read the header once, then stream exactly
-//! `element vertex N` payload lines, capturing only x/y/z.
+//! The bunny files contain ASCII vertices with `x y z confidence intensity`.
+//! The loader reads positions and skips faces and unused properties.
+//! It uses the `ply-rs` header parser.
 //!
-//! The parser is generic (`ply-rs` `PropertyAccess`): the crate's `peg` header
-//! grammar is robust against malformed headers, and only the declared
-//! properties are materialized, so faces and unused scalars cost nothing.
-//!
-//! Known `ply-rs` limitation: its ASCII payload grammar accepts `-4.2e3` but
-//! not uppercase `E`, and requires digits after the decimal point (`.5` /
-//! `5.` fail). The shipped bunny files use plain decimals; a hand-rolled
-//! scanner is the fallback if a data source trips this.
+//! The ASCII parser accepts lowercase `e` exponents, but rejects uppercase `E`,
+//! `.5`, and `5.`. The included bunny files use plain decimal values.
 
 use std::io::{self, BufRead, Cursor};
 
 use ply_rs::parser::Parser;
-use ply_rs::ply::{
-    Encoding, Property, PropertyAccess, PropertyDef, PropertyType, ScalarType,
-};
+use ply_rs::ply::{Encoding, Property, PropertyAccess, PropertyDef, PropertyType, ScalarType};
 
 /// Vertices plus the axis-aligned bounding box computed during the scan.
 #[derive(Debug, Clone, Default)]
@@ -82,10 +73,9 @@ pub fn load_vertices(bytes: &[u8]) -> io::Result<LoadedParticles> {
     let parser = Parser::<Vertex>::new();
     let header = parser.read_header(&mut buf)?;
 
-    let vertex_def = header
-        .elements
-        .get("vertex")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PLY has no 'vertex' element"))?;
+    let vertex_def = header.elements.get("vertex").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PLY has no 'vertex' element")
+    })?;
     let count = vertex_def.count;
 
     let mut positions = Vec::with_capacity(count);

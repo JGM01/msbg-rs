@@ -1,12 +1,8 @@
-//! Particle placement and block bucketing.
+//! Particle placement and sparse block bucketing.
 //!
-//! Placement replicates the C++ `msbg_test_sparse` loop exactly: each instance
-//! `i` has an origin `0.2*sxyzMax + 0.6*sxyzMax*baseScale*(base[i]-bboxMin)`
-//! and scale `sxyzMin*factor`; each base point is placed as
-//! `origin + scale*baseScale*(base[j]-bboxMin)`, domain-checked, truncated, and
-//! assigned to its block. Bucketing is an O(n) counting sort into per-block
-//! contiguous position slices (no atomics, no per-block linked lists), then a
-//! CSR start-offset array for the splat.
+//! Placement uses the C++ demo's instance origins and scale.
+//! Particles outside the domain are discarded; the rest receive a center-block ID.
+//! Bucketing groups positions by block and builds compact start offsets.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -14,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::blockmap::{BlockMap, BlockSet};
 
-use super::{footprint_axis, DomainBounds, GridDims, SurfaceConfig};
+use super::{DomainBounds, GridDims, SurfaceConfig, footprint_axis};
 
 /// Center block id of a truncated in-domain position.
 #[inline(always)]
@@ -25,9 +21,8 @@ fn center_block(ipos: [i32; 3], dims: &GridDims, bsx_log2: u32) -> usize {
     bx + by * dims.nx + bz * dims.nxy
 }
 
-/// Place every instance's particles, assign each to its center block, and
-/// collect the footprint blocks inline (a single pass — the C++ path does the
-/// same with atomics; here the footprint list is sorted/deduped at the end).
+/// Place instance particles, assign center-block IDs, and collect footprint blocks.
+/// The returned footprint blocks are sorted and deduplicated.
 pub fn place(
     base: &[[f32; 3]],
     bbox_min: &[f32; 3],
@@ -166,11 +161,8 @@ pub struct BucketPlan {
 
 /// Sparse counting sort of block ids into a block-major permutation.
 ///
-/// Unlike the dense C++/first-cut approach (a `counts`/`block_start` array of
-/// size `n_blocks` — 68.7 GB each at 32,768³/block-16), the histogram is keyed
-/// by block id in an open-addressed `BlockMap`, so cost scales with *occupied*
-/// blocks (~25M at paper scale, not 8.59B). The parallel scatter uses a
-/// dense-by-rank `AtomicU32` cursor — rank ≤ occupied blocks, ~100 MB.
+/// A sparse histogram stores counts by occupied block ID.
+/// The parallel scatter uses one `AtomicU32` cursor per occupied-block rank.
 pub fn bucket_indices(bids: &[usize]) -> BucketPlan {
     let n = bids.len();
     if n == 0 {
@@ -241,7 +233,8 @@ pub fn bucket_indices(bids: &[usize]) -> BucketPlan {
     bids.par_iter().enumerate().for_each(|(i, &bid)| {
         let rank = block_rank
             .get(bid)
-            .unwrap_or_else(|| panic!("block {bid} missing from the histogram")) as usize;
+            .unwrap_or_else(|| panic!("block {bid} missing from the histogram"))
+            as usize;
         let off = cursors[rank].fetch_add(1, Ordering::Relaxed) as usize;
         // SAFETY: `starts[rank] + off` is a unique index per (rank, off);
         // ranges across ranks are disjoint, so no two writes alias.
@@ -268,9 +261,7 @@ pub fn bucket_indices(bids: &[usize]) -> BucketPlan {
     }
 }
 
-/// Sparse counting sort of `(positions, bids)` into block-major order (the
-/// step-9 surface-reconstruction path). Gathers positions through the
-/// [`bucket_indices`] permutation.
+/// Group positions by block through the [`bucket_indices`] permutation.
 pub fn bucket_by_block(positions: Vec<[f32; 3]>, bids: Vec<usize>) -> Bucketed {
     let n = positions.len();
     debug_assert_eq!(n, bids.len());
@@ -309,9 +300,21 @@ mod tests {
     // A single instance: all base points land in-domain, same count out.
     #[test]
     fn place_01_single_instance_counts() {
-        let base = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.5], [0.25, 0.25, 0.75]];
+        let base = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 1.0, 0.5],
+            [0.25, 0.25, 0.75],
+        ];
         let d = dims(64);
-        let p = place(&base, &[0.0, 0.0, 0.0], 1.0, &d, &DomainBounds::new(&d), &cfg(1, 0.5));
+        let p = place(
+            &base,
+            &[0.0, 0.0, 0.0],
+            1.0,
+            &d,
+            &DomainBounds::new(&d),
+            &cfg(1, 0.5),
+        );
         assert_eq!(p.positions.len(), base.len());
         assert_eq!(p.bids.len(), base.len());
     }
@@ -323,7 +326,14 @@ mod tests {
         // Instance origin near 0.2*64=12.8; a base point pushed past 64 drops.
         let base = [[0.0, 0.0, 0.0], [0.999, 0.0, 0.0]];
         let d = dims(64);
-        let p = place(&base, &[0.0, 0.0, 0.0], 1.0, &d, &DomainBounds::new(&d), &cfg(1, 100.0));
+        let p = place(
+            &base,
+            &[0.0, 0.0, 0.0],
+            1.0,
+            &d,
+            &DomainBounds::new(&d),
+            &cfg(1, 100.0),
+        );
         // scale = 64*100 = 6400 voxels: the instance spans far beyond the grid.
         assert!(p.positions.len() < base.len());
     }
@@ -334,7 +344,14 @@ mod tests {
     fn place_03_zero_span_does_not_panic() {
         let base = [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]];
         let d = dims(64);
-        let p = place(&base, &[1.0, 2.0, 3.0], 0.0, &d, &DomainBounds::new(&d), &cfg(1, 0.5));
+        let p = place(
+            &base,
+            &[1.0, 2.0, 3.0],
+            0.0,
+            &d,
+            &DomainBounds::new(&d),
+            &cfg(1, 0.5),
+        );
         // span_max = 0 -> base_scale = inf -> positions are inf; domain check
         // rejects them all. Callers guard span before calling.
         let _ = p;
@@ -345,7 +362,14 @@ mod tests {
     fn place_04_zero_instances_means_all() {
         let base = [[0.0, 0.0, 0.0]];
         let d = dims(64);
-        let p = place(&base, &[0.0, 0.0, 0.0], 1.0, &d, &DomainBounds::new(&d), &cfg(0, 0.5));
+        let p = place(
+            &base,
+            &[0.0, 0.0, 0.0],
+            1.0,
+            &d,
+            &DomainBounds::new(&d),
+            &cfg(0, 0.5),
+        );
         assert_eq!(p.positions.len(), 1);
     }
 
@@ -413,7 +437,11 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(b.particle_blocks, expected);
-        let idx = b.particle_blocks.iter().position(|&k| k == u32::MAX as usize).unwrap();
+        let idx = b
+            .particle_blocks
+            .iter()
+            .position(|&k| k == u32::MAX as usize)
+            .unwrap();
         assert_eq!(b.starts[idx + 1] - b.starts[idx], 2);
     }
 
@@ -431,11 +459,16 @@ mod tests {
             let positions: Vec<[f32; 3]> = (0..n)
                 .map(|i| [i as f32, (i % 7) as f32, (i % 13) as f32])
                 .collect();
-            let bids: Vec<usize> = (0..n).map(|_| (next(&mut rng) as usize) % n_blocks).collect();
+            let bids: Vec<usize> = (0..n)
+                .map(|_| (next(&mut rng) as usize) % n_blocks)
+                .collect();
             let dense = bucket_by_block_dense(positions.clone(), bids.clone(), n_blocks);
             let sparse = bucket_by_block(positions.clone(), bids.clone());
 
-            assert_eq!(sparse.particle_blocks, dense.1, "particle_blocks differ at n={n}");
+            assert_eq!(
+                sparse.particle_blocks, dense.1,
+                "particle_blocks differ at n={n}"
+            );
             assert_eq!(sparse.starts, dense.2, "starts differ at n={n}");
 
             for (i, &bid) in sparse.particle_blocks.iter().enumerate() {
@@ -450,7 +483,7 @@ mod tests {
         }
     }
 
-    /// Dense counting sort (the pre-step-12 implementation), kept test-only as
+    /// Dense counting sort, kept test-only as
     /// the equivalence oracle. Returns `(ordered, particle_blocks, compact_starts)`.
     fn bucket_by_block_dense(
         positions: Vec<[f32; 3]>,

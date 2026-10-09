@@ -1,27 +1,24 @@
-//! Paper-scale "bunny-of-bunnies" showcase: reconstruct the testCase-1/2
-//! density field through the `msbg_rs` public API (with per-phase throughput +
-//! peak-RSS reporting), then render a perspective raymarch + downsampled
-//! orthogonal slices to PNG — all in one process, so the image is written
-//! "during" the run rather than a second reconstruction.
+//! Large bunny reconstruction with phase timings and Linux peak-RSS reporting.
+//! Render a perspective image and downsampled slices from the same field.
 //!
 //! Usage:
 //!   bunny_of_bunnies <ply> <sx> <sy> <sz> <nInst(0=auto)> <scale_factor> \
 //!                    <out_dir> [render_w=1920] [render_h=1080] [bsx=16|32]
 //!
-//! AWS paper run (testCase 2, ~1.29B particles, ~100B active voxels at 32,768³):
+//! Large EC2 configuration (requires hundreds of gigabytes):
 //!   cargo run -p msbg-render --release --example bunny_of_bunnies -- \
 //!       ../MSBG/data/bun_zipper.ply 32768 32768 32768 35947 0.005 \
-//!       out_msbg_aws 3840 2160 16
+//!       out_msbg_aws 3840 2160 32
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use image::Rgba;
-use msbg_render::{raymarch, turbo, Camera, RenderOptions};
+use msbg_render::{Camera, RenderOptions, raymarch, turbo};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::{Density, Vec3};
 use msbg_rs::math::{BoundaryCondition, GridAlignment, Interpolation, Sampler};
-use msbg_rs::particles::{finalize, sort, splat, DomainBounds, GridDims, SurfaceConfig};
+use msbg_rs::particles::{DomainBounds, GridDims, SurfaceConfig, finalize, sort, splat};
 use msbg_rs::solver::{Fence, PdeParams, Stencil, Sweeper};
 use msbg_rs::sparse_grid::SparseGrid;
 use rayon::prelude::*;
@@ -48,7 +45,10 @@ fn peak_rss_mib() -> f64 {
 fn report(name: &str, n_units: u64, dur: std::time::Duration) {
     let ms = dur.as_secs_f64() * 1000.0;
     let rate = n_units as f64 / dur.as_secs_f64();
-    println!("[Rust] {name}: {ms:.3} ms ({rate:.3} /s, rss={:.1} MiB)", peak_rss_mib());
+    println!(
+        "[Rust] {name}: {ms:.3} ms ({rate:.3} /s, rss={:.1} MiB)",
+        peak_rss_mib()
+    );
 }
 
 /// Whole-domain downsampled Z-slice: sample `out_w × out_h` pixels across the
@@ -90,8 +90,28 @@ fn main() {
     let bsx = arg::<usize>(10, Some(16));
 
     match bsx {
-        16 => run::<16, 4096, 18, 24>(ply_path, sx, sy, sz, n_inst, scale_factor, out_dir, render_w, render_h),
-        32 => run::<32, 32768, 34, 40>(ply_path, sx, sy, sz, n_inst, scale_factor, out_dir, render_w, render_h),
+        16 => run::<16, 4096, 18, 24>(
+            ply_path,
+            sx,
+            sy,
+            sz,
+            n_inst,
+            scale_factor,
+            out_dir,
+            render_w,
+            render_h,
+        ),
+        32 => run::<32, 32768, 34, 40>(
+            ply_path,
+            sx,
+            sy,
+            sz,
+            n_inst,
+            scale_factor,
+            out_dir,
+            render_w,
+            render_h,
+        ),
         other => panic!("unsupported bsx {other} (16 or 32)"),
     }
 }
@@ -163,7 +183,10 @@ fn run<const BSX: usize, const N: usize, const HSX: usize, const MSX: usize>(
             // constant — a tiny pool would panic on allocation.
             let blocks_per_seg = 4096; // 64 MB segments (C++ standard)
             let max_segments = active.len() / blocks_per_seg + 2;
-            let grid_pool = Arc::new(BlockPool::<Density, BSX, N>::new(max_segments, blocks_per_seg));
+            let grid_pool = Arc::new(BlockPool::<Density, BSX, N>::new(
+                max_segments,
+                blocks_per_seg,
+            ));
             let mut grid = SparseGrid::new(
                 "bunny_of_bunnies".into(),
                 sx,
@@ -198,11 +221,19 @@ fn run<const BSX: usize, const N: usize, const HSX: usize, const MSX: usize>(
         // ---- Mean-curvature smoothing --------------------------------------
         {
             let t = Instant::now();
-            let sweeper = Sweeper::<Density, BSX, N, HSX>::new(&grid, rayon::current_num_threads(), Fence::Sfence);
+            let sweeper = Sweeper::<Density, BSX, N, HSX>::new(
+                &grid,
+                rayon::current_num_threads(),
+                Fence::Sfence,
+            );
             sweeper.sweep(
                 &active,
                 Stencil::MeanCurvature,
-                &PdeParams { dt: 0.05, iterations: 6, do_constr_zero_one: true },
+                &PdeParams {
+                    dt: 0.05,
+                    iterations: 6,
+                    do_constr_zero_one: true,
+                },
             );
             // unknowns = active_voxels × iterations, the paper's headline unit.
             let unknowns = active.len() as u64 * N as u64 * 6;
@@ -217,7 +248,8 @@ fn run<const BSX: usize, const N: usize, const HSX: usize, const MSX: usize>(
             // Big-bunny world AABB: the instance origins trace the bunny shape
             // (`origin = 0.2*sxyz + 0.6*sxyz*base_scale*(bi - bbox_min)`).
             let base_scale = 1.0 / span_max;
-            let wmap = |f: f32, k: usize| 0.2 * sxyz + 0.6 * sxyz * base_scale * (f - loaded.bbox_min[k]);
+            let wmap =
+                |f: f32, k: usize| 0.2 * sxyz + 0.6 * sxyz * base_scale * (f - loaded.bbox_min[k]);
             let center = Vec3::new(
                 wmap((loaded.bbox_min[0] + loaded.bbox_max[0]) * 0.5, 0),
                 wmap((loaded.bbox_min[1] + loaded.bbox_max[1]) * 0.5, 1),
@@ -266,7 +298,11 @@ fn run<const BSX: usize, const N: usize, const HSX: usize, const MSX: usize>(
             slice_z_downsampled::<BSX, N>(&grid, slice_w, slice_h)
                 .save(format!("{out_dir}/slice_z.png"))
                 .expect("save slice");
-            report("render", (2 * render_w * render_h + 2 * slice_w * slice_h) as u64, t.elapsed());
+            report(
+                "render",
+                (2 * render_w * render_h + 2 * slice_w * slice_h) as u64,
+                t.elapsed(),
+            );
         }
 
         println!("done: images in {out_dir}");

@@ -1,5 +1,5 @@
 use msbg_rs::{
-    blockpool::{Block, BlockPool},
+    blockpool::BlockPool,
     channel::Density,
     math::boundary::BoundaryCondition,
     multires::halo::HaloBlockPool,
@@ -28,7 +28,7 @@ fn gyroid(x: f32, y: f32, z: f32, freq: f32) -> f32 {
 fn main() {
     let threads = rayon::current_num_threads();
     println!("============================================================");
-    println!(" msbg-rs 16-Bit Scale Stress Benchmark (M3 Pro 36GB)");
+    println!(" msbg-rs 16-Bit Scale Stress Benchmark");
     println!(" Threads: {}", threads);
     println!(
         " Virtual Resolution: {0}x{0}x{0} ({1:.2} Billion Virtual Voxels)",
@@ -37,7 +37,7 @@ fn main() {
     );
     println!("============================================================\n");
 
-    // 1. Domain Allocation (Now using 16-bit Density)
+    // Allocate the 16-bit density field.
     println!("[1/4] Allocating 16-Bit Sparse Grid & Materializing Surface...");
     let start_setup = Instant::now();
     let blocks_per_seg = 4096;
@@ -48,7 +48,7 @@ fn main() {
     ));
 
     let mut grid = SparseGrid::new(
-        "hero_grid".to_string(),
+        "gyroid".to_string(),
         DOMAIN_VOXELS,
         DOMAIN_VOXELS,
         DOMAIN_VOXELS,
@@ -108,11 +108,11 @@ fn main() {
     let n_active = candidate_blocks.len();
     let total_active_voxels = n_active * N;
 
-    // RAM calc: Grid (u16) + Output (u16) + Flags (u16)
-    let bytes_per_active = std::mem::size_of::<Block<Density, BSX, N>>() * 2
-        + std::mem::size_of::<Block<u16, BSX, N>>();
-    let active_gb = (n_active * bytes_per_active) as f64 / 1e9;
-    let dense_equivalent_gb = ((DOMAIN_VOXELS as f64).powi(3) * 4.0) / 1e9;
+    // Compare scalar payloads at equal precision. This benchmark allocates
+    // one density field; maps, pool capacity and scratch are additional costs.
+    let scalar_bytes = std::mem::size_of::<Density>() as f64;
+    let active_payload_gb = total_active_voxels as f64 * scalar_bytes / 1e9;
+    let dense_payload_gb = (DOMAIN_VOXELS as f64).powi(3) * scalar_bytes / 1e9;
 
     println!(
         "      Active Blocks:        {} ({:.2} Billion active voxels)",
@@ -120,9 +120,10 @@ fn main() {
         total_active_voxels as f64 / 1e9
     );
     println!(
-        "      Active Grid Memory:   {:.2} GB (Dense Equivalent: {:.1} GB)",
-        active_gb, dense_equivalent_gb
+        "      Scalar Payload:       {:.2} GB (same-precision dense: {:.1} GB)",
+        active_payload_gb, dense_payload_gb
     );
+    println!("      Payload estimate excludes maps, pool capacity, scratch, and process overhead.");
     println!("      Setup Time:           {:.2?}", start_setup.elapsed());
 
     // 2. Prepare Working Buffers
@@ -136,7 +137,7 @@ fn main() {
     for _ in 0..gather_iters {
         candidate_blocks.par_iter().for_each(|&bid| {
             let halo = unsafe { halo_pool.get_mut() };
-            // Automatically dequantizes Density(u16) to f32 inside the L1 cache!
+            // Convert stored density to f32 in the halo buffer.
             halo.fill::<1, true, Density, N>(&grid, bid, BoundaryCondition::Neumann);
             black_box(halo.data.as_ref());
         });
@@ -152,7 +153,11 @@ fn main() {
     println!("\n[4/4] Benchmarking 19-tap Mean Curvature PDE Solve...");
     let active: Vec<usize> = candidate_blocks.clone();
     let sweeper = Sweeper::<Density, BSX, N, HSX>::new(&grid, threads, Fence::Sfence);
-    let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
+    let params = PdeParams {
+        dt: 0.025,
+        iterations: 1,
+        do_constr_zero_one: false,
+    };
     let pde_iters = 3;
     let start_pde = Instant::now();
     for _ in 0..pde_iters {
@@ -167,16 +172,16 @@ fn main() {
     );
 
     println!("\n============================================================");
-    println!(" RESUME METRIC SUMMARY (16-BIT)");
+    println!(" WORKLOAD SUMMARY (16-BIT)");
     println!(" - Scaled to a 4096^3 virtual domain (68.7B virtual voxels)");
     println!(
-        " - Simulated {:.2}B active voxels in {:.1} GB RAM (Dense eq: {:.0} GB)",
+        " - Smoothed {:.2}B active voxels; {:.1} GB scalar payload (dense: {:.0} GB)",
         total_active_voxels as f64 / 1e9,
-        active_gb,
-        dense_equivalent_gb
+        active_payload_gb,
+        dense_payload_gb
     );
     println!(
-        " - Peak PDE Solver Throughput: {:.2} Gvoxels/sec (~{:.0} ms / full pass)",
+        " - Mean PDE Sweep Throughput: {:.2} Gvoxels/sec (~{:.0} ms / full pass)",
         pde_gvoxels,
         pde_duration.as_secs_f64() * 1000.0
     );

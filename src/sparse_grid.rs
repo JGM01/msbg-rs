@@ -3,9 +3,11 @@ use std::{ptr::NonNull, sync::Arc};
 use crate::blockmap::BlockMap;
 use crate::blockpool::{Block, BlockPool};
 
-/// Thread-safe wrapper.
-/// Sharing these pointers across threads is safe because
-/// BlockPool + general architecture handle the synchronization.
+/// Wrapper for a grid-owned block pointer.
+///
+/// The pointer does not synchronize access to its payload. Parallel kernels
+/// must establish exclusive writes and prevent reads of concurrently written
+/// values through their scheduling and ownership rules.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct BlockPtr<D: Copy + Default + Send + Sync, const BSX: usize, const N: usize>(
@@ -79,10 +81,8 @@ where
     pub nxy: usize,
     pub n_blocks: usize,
 
-    /// Sparse block-id → block map. Cost scales with *active* blocks, not the
-    /// virtual block count (at 32,768³/block-16 a dense map is 68.7 GB; this
-    /// open-addressed map is ~0.4 GB). Absent = empty; the full dummy is stored
-    /// as a real entry; the empty dummy is not stored at all.
+    /// Sparse map from block ID to payload pointer.
+    /// Absent keys are empty. Full blocks store the shared full-dummy pointer.
     blockmap: BlockMap<BlockPtr<D, BSX, N>>,
 
     /// Memory pool for spatial regions.
@@ -323,13 +323,9 @@ where
         self.blockmap.insert(bid, new_block);
     }
 
-    /// Allocate + zero `bids` in parallel, then insert the pointers into the
-    /// blockmap. The serial `ensure_block` loop spends its wall-clock on
-    /// first-touch page faults + zeroing (the dominant cost when materializing a
-    /// ~215 GB density field); this spreads that across all rayon threads. The
-    /// blockmap insert — the only `&mut self` part — is deferred to a fast
-    /// serial pass. `bids` must be unique (the active block list is sorted and
-    /// deduplicated); a duplicate would race on `get` and leak a block.
+    /// Allocate and initialize `bids` in parallel, then insert their pointers.
+    /// Initialization spreads first-touch page faults across Rayon workers.
+    /// `bids` must contain unique block IDs.
     pub fn ensure_blocks_parallel(&mut self, bids: &[usize]) {
         use rayon::prelude::*;
         let full = self.full_block;

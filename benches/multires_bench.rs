@@ -1,9 +1,8 @@
-//! Step-7 multires benchmarks: refinement-map setup, multires halo gather, and
-//! downsampling. Mirrors the C++ `benchmark.cpp` "multires" scenario (real
-//! library calls on both sides, no mocks).
+//! Multiresolution benchmarks: refinement setup, halo gathering, and downsampling.
+//! See docs/benchmarks.md for C++ harness availability.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use msbg_rs::multires::halo::{fill_multires, HaloBlockPool};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use msbg_rs::multires::halo::{HaloBlockPool, fill_multires};
 use msbg_rs::multires::{Level, LevelData, MultiresGrid, RefinementMap};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{env, hint::black_box, sync::Arc};
@@ -161,7 +160,11 @@ fn bench_multires_halo(c: &mut Criterion) {
                     active.par_iter().for_each(|&bid| {
                         let halo = unsafe { pool.get_mut() };
                         fill_multires::<BSX, N, HSX, 1, true, 8, 512>(
-                            halo, fine, coarse, &levels, bid,
+                            halo,
+                            fine,
+                            coarse,
+                            &levels,
+                            bid,
                             msbg_rs::math::BoundaryCondition::Neumann,
                         );
                         black_box(&halo.data);
@@ -188,7 +191,8 @@ fn bench_multires_downsample(c: &mut Criterion) {
             let mut scratch = LevelData::<8, 512>::new(coarse_sx, coarse_sy, coarse_sz);
             b.iter(|| {
                 msbg_rs::multires::downsample::downsample_channel_avg::<16, 4096, 8, 512>(
-                    &mut scratch, fine,
+                    &mut scratch,
+                    fine,
                 );
                 black_box(&scratch);
             });

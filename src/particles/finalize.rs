@@ -82,7 +82,15 @@ mod tests {
 
     fn setup(sx: usize, sy: usize, sz: usize) -> SparseGrid<Density, BSX, N> {
         let pool = Arc::new(BlockPool::<Density, BSX, N>::new(64, 64));
-        SparseGrid::new("finalize".into(), sx, sy, sz, Density(0), Density(u16::MAX), pool)
+        SparseGrid::new(
+            "finalize".into(),
+            sx,
+            sy,
+            sz,
+            Density(0),
+            Density(u16::MAX),
+            pool,
+        )
     }
 
     fn cfg() -> SurfaceConfig {
@@ -110,7 +118,12 @@ mod tests {
         let mut grid = setup(32, 32, 32);
         grid.set_voxel(8, 8, 8, Density(0)); // center (distSq ratio 0)
         let r = 16.0f32; // distSqMax
-        grid.set_voxel(6, 8, 8, Density(((2.5f32 * 2.5) / r * 65535.0).round() as u16)); // dx=2.5
+        grid.set_voxel(
+            6,
+            8,
+            8,
+            Density(((2.5f32 * 2.5) / r * 65535.0).round() as u16),
+        ); // dx=2.5
         grid.set_voxel(4, 8, 8, Density(65468)); // ratio ~0.99898, just touched
         let active = vec![0usize];
         finalize(&grid, &active, &cfg());
@@ -123,7 +136,12 @@ mod tests {
         // Ratio just below 0.999: f = 1 - sqrt(ratio*16)/6 ~ 1/3.
         let ratio = 65468.0f32 / 65535.0;
         let want = 1.0 - (ratio * r).sqrt() / 6.0;
-        assert!((get(&grid, 4, 8, 8) - want).abs() < 1e-4, "got {} want {}", get(&grid, 4, 8, 8), want);
+        assert!(
+            (get(&grid, 4, 8, 8) - want).abs() < 1e-4,
+            "got {} want {}",
+            get(&grid, 4, 8, 8),
+            want
+        );
     }
 
     // Untouched voxels (stored u16::MAX) -> 0.

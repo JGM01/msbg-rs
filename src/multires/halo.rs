@@ -1,4 +1,4 @@
-use crate::math::boundary::{resolve_axis, BoundaryCondition};
+use crate::math::boundary::{BoundaryCondition, resolve_axis};
 use crate::math::gather::Dequant;
 use crate::multires::level::LevelData;
 use crate::sparse_grid::SparseGrid;
@@ -19,14 +19,11 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
         }
     }
 
-    /// Fill the halo from block `bid` of `grid`, dequantizing each element to
-    /// `f32`.
-    ///
-    /// `HALO` is the halo width in voxels on each face (1 for the 7/19-tap
-    /// stencils, 2 for the 25-tap bi-Laplacian). `FULL = true` fills the whole
-    /// `HSX^3` cube (faces + edges + corners); `FULL = false` fills the center
-    /// plus the six faces only (enough for the 7-point Laplacian) and leaves
-    /// the edges/corners zero.
+    /// Fill a block and its halo, converting stored values to `f32`.
+    /// `HALO` is 1 for the 7/19-tap stencils and 2 for the 25-tap stencil.
+    /// `HSX` must equal `BSX + 2 * HALO`.
+    /// `FULL = true` fills faces, edges, and corners.
+    /// `FULL = false` fills only the center and faces.
     #[inline]
     pub fn fill<const HALO: usize, const FULL: bool, D, const N: usize>(
         &mut self,
@@ -79,7 +76,7 @@ impl<const BSX: usize, const HSX: usize> HaloBlock<BSX, HSX> {
             }
         }
 
-    let dst = self.data.as_mut_ptr();
+        let dst = self.data.as_mut_ptr();
         let dy_stride = HSX;
         let dz_stride = HSX * HSX;
 
@@ -176,13 +173,10 @@ impl<const BSX: usize, const HSX: usize> Default for HaloBlock<BSX, HSX> {
     }
 }
 
-/// Fill the halo for a block in a *multires* grid: neighbors at the same level
-/// are read from `fine`, neighbors at a coarser level (per `levels`) are ghost
-/// sampled from `coarse` (fine coordinate `>> 1`), matching the C++
-/// `OPT_BC_COARSE_LEVEL` path of `getOutOfBlockValue` (`halo.h`).
-///
-/// The center block is always fine, so the contiguous middle copy is unchanged;
-/// only the halo border reads may hit a coarse neighbor.
+/// Fill a multiresolution halo.
+/// Read the center and same-level neighbors from `fine`.
+/// For coarser neighbors, sample `coarse` at fine coordinates shifted right by one.
+/// `levels` identifies each neighbor's resolution.
 #[inline]
 pub fn fill_multires<
     const BSX: usize,
@@ -380,10 +374,9 @@ impl<const BSX: usize, const HSX: usize> HaloBlockPool<BSX, HSX> {
     ///
     /// # Safety
     ///
-    /// Must only be called from inside a Rayon parallel context whose worker
-    /// count matches (or is at most) the pool size: each slot is owned by
-    /// exactly one worker. `current_thread_index` is scoped to whichever rayon
-    /// pool is currently executing, so the pool must be sized for that pool.
+    /// Call within one Rayon pool with at most `self.slots.len()` workers.
+    /// Each worker index must have exclusive access to its slot.
+    /// Do not retain a buffer across nested calls or share this pool between active Rayon pools.
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut(&self) -> &mut HaloBlock<BSX, HSX> {
@@ -444,7 +437,10 @@ mod halo_tests {
         for z in 0..BSX {
             for y in 0..BSX {
                 for x in 0..BSX {
-                    assert_eq!(halo_at(&halo, x + 1, y + 1, z + 1), (x + y * 16 + z * 256) as f32);
+                    assert_eq!(
+                        halo_at(&halo, x + 1, y + 1, z + 1),
+                        (x + y * 16 + z * 256) as f32
+                    );
                 }
             }
         }
@@ -628,13 +624,20 @@ mod halo_tests {
         let pool = Arc::new(BlockPool::<Density, BSX, N>::new(64, 64));
         let mut grid = SparseGrid::new(
             "dens".to_string(),
-            32, 16, 16,
+            32,
+            16,
+            16,
             Density(0),
             Density(u16::MAX),
             pool,
         );
         for x in 0..32 {
-            grid.set_voxel(x, 0, 0, Density(((x as f32 / 31.0) * u16::MAX as f32).round() as u16));
+            grid.set_voxel(
+                x,
+                0,
+                0,
+                Density(((x as f32 / 31.0) * u16::MAX as f32).round() as u16),
+            );
         }
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
@@ -709,9 +712,7 @@ mod halo_tests {
         let levels = [0u8, 1]; // block 0 fine, block 1 coarse
 
         let mut halo = HaloBlock::<BSX, HSX>::new();
-        fill_multires::<BSX, N, HSX, 1, true, 8, 512>(
-            &mut halo, fine, coarse, &levels, 0, NEUMANN,
-        );
+        fill_multires::<BSX, N, HSX, 1, true, 8, 512>(&mut halo, fine, coarse, &levels, 0, NEUMANN);
 
         // Right halo (halo x=17 -> global x=16) reads coarse (8,0,0) = 5.0.
         assert_eq!(halo_at(&halo, 17, 1, 1), 5.0);

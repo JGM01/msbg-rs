@@ -1,17 +1,15 @@
-//! Differential test for the step-6 stencil kernels against the C++ baseline
-//! (`../MSBG/meancurvtest.cpp`). Both sides smooth the same polynomial field
-//! once (Laplacian `laplTyp=1`, mean-curvature `laplTyp=4`, bi-Laplacian
-//! `laplTyp=2`) and the interior block is compared within 1e-4 tolerance
-//! (f32 + FMA -> not bit-exact).
+//! Stencil comparison with C++ golden samples.
+//! Apply one Laplacian, mean-curvature, or bi-Laplacian update to a polynomial field.
+//! Compare the interior block with tolerance 1e-4.
 
 use msbg_rs::{
     blockpool::{Block, BlockPool},
+    math::BoundaryCondition,
     math::bilaplacian::kernel_bilaplacian,
     math::laplacian::kernel_laplacian,
     math::meancurv::kernel_meancurv,
     math::simd::LANES,
     math::stencil::SimdRng,
-    math::BoundaryCondition,
     multires::halo::HaloBlock,
     sparse_grid::SparseGrid,
 };
@@ -91,11 +89,20 @@ const SAMPLE_IDX: [usize; 10] = [0, 1, 2, 3, 15, 16, 255, 256, 272, 4095];
 // Golden sample values produced by ../MSBG/build/meancurvtest.
 const GOLDEN: [[f32; 10]; 3] = [
     // laplTyp 1
-    [16.8713436, 14.9309492, 13.6057587, 12.7378674, 13.8075304, 14.7801056, 12.8503265, 14.709692, 12.6189442, 10.6895962],
+    [
+        16.8713436, 14.9309492, 13.6057587, 12.7378674, 13.8075304, 14.7801056, 12.8503265,
+        14.709692, 12.6189442, 10.6895962,
+    ],
     // laplTyp 4
-    [16.7841225, 14.8576059, 13.5410128, 12.6785774, 13.7376575, 14.7077026, 12.7913237, 14.6377525, 12.5615482, 10.6455212],
+    [
+        16.7841225, 14.8576059, 13.5410128, 12.6785774, 13.7376575, 14.7077026, 12.7913237,
+        14.6377525, 12.5615482, 10.6455212,
+    ],
     // laplTyp 2
-    [16.7649345, 14.840188, 13.5253305, 12.664402, 13.7202902, 14.6902142, 12.7754869, 14.6202278, 12.5455322, 10.6308451],
+    [
+        16.7649345, 14.840188, 13.5253305, 12.664402, 13.7202902, 14.6902142, 12.7754869,
+        14.6202278, 12.5455322, 10.6308451,
+    ],
 ];
 
 fn assert_close(got: &[f32], want: &[f32], tag: &str) {
@@ -154,11 +161,20 @@ fn stencil_against_cpp_binary_if_available() {
     let mut i = 0;
     for lapl_typ in [1u8, 4, 2] {
         // Header line is the laplTyp itself.
-        assert_eq!(lines[i].trim(), lapl_typ.to_string(), "expected header {lapl_typ}");
+        assert_eq!(
+            lines[i].trim(),
+            lapl_typ.to_string(),
+            "expected header {lapl_typ}"
+        );
         i += 1;
         let mut want = Vec::with_capacity(N);
         for _ in 0..N {
-            want.push(lines[i].trim().parse::<f32>().expect("bad float in C++ output"));
+            want.push(
+                lines[i]
+                    .trim()
+                    .parse::<f32>()
+                    .expect("bad float in C++ output"),
+            );
             i += 1;
         }
         let got = run_kernel(&grid, lapl_typ);

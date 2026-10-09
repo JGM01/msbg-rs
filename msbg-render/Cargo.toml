@@ -2,6 +2,8 @@
 name = "msbg-render"
 version = "0.1.0"
 edition = "2024"
+description = "Offline slices and sparse isosurface raymarching for msbg-rs"
+repository = "https://github.com/JGM01/msbg-rs"
 
 [dependencies]
 msbg-rs = { path = ".." }

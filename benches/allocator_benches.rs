@@ -105,7 +105,9 @@ fn machine() -> Machine {
         Some("macbook") => Machine::Macbook,
         Some("windows") => Machine::Windows,
         Some("aws") => Machine::Aws,
-        Some(other) => panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows|aws)"),
+        Some(other) => {
+            panic!("unknown MSBG_BENCH_MACHINE '{other}' (use dell|macbook|windows|aws)")
+        }
         None => {
             if cfg!(target_os = "macos") {
                 Machine::Macbook
@@ -129,7 +131,10 @@ enum Size {
 }
 
 fn size() -> Size {
-    let raw = cli().scale.clone().or_else(|| env::var("MSBG_BENCH_SCALE").ok());
+    let raw = cli()
+        .scale
+        .clone()
+        .or_else(|| env::var("MSBG_BENCH_SCALE").ok());
     match raw.as_deref() {
         Some("small") => Size::Small,
         Some("big") | Some("full") => Size::Big,
@@ -256,7 +261,7 @@ fn generate_active_blocks(nx: usize, ny: usize, nz: usize) -> Vec<usize> {
 
 /// Build a sparse grid sized so the shell yields roughly `active_target`
 /// active blocks. Active blocks are materialized and pre-filled with a fixed
-/// value so gather reads are deterministic (no denormal garbage).
+/// value so gather reads are deterministic (no uninitialized values).
 fn build_sparse_grid(active_target: usize) -> (Arc<SparseGrid<f32, BSX, N>>, Vec<usize>) {
     let full = (active_target as f64 / SHELL_OCCUPANCY).cbrt().ceil() as usize;
     let bpd = full.max(8);
@@ -404,14 +409,16 @@ fn bench_laplacian_compute_only(c: &mut Criterion) {
 
                 b.iter(|| {
                     thread_pool().install(|| {
-                        output_blocks
-                            .par_iter_mut()
-                            .for_each(|out_block| {
-                                let mut rng = SimdRng::<LANES>::seed(0);
-                                kernel_laplacian::<LANES, BSX, HSX, f32>(
-                                    &halo, dt, false, out_block.data.as_mut_ptr(), &mut rng,
-                                );
-                            });
+                        output_blocks.par_iter_mut().for_each(|out_block| {
+                            let mut rng = SimdRng::<LANES>::seed(0);
+                            kernel_laplacian::<LANES, BSX, HSX, f32>(
+                                &halo,
+                                dt,
+                                false,
+                                out_block.data.as_mut_ptr(),
+                                &mut rng,
+                            );
+                        });
                     });
                     black_box(&mut output_blocks);
                 });
@@ -442,14 +449,16 @@ fn bench_mean_curvature_compute_only(c: &mut Criterion) {
 
                 b.iter(|| {
                     thread_pool().install(|| {
-                        output_blocks
-                            .par_iter_mut()
-                            .for_each(|out_block| {
-                                let mut rng = SimdRng::<LANES>::seed(0);
-                                kernel_meancurv::<LANES, BSX, HSX, f32>(
-                                    &halo, dt, false, out_block.data.as_mut_ptr(), &mut rng,
-                                );
-                            });
+                        output_blocks.par_iter_mut().for_each(|out_block| {
+                            let mut rng = SimdRng::<LANES>::seed(0);
+                            kernel_meancurv::<LANES, BSX, HSX, f32>(
+                                &halo,
+                                dt,
+                                false,
+                                out_block.data.as_mut_ptr(),
+                                &mut rng,
+                            );
+                        });
                     });
                     black_box(&mut output_blocks);
                 });
@@ -529,19 +538,19 @@ fn bench_laplacian_smoothing_e2e(c: &mut Criterion) {
                 Stencil::MeanCurvature => "mean_curvature",
                 Stencil::BiLaplacian => unreachable!(),
             };
-            let params = PdeParams { dt: 0.025, iterations: num_iter, do_constr_zero_one: false };
-            group.bench_with_input(
-                BenchmarkId::new(name, target),
-                &active,
-                |b, active| {
-                    b.iter(|| {
-                        thread_pool().install(|| {
-                            sweeper.sweep(active, stencil, &params);
-                        });
-                        black_box(&grid);
+            let params = PdeParams {
+                dt: 0.025,
+                iterations: num_iter,
+                do_constr_zero_one: false,
+            };
+            group.bench_with_input(BenchmarkId::new(name, target), &active, |b, active| {
+                b.iter(|| {
+                    thread_pool().install(|| {
+                        sweeper.sweep(active, stencil, &params);
                     });
-                },
-            );
+                    black_box(&grid);
+                });
+            });
         }
     }
     group.finish();
@@ -561,7 +570,11 @@ fn bench_smoothing_fence(c: &mut Criterion) {
     let (grid, active_usize) = build_sparse_grid(target);
     let active: Vec<usize> = active_usize.clone();
     let num_threads = rayon::current_num_threads();
-    let params = PdeParams { dt: 0.025, iterations: 1, do_constr_zero_one: false };
+    let params = PdeParams {
+        dt: 0.025,
+        iterations: 1,
+        do_constr_zero_one: false,
+    };
 
     for fence in [Fence::Sfence, Fence::Mfence, Fence::None] {
         let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&grid, num_threads, fence);
@@ -570,7 +583,8 @@ fn bench_smoothing_fence(c: &mut Criterion) {
             &active,
             |b, active| {
                 b.iter(|| {
-                    thread_pool().install(|| sweeper.sweep(active, Stencil::MeanCurvature, &params));
+                    thread_pool()
+                        .install(|| sweeper.sweep(active, Stencil::MeanCurvature, &params));
                     black_box(&grid);
                 });
             },

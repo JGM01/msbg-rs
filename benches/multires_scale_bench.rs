@@ -1,32 +1,14 @@
-//! Multires memory-bound scale-stress benchmark (M3 Pro 36 GB).
+//! Large multiresolution grid benchmark.
 //!
-//! Builds a real `MultiresGrid` whose fine-level density shell is sized to a
-//! target RAM budget (default ~28 GB), then times the three multires phases a
-//! large sparse volume actually exercises:
+//! Build a density shell for a target memory budget, then time refinement setup,
+//! halo gathering, and downsampling.
 //!
-//!   1. `set_refinement_map` — topology + cell flags + fine-coarse distances
-//!      (the "build" phase, materializes the per-block `cell_flags` channel).
-//!   2. multires halo gather (`fill_multires`) over every fine block — the
-//!      memory-bound inner loop a multires solver runs per block per sweep.
-//!   3. `downsample_channel_avg` — the fine→coarse restriction pass.
-//!
-//! Working-set sanity: at 28 GB the live set is ~700× the M3's total cache, so
-//! every pass is DRAM-streaming bound — this is the regime the paper's
-//! 100-billion-voxel result lives in, and where the small-scale (cache-resident)
-//! benches stop being predictive.
-//!
-//! Knobs:
-//!   MSBG_STRESS_GB        target density+flags working set (default 28)
-//!   MSBG_BENCH_SCALE=small  override the budget to 0.5 GB (validates on the
-//!                          Dell 5500U, which cannot host the full run)
-//!
-//! Note: this is the multires *data structure + memory-bound primitives* we
-//! have today, not the integrated multires solver (the `Sweeper` is
-//! single-level; see step 8). It characterizes the substrate that solver will
-//! sit on.
+//! Set `MSBG_STRESS_GB` to change the default 28 GB target.
+//! Set `MSBG_BENCH_SCALE=small` for a 0.5 GB target.
+//! These are workload estimates; actual process memory includes other allocations.
 
 use msbg_rs::math::boundary::BoundaryCondition;
-use msbg_rs::multires::halo::{fill_multires, HaloBlockPool};
+use msbg_rs::multires::halo::{HaloBlockPool, fill_multires};
 use msbg_rs::multires::{Level, LevelData, MultiresGrid, RefinementMap};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{env, hint::black_box, sync::Arc, time::Instant};
@@ -36,7 +18,7 @@ const N: usize = 4096;
 const HSX: usize = 18;
 const SHELL_OCCUPANCY: f64 = 0.14;
 
-// Per fine block, recalibrated for the step-11 SoA layout: one 32 KiB
+// Estimated storage per fine block: one 32 KiB
 // `LevelBlock` (density 16 KiB + cell_flags 8 KiB + dist_fine_coarse 8 KiB) +
 // the shared sparse blockmap (16 B/entry, amortized) + ring/coarse levels +
 // the sparse downsample scratch. Verified by the live RSS printout on each run
@@ -221,15 +203,17 @@ fn main() {
     let ds_gbs = (read_gb + write_gb) / per.as_secs_f64();
     println!(
         "      avg per pass: {:.2?} ({:.2} GB/s read+write, {:.2} GB read + {:.2} GB written)",
-        per,
-        ds_gbs,
-        read_gb,
-        write_gb
+        per, ds_gbs, read_gb, write_gb
     );
 
     println!("\n============================================================");
     println!(" SUMMARY");
-    println!("  domain: {}³ ({} blocks, {} fine)", sx, n_blocks, fine.len());
+    println!(
+        "  domain: {}³ ({} blocks, {} fine)",
+        sx,
+        n_blocks,
+        fine.len()
+    );
     println!("  final RSS: {:.2} GB", gb(rss_bytes() as f64));
     println!("  set_refinement_map: {refine_ms:.0} ms ({n_blocks} blocks)");
     println!("  multires halo: {halo_gvox:.2} Gvox/s ({halo_gbs:.2} GB/s)");

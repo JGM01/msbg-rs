@@ -1,15 +1,13 @@
-//! Active-block determination: the union of every placed particle's footprint
-//! block range, replicated exactly from the C++ `msbg_test_sparse` marking
-//! (`trunc(bpos ± rScan/bsx)` clipped to the block grid). Per-thread sparse
-//! sets are merged and sorted — no atomics (C++ uses one `InterlockedIncrement`
-//! per footprint block per particle into a dense `blockActive` array, which is
-//! 68.7 GB at 32,768³/block-16), and no per-particle `Vec`.
+//! Active blocks covered by particle footprints.
+//!
+//! The footprint uses `trunc(bpos ± rScan/bsx)`, clipped to the block grid.
+//! Workers collect sparse sets. The result is merged, sorted, and deduplicated.
 
 use rayon::prelude::*;
 
 use crate::blockmap::BlockSet;
 
-use super::{footprint_axis, GridDims, SurfaceConfig};
+use super::{GridDims, SurfaceConfig, footprint_axis};
 
 /// Union of all particles' footprint blocks, sorted and deduplicated.
 pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfig) -> Vec<usize> {
@@ -26,7 +24,8 @@ pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfi
                 for bz in z1..=z2 {
                     for by in y1..=y2 {
                         for bx in x1..=x2 {
-                            let bid = (bx as usize) + (by as usize) * dims.nx + (bz as usize) * chunk;
+                            let bid =
+                                (bx as usize) + (by as usize) * dims.nx + (bz as usize) * chunk;
                             local.insert(bid, ());
                         }
                     }
@@ -159,8 +158,14 @@ mod tests {
                 ]
             })
             .collect();
-        let single = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        let multi = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let multi = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
         let a1 = single.install(|| active_blocks(&positions, &d, &cfg()));
         let a8 = multi.install(|| active_blocks(&positions, &d, &cfg()));
         assert_eq!(a1, a8);
@@ -177,17 +182,26 @@ mod tests {
         };
         let d = dims(128);
         let positions: Vec<[f32; 3]> = (0..5000)
-            .map(|_| [
-                (next(&mut rng) % 128) as f32,
-                (next(&mut rng) % 128) as f32,
-                (next(&mut rng) % 128) as f32,
-            ])
+            .map(|_| {
+                [
+                    (next(&mut rng) % 128) as f32,
+                    (next(&mut rng) % 128) as f32,
+                    (next(&mut rng) % 128) as f32,
+                ]
+            })
             .collect();
-        assert_eq!(active_blocks(&positions, &d, &cfg()), active_blocks_dense(&positions, &d, &cfg()));
+        assert_eq!(
+            active_blocks(&positions, &d, &cfg()),
+            active_blocks_dense(&positions, &d, &cfg())
+        );
     }
 
-    /// Dense footprint Vec + sort/dedup reference (the pre-step-12 path).
-    fn active_blocks_dense(positions: &[[f32; 3]], dims: &GridDims, cfg: &SurfaceConfig) -> Vec<usize> {
+    /// Dense footprint reference with sort and deduplication.
+    fn active_blocks_dense(
+        positions: &[[f32; 3]],
+        dims: &GridDims,
+        cfg: &SurfaceConfig,
+    ) -> Vec<usize> {
         let r_scan_bsx = cfg.r_scan() / dims.bsx as f32;
         let mut merged: Vec<usize> = Vec::new();
         for p in positions {
@@ -197,7 +211,9 @@ mod tests {
             for bz in z1..=z2 {
                 for by in y1..=y2 {
                     for bx in x1..=x2 {
-                        merged.push((bx as usize) + (by as usize) * dims.nx + (bz as usize) * dims.nxy);
+                        merged.push(
+                            (bx as usize) + (by as usize) * dims.nx + (bz as usize) * dims.nxy,
+                        );
                     }
                 }
             }

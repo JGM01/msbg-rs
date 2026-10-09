@@ -3,12 +3,14 @@
 //!
 //! Core building blocks:
 //!
-//! * [`blockpool`] — aligned blocks + a lock-free monotonic allocator.
+//! * [`blockpool`] — aligned blocks and segmented monotonic allocation.
 //! * [`sparse_grid`] — single-resolution `SparseGrid<T>` over blocks.
 //! * [`channel`] — typed data channels (density, pressure, velocity, ...).
 //! * [`math`] — field sampling/interpolation and SIMD stencil kernels.
 //! * [`multires`] — halo gather and block iteration.
-//! * [`particles`] — step-9 surface reconstruction (PLY → splat → density).
+//! * [`particles`] — particle surface reconstruction (PLY → splat → density).
+//! * [`solver`] — in-place SIMD smoothing with eight-color scheduling.
+//! * [`fluid`] — staggered MAC-grid particle transfer and divergence.
 //! * [`io`] — file-format I/O (PLY).
 //! * [`thread_pool`] — rayon workers with FTZ/DAZ enabled.
 //!

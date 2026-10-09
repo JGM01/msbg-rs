@@ -183,7 +183,12 @@ mod tests {
         assert_eq!(store.level0.len(), 8);
         assert_eq!(store.level0, vec![2u8; 8]);
         assert_eq!(store.flags.len(), 3);
-        assert!(store.flags.iter().all(|f| f.iter().all(|&x| x == BlockFlags(0))));
+        assert!(
+            store
+                .flags
+                .iter()
+                .all(|f| f.iter().all(|&x| x == BlockFlags(0)))
+        );
     }
 
     #[test]

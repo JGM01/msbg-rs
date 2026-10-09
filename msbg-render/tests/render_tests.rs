@@ -1,13 +1,10 @@
-//! Boundary & awkward-case test matrix for `msbg-render` (step 10).
-//!
-//! Only two happy-path tests; the rest exercise boundaries, degenerate grids,
-//! and DDA edge cases. Synthetic analytic fields keep the suite fast and
-//! deterministic (the real bunny is exercised by the bench + example).
+//! Renderer tests for geometry, boundaries, empty grids, and DDA traversal.
+//! Analytic fields keep the tests deterministic and independent of bunny data.
 
 use std::sync::Arc;
 
 use image::Rgba;
-use msbg_render::{greyscale, raymarch, render_slice, Camera, RenderOptions, SliceAxis};
+use msbg_render::{Camera, RenderOptions, SliceAxis, greyscale, raymarch, render_slice};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::{Density8, Vec3};
 use msbg_rs::math::{BoundaryCondition, Interpolation};
@@ -17,11 +14,7 @@ const BSX: usize = 16;
 const N: usize = 4096;
 const IP_LINEAR: Interpolation = Interpolation::Linear;
 
-fn grid<D: Copy + Default + Send + Sync>(
-    sx: usize,
-    sy: usize,
-    sz: usize,
-) -> SparseGrid<D, BSX, N> {
+fn grid<D: Copy + Default + Send + Sync>(sx: usize, sy: usize, sz: usize) -> SparseGrid<D, BSX, N> {
     let pool = Arc::new(BlockPool::new(8, 64));
     SparseGrid::new("t".into(), sx, sy, sz, D::default(), D::default(), pool)
 }
@@ -92,7 +85,10 @@ fn raymarch_02_sphere_perspective() {
     let cam = Camera::look_at(Vec3::new(24.0, 24.0, 0.0), Vec3::new(24.0, 24.0, 24.0), 1.0);
     let img = raymarch::<f32, BSX, N>(&g, &cam, 64, 64, &default_opts(&g));
     assert_eq!((img.width(), img.height()), (64, 64));
-    assert!(!is_background(img.get_pixel(32, 32)), "center ray should hit");
+    assert!(
+        !is_background(img.get_pixel(32, 32)),
+        "center ray should hit"
+    );
     let hits = img.pixels().filter(|p| !is_background(p)).count();
     assert!(hits > 0);
 }
@@ -134,7 +130,13 @@ fn slice_03_out_of_bounds_dirichlet_vs_clamp() {
 
     // Far side, same contract.
     let dir_hi = render_slice::<f32, BSX, N, IP_LINEAR>(
-        &g, SliceAxis::Z, 5000.0, 16, 16, BoundaryCondition::Dirichlet, greyscale,
+        &g,
+        SliceAxis::Z,
+        5000.0,
+        16,
+        16,
+        BoundaryCondition::Dirichlet,
+        greyscale,
     );
     assert_eq!(dir_hi.get_pixel(4, 4)[0], 0);
 }
@@ -155,7 +157,10 @@ fn raymarch_04_grazing_coplanar_ray() {
     };
     let img = raymarch::<f32, BSX, N>(&g, &cam, 64, 64, &default_opts(&g));
     // The center ray traverses the sphere along its equator -> a hit.
-    assert!(!is_background(img.get_pixel(32, 32)), "coplanar ray must not NaN-skip");
+    assert!(
+        !is_background(img.get_pixel(32, 32)),
+        "coplanar ray must not NaN-skip"
+    );
 }
 
 #[test]
@@ -164,7 +169,11 @@ fn raymarch_05_camera_inside_density() {
     fill_sphere(&mut g, (16.0, 16.0, 16.0), 12.0, 1.0f32);
     // Camera at the dense center: no surface is crossed looking outward, so the
     // near plane is not spuriously treated as a hit.
-    let cam = Camera::look_at(Vec3::new(16.0, 16.0, 16.0), Vec3::new(24.0, 16.0, 16.0), 1.0);
+    let cam = Camera::look_at(
+        Vec3::new(16.0, 16.0, 16.0),
+        Vec3::new(24.0, 16.0, 16.0),
+        1.0,
+    );
     let img = raymarch::<f32, BSX, N>(&g, &cam, 64, 64, &default_opts(&g));
     assert!(is_background(img.get_pixel(32, 32)));
 }
@@ -193,19 +202,29 @@ fn raymarch_06_ess_equivalence() {
         &cam,
         96,
         96,
-        &RenderOptions { disable_ess: true, ..default_opts(&g) },
+        &RenderOptions {
+            disable_ess: true,
+            ..default_opts(&g)
+        },
     );
 
     // Hit mask must match exactly; colors may shift by a few LSBs from the
     // sub-voxel difference in the interpolated surface position.
     let mut max_diff = 0u8;
     for (a, b) in on.pixels().zip(off.pixels()) {
-        assert_eq!(is_background(a), is_background(b), "ESS changed the hit mask");
+        assert_eq!(
+            is_background(a),
+            is_background(b),
+            "ESS changed the hit mask"
+        );
         for k in 0..3 {
             max_diff = max_diff.max(a[k].abs_diff(b[k]));
         }
     }
-    assert!(max_diff <= 16, "ESS color divergence {max_diff} exceeds budget");
+    assert!(
+        max_diff <= 16,
+        "ESS color divergence {max_diff} exceeds budget"
+    );
 }
 
 #[test]
@@ -221,10 +240,19 @@ fn raymarch_07_density8_sqrt_dequant() {
         }
     }
     let img = render_slice::<Density8, BSX, N, IP_LINEAR>(
-        &g, SliceAxis::Z, 8.0, 16, 16, BoundaryCondition::Clamp, greyscale,
+        &g,
+        SliceAxis::Z,
+        8.0,
+        16,
+        16,
+        BoundaryCondition::Clamp,
+        greyscale,
     );
     let px = img.get_pixel(8, 8)[0];
-    assert!((126..=130).contains(&px), "sqrt-space sample not squared: {px}");
+    assert!(
+        (126..=130).contains(&px),
+        "sqrt-space sample not squared: {px}"
+    );
 }
 
 #[test]
@@ -233,7 +261,13 @@ fn render_08_asymmetric_ribbon() {
     let mut g = grid::<f32>(512, 16, 16);
     fill_sphere(&mut g, (256.0, 8.0, 8.0), 6.0, 1.0f32);
     let img = render_slice::<f32, BSX, N, IP_LINEAR>(
-        &g, SliceAxis::Z, 8.0, 512, 16, BoundaryCondition::Clamp, greyscale,
+        &g,
+        SliceAxis::Z,
+        8.0,
+        512,
+        16,
+        BoundaryCondition::Clamp,
+        greyscale,
     );
     assert_eq!((img.width(), img.height()), (512, 16));
     assert!(img.get_pixel(256, 8)[0] > 200);
@@ -248,7 +282,11 @@ fn raymarch_09_ray_misses_grid() {
     let mut g = grid::<f32>(32, 32, 32);
     fill_sphere(&mut g, (16.0, 16.0, 16.0), 8.0, 1.0f32);
     // Camera looking away from the grid: no ray intersects the AABB.
-    let cam = Camera::look_at(Vec3::new(16.0, 16.0, -20.0), Vec3::new(16.0, 16.0, -40.0), 1.0);
+    let cam = Camera::look_at(
+        Vec3::new(16.0, 16.0, -20.0),
+        Vec3::new(16.0, 16.0, -40.0),
+        1.0,
+    );
     let img = raymarch::<f32, BSX, N>(&g, &cam, 64, 64, &default_opts(&g));
     assert!(img.pixels().all(is_background));
 }
@@ -281,7 +319,13 @@ fn render_10_all_empty_grid() {
     // No blocks allocated: every voxel is the empty sentinel.
     let g = grid::<f32>(32, 32, 32);
     let img = render_slice::<f32, BSX, N, IP_LINEAR>(
-        &g, SliceAxis::Z, 16.0, 32, 32, BoundaryCondition::Clamp, greyscale,
+        &g,
+        SliceAxis::Z,
+        16.0,
+        32,
+        32,
+        BoundaryCondition::Clamp,
+        greyscale,
     );
     assert!(img.pixels().all(|p| p[0] == 0));
 

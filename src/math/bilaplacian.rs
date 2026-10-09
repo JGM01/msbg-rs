@@ -85,7 +85,11 @@ pub fn kernel_bilaplacian<const W: usize, const BSX: usize, const HSX: usize, D>
                     let d = (-upd).simd_clamp(lo, hi);
 
                     let new = f0 + d;
-                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
+                    let new = if clamp01 {
+                        new.simd_clamp(zero, one)
+                    } else {
+                        new
+                    };
 
                     D::store_chunk(out, out_idx, new, rng);
                 }
@@ -164,12 +168,23 @@ mod tests {
         let mut ref_out = [0.0f32; N];
         let dt = 0.01;
         let mut rng = SimdRng::<LANES>::seed(0);
-        kernel_bilaplacian::<LANES, BSX, HSX, f32>(&halo, dt, false, out.data.as_mut_ptr(), &mut rng);
+        kernel_bilaplacian::<LANES, BSX, HSX, f32>(
+            &halo,
+            dt,
+            false,
+            out.data.as_mut_ptr(),
+            &mut rng,
+        );
         scalar_bilaplacian(&halo, dt, &mut ref_out);
 
         for i in 0..N {
             let d = (out.data[i] - ref_out[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
+            assert!(
+                d < 1e-4,
+                "mismatch at {i}: simd={} scalar={}",
+                out.data[i],
+                ref_out[i]
+            );
         }
     }
 
@@ -180,6 +195,12 @@ mod tests {
         let halo = HaloBlock::<16, 18>::new();
         let mut out = Block::<f32, BSX, N>::new();
         let mut rng = SimdRng::<LANES>::seed(0);
-        kernel_bilaplacian::<LANES, 16, 18, f32>(&halo, 0.01, false, out.data.as_mut_ptr(), &mut rng);
+        kernel_bilaplacian::<LANES, 16, 18, f32>(
+            &halo,
+            0.01,
+            false,
+            out.data.as_mut_ptr(),
+            &mut rng,
+        );
     }
 }

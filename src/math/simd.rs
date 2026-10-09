@@ -1,10 +1,7 @@
-//! Hardware-sympathetic SIMD lane-width selection.
+//! SIMD width selection by target feature.
 //!
-//! The stencil kernels are written once, generic over `const W: usize` lanes,
-//! and instantiated at the width matching the target's *native* vector
-//! register. Hardcoding `f32x16` everywhere forces LLVM to split the 16-lane
-//! vectors (2x 256-bit on AVX2, 4x 128-bit on NEON) and inflates register
-//! pressure in the 19/25-tap kernels, causing spills.
+//! Kernels use a const lane count: 16 for AVX-512, 8 for AVX, and 4 for NEON/SSE2.
+//! Matching the register width limits vector splitting and register pressure.
 
 use std::simd::{Mask, Simd};
 

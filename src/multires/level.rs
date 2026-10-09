@@ -1,18 +1,9 @@
-//! Per-resolution-level data, stored behind a closed `Level` enum over the
-//! supported block sizes.
+//! Data for each resolution level, with supported block sizes represented by `Level`.
 //!
-//! One shared sparse `BlockMap` maps block id → one `LevelBlock` allocation
-//! (one pointer per active block), replacing the step-1..10 design of nine
-//! separate `SparseGrid` channels each with its own dense blockmap and pool.
-//! The C++ `MultiresSparseGrid` keeps ~40 named `SparseGrid*` fields with a
-//! dense `_blockmap` each; a multigrid sweep there is 9 map lookups + 9
-//! scattered allocations per block, here it is 1 lookup + offset math.
-//!
-//! Layout note: the per-block *metadata* (cell flags + fine-coarse distance) is
-//! co-resident so the solver's mask reads share cache lines, but the *density*
-//! is materialized lazily into its own contiguous pool — flags-only blocks
-//! (e.g. the coarse sea during `set_refinement_map`) don't pay a 16 KiB density
-//! write, and the density stream the halo/solver gather stays contiguous.
+//! A sparse `BlockMap` maps each active block ID to one metadata allocation.
+//! Cell flags and fine-coarse distances share that allocation.
+//! Density and face fields are allocated separately when needed.
+//! Metadata-only blocks therefore need no density payload.
 
 use crate::blockmap::BlockMap;
 use crate::blockpool::Pool;
@@ -32,7 +23,7 @@ pub struct DensityBlock<const N: usize> {
 
 /// The 2-phase MAC face channels (C++ `face_area` / `face_coeff`, three
 /// directional components each), allocated lazily by [`LevelData::ensure_faces`]
-/// so the single-phase steps (7..19) don't pay their ~6× f32 footprint per block.
+/// so single-phase operations do not allocate their six scalar channels.
 #[repr(C, align(64))]
 pub struct FaceBlock<const BSX: usize, const N: usize> {
     pub face_area: [[f32; N]; 3],
@@ -55,17 +46,14 @@ impl<const BSX: usize, const N: usize> FaceBlock<BSX, N> {
 pub struct LevelBlock<const BSX: usize, const N: usize> {
     pub cell_flags: [CellFlags; N],
     pub dist_fine_coarse: [DistFineCoarse; N],
-    /// Lazily-materialized density (step 7+); `None` reads as empty (0.0).
+    /// Density allocated on demand; `None` reads as empty (0.0).
     pub density: Option<NonNull<DensityBlock<N>>>,
-    /// Lazily-materialized 2-phase face payload (step 20).
+    /// Two-phase face payload allocated on demand.
     pub faces: Option<NonNull<FaceBlock<BSX, N>>>,
 }
 
-/// A shared, sendable handle to a [`LevelBlock`]. `NonNull` is deliberately
-/// neither `Send` nor `Sync` (it is a raw pointer); concurrent access to a
-/// level block is safe by construction — blocks are materialized in serial
-/// phases and only *read* in the parallel sweeps (`density_ptr`/halo), while
-/// `ensure_*` mutate via `&mut self`. Mirrors `sparse_grid::BlockPtr`.
+/// Shared handle to a [`LevelBlock`].
+/// Allocation uses exclusive access. Parallel readers must not overlap mutation.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct LevelBlockPtr<const BSX: usize, const N: usize>(pub NonNull<LevelBlock<BSX, N>>);
@@ -117,7 +105,9 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
 
         let empty_density = density_pool.alloc_block();
         unsafe {
-            empty_density.as_ptr().write(DensityBlock { data: [0.0; N] });
+            empty_density
+                .as_ptr()
+                .write(DensityBlock { data: [0.0; N] });
         }
 
         Self {
@@ -161,7 +151,10 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
     /// Materialize (once) the density payload for `bid` (zeroed).
     pub fn ensure_density(&mut self, bid: usize) {
         self.ensure_block(bid);
-        let block = self.blocks.get(bid).expect("ensure_block materialized a block");
+        let block = self
+            .blocks
+            .get(bid)
+            .expect("ensure_block materialized a block");
         if unsafe { (*block.0.as_ptr()).density }.is_none() {
             let d = self.density_pool.alloc_block();
             unsafe { d.as_ptr().write(DensityBlock { data: [0.0; N] }) };
@@ -173,7 +166,10 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
     pub fn ensure_faces(&mut self, bid: usize) -> NonNull<FaceBlock<BSX, N>> {
         debug_assert!(bid < self.n_blocks);
         self.ensure_block(bid);
-        let block = self.blocks.get(bid).expect("ensure_block materialized a block");
+        let block = self
+            .blocks
+            .get(bid)
+            .expect("ensure_block materialized a block");
         let faces = unsafe { (*block.0.as_ptr()).faces };
         match faces {
             Some(f) => f,
@@ -209,8 +205,18 @@ impl<const BSX: usize, const N: usize> LevelData<BSX, N> {
     #[inline(always)]
     pub fn density_ptr_mut(&mut self, bid: usize) -> *mut f32 {
         self.ensure_density(bid);
-        let block = self.blocks.get(bid).expect("ensure_density materialized a block");
-        unsafe { (*(*block.0.as_ptr()).density.expect("density materialized").as_ptr()).data.as_mut_ptr() }
+        let block = self
+            .blocks
+            .get(bid)
+            .expect("ensure_density materialized a block");
+        unsafe {
+            (*(*block.0.as_ptr())
+                .density
+                .expect("density materialized")
+                .as_ptr())
+            .data
+            .as_mut_ptr()
+        }
     }
 
     /// Raw writable cell-flags pointer for an allocated block, else null.
@@ -308,8 +314,8 @@ macro_rules! level_dispatch {
 
 use crate::multires::blockinfo::{BlockFlags, BlockInfoStore};
 use crate::multires::refinement::{
-    init_cell_flags, init_dist_fine_coarse, propagate_dist_fine_coarse_full, BlockGridDims,
-    RefinementMap,
+    BlockGridDims, RefinementMap, init_cell_flags, init_dist_fine_coarse,
+    propagate_dist_fine_coarse_full,
 };
 
 impl Level {

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 scenario="${1:-blockpool_hot_path}"
 
-BIN=$(find target/release -name 'allocator_benches-*' -type f -executable | head -1)
+BIN=$(find target/release -name 'allocator_benches-*' -type f -perm -111 | head -1)
 if [ -z "$BIN" ]; then
   echo "bench binary not found; run: cargo bench --bench allocator_benches --no-run" >&2
   exit 1

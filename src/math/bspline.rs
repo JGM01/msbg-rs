@@ -56,7 +56,10 @@ mod tests {
         for i in 0..=100 {
             let t = i as f32 / 100.0;
             assert!(close(cubic_deriv_weights(t).iter().sum(), 0.0), "d at {t}");
-            assert!(close(cubic_deriv2_weights(t).iter().sum(), 0.0), "d2 at {t}");
+            assert!(
+                close(cubic_deriv2_weights(t).iter().sum(), 0.0),
+                "d2 at {t}"
+            );
         }
     }
 

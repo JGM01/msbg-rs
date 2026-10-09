@@ -1,6 +1,6 @@
 //! Stencil-window gather over a [`SparseGrid`], with inline dequantization.
 
-use crate::math::boundary::{resolve_axis, BoundaryCondition};
+use crate::math::boundary::{BoundaryCondition, resolve_axis};
 use crate::sparse_grid::SparseGrid;
 
 /// A window of `dmax <= 3` spans at most 2 blocks per axis (2^3 = 8).
@@ -10,27 +10,15 @@ const MAX_SLOTS: usize = 8;
 pub trait Dequant<O>: Copy + Default + Send + Sync {
     fn dequant(self) -> O;
 
-    /// Dequantize the element at `src + idx`, given the total element count
-    /// `len` of the contiguous run `src` points into. The default copies the
-    /// element and dequantizes it; vector types may override this to issue a
-    /// single wider load that reads `Self`'s trailing bytes / the successor
-    /// element, which is only in-bounds when a successor exists (`idx + 1 < len`).
+    /// Read and dequantize element `idx` in a run of `len` elements.
+    /// Vector overrides may use a wider load.
     ///
     /// # Safety
     ///
-    /// `src` must point at `len` valid `Self` elements and `idx < len`.
-    ///
-    /// **Contract for wide-load overrides.** An override that reads *past* the
-    /// element (`idx`'s) allocation — e.g. a 16-byte load of a 12-byte `Vec3` —
-    /// is only sound when `src` is the `data` field of a
-    /// [`crate::blockpool::Block`], whose `flags: u16` + `_pad: [u8; 62]` tail
-    /// is 64 bytes of initialized memory immediately after `data`. That
-    /// guarantee is *by construction of the caller*, not a runtime check:
-    /// [`gather_map`] is the sole caller of `dequant_at`, and it only ever
-    /// passes [`SparseGrid::block_data_ptr`], which resolves real, full, and
-    /// empty blocks alike to a `Block::data` pointer. The
-    /// `debug_assert!(idx < len)` bounds the *index*; it does **not** detect a
-    /// caller handing over an unpadded `[Self; N]` slice or stack array.
+    /// `src` must point to `len` initialized elements, and `idx < len`.
+    /// Wide-load overrides also require enough initialized trailing bytes.
+    /// A 16-byte load of the final 12-byte vector requires four trailing bytes.
+    /// The block layout reserves tail storage; callers must ensure it is initialized.
     #[inline]
     unsafe fn dequant_at(src: *const Self, idx: usize, len: usize) -> O {
         debug_assert!(idx < len);
@@ -42,7 +30,9 @@ pub trait Dequant<O>: Copy + Default + Send + Sync {
     #[inline]
     fn copy_row(src: *const Self, dst: *mut O, n: usize) {
         for i in 0..n {
-            unsafe { *dst.add(i) = (*src.add(i)).dequant(); }
+            unsafe {
+                *dst.add(i) = (*src.add(i)).dequant();
+            }
         }
     }
 }

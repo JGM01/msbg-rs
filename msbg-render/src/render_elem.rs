@@ -1,9 +1,7 @@
-//! Storage-to-physical mapping for rendering.
+//! Conversion from sampled storage values to physical density.
 //!
-//! [`msbg_rs::math::Sampler`] returns the interpolated value in *storage
-//! space* (linear for `Density`/`f32`). [`Density8`] is sqrt-compressed, so its
-//! sampled value must be squared to recover a physical `[0, 1]` density —
-//! exactly what the C++ render path does for 8-bit builds.
+//! `Density` and `f32` samples are linear. `Density8` samples use sqrt space.
+//! Square a `Density8` sample to recover physical density.
 
 use msbg_rs::channel::{Density, Density8};
 use msbg_rs::math::InterpElem;

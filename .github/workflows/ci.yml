@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      MSBG_DATA_DIR: ${{ github.workspace }}/reference-msbg/data
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Fetch reference input data
+        uses: actions/checkout@v7
+        with:
+          repository: JGM01/MSBG
+          ref: 5aed13c0674f141359bf764f2e57752372a6a67f
+          path: reference-msbg
+          sparse-checkout: data
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install nightly-2026-06-18 --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --workspace --locked
+      - name: Run standalone example
+        run: cargo run --example sparse_field --locked
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked

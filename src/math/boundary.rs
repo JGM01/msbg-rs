@@ -7,7 +7,7 @@ use std::marker::ConstParamTy;
 pub enum BoundaryCondition {
     /// Replicate the edge voxel.
     Clamp,
-    /// Mirror (symmetric) reflection; the edge voxel is not repeated.
+    /// Symmetric reflection, with the edge voxel repeated.
     Neumann,
     /// Out-of-domain samples read the grid's empty sentinel.
     Dirichlet,
@@ -48,9 +48,5 @@ pub fn resolve_axis(g: i32, max: i32, bc: BoundaryCondition) -> Option<i32> {
 fn reflect(g: i32, max: i32) -> i32 {
     let period = 2 * (max + 1);
     let r = g.rem_euclid(period);
-    if r > max {
-        period - 1 - r
-    } else {
-        r
-    }
+    if r > max { period - 1 - r } else { r }
 }

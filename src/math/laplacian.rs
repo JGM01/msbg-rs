@@ -58,7 +58,11 @@ pub fn kernel_laplacian<const W: usize, const BSX: usize, const HSX: usize, D>(
                     let g = fx.mul_add(fx, fy.mul_add(fy, fz * fz)).sqrt();
 
                     let new = (dtv * lap).mul_add(g, c); // c + dt*lap*g
-                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
+                    let new = if clamp01 {
+                        new.simd_clamp(zero, one)
+                    } else {
+                        new
+                    };
 
                     D::store_chunk(out, out_idx, new, rng);
                 }
@@ -139,7 +143,12 @@ mod tests {
 
         for i in 0..N {
             let d = (out.data[i] - ref_out[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
+            assert!(
+                d < 1e-4,
+                "mismatch at {i}: simd={} scalar={}",
+                out.data[i],
+                ref_out[i]
+            );
         }
     }
 
@@ -160,7 +169,12 @@ mod tests {
 
         for i in 0..N {
             let d = (out.data[i] - ref_out[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
+            assert!(
+                d < 1e-4,
+                "mismatch at {i}: simd={} scalar={}",
+                out.data[i],
+                ref_out[i]
+            );
         }
     }
 
@@ -171,7 +185,13 @@ mod tests {
 
         let mut out = Block::<f32, BSX, N>::new();
         let mut rng = SimdRng::<LANES>::seed(2);
-        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, 0.0, false, out.data.as_mut_ptr(), &mut rng);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(
+            &halo,
+            0.0,
+            false,
+            out.data.as_mut_ptr(),
+            &mut rng,
+        );
 
         // dt=0 -> new == c (halo center), i.e. the quadratic field value.
         let mut out_idx = 0;
@@ -198,7 +218,13 @@ mod tests {
         }
         let mut out = Block::<f32, BSX, N>::new();
         let mut rng = SimdRng::<LANES>::seed(3);
-        kernel_laplacian::<LANES, BSX, HSX, f32>(&halo, 1000.0, true, out.data.as_mut_ptr(), &mut rng);
+        kernel_laplacian::<LANES, BSX, HSX, f32>(
+            &halo,
+            1000.0,
+            true,
+            out.data.as_mut_ptr(),
+            &mut rng,
+        );
         for &v in &out.data {
             assert!((0.0..=1.0).contains(&v), "clamp01 violated: {v}");
         }

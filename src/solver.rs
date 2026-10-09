@@ -1,12 +1,9 @@
 //! In-place 8-color PDE smoothing.
 //!
-//! The [`Sweeper`] is a use-case-independent primitive: it iterates an active
-//! block list in 8 colors (blocks of one color never share a halo face, so they
-//! can be updated in parallel without races), and for each block it gathers a
-//! thread-local halo, runs a per-block stencil, and writes the result back into
-//! the *same* grid block through the element type's [`StoreBack`]. Mean-
-//! curvature, Laplacian, and bi-Laplacian are just stencils over this primitive
-//! — the core stays solver-agnostic.
+//! [`Sweeper`] processes active blocks in eight spatial colors.
+//! Each block gathers a halo, applies a stencil, and writes back to the same grid.
+//! The element type supplies storage conversion through [`StoreBack`].
+//! Supported stencils are Laplacian, mean curvature, and bi-Laplacian.
 //!
 //! ```
 //! use msbg_rs::solver::{Fence, PdeParams, Stencil, Sweeper};
@@ -30,7 +27,7 @@ use rayon::prelude::*;
 use crate::math::boundary::BoundaryCondition;
 use crate::math::gather::Dequant;
 use crate::math::simd::LANES;
-use crate::math::stencil::{store_fence, store_mfence, SimdRng, StoreBack};
+use crate::math::stencil::{SimdRng, StoreBack, store_fence, store_mfence};
 use crate::multires::halo::HaloBlock;
 use crate::multires::sort::morton3;
 use crate::sparse_grid::SparseGrid;
@@ -63,9 +60,8 @@ pub struct PdeParams {
 /// Store fence policy between color passes. Only the `f32` path uses
 /// non-temporal stores, so the fence is a no-op for `Density`/`Density8`.
 ///
-/// `None` is **not** memory-safe for the `f32` path (the non-temporal store
-/// bypasses the cache and a later regular load may read stale data). It exists
-/// only to benchmark the cost of the store ordering against `Sfence`/`Mfence`.
+/// `None` omits the ordering required between streaming writes and later reads.
+/// Use it only to benchmark fence overhead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fence {
     /// Store-only fence (`_mm_sfence`).
@@ -207,7 +203,13 @@ where
                         bid,
                         BoundaryCondition::Neumann,
                     );
-                    kernel(&slot.halo, params.dt, params.do_constr_zero_one, out, &mut slot.rng);
+                    kernel(
+                        &slot.halo,
+                        params.dt,
+                        params.do_constr_zero_one,
+                        out,
+                        &mut slot.rng,
+                    );
                     if D::USES_NT {
                         self.fence.apply();
                     }
@@ -314,13 +316,21 @@ mod tests {
                         Stencil::Laplacian => {
                             halo.fill::<1, false, f32, N>(g, bid, BoundaryCondition::Neumann);
                             kernel_laplacian::<LANES, BSX, HSX, f32>(
-                                &halo, params.dt, params.do_constr_zero_one, out, &mut rng,
+                                &halo,
+                                params.dt,
+                                params.do_constr_zero_one,
+                                out,
+                                &mut rng,
                             );
                         }
                         Stencil::MeanCurvature => {
                             halo.fill::<1, true, f32, N>(g, bid, BoundaryCondition::Neumann);
                             kernel_meancurv::<LANES, BSX, HSX, f32>(
-                                &halo, params.dt, params.do_constr_zero_one, out, &mut rng,
+                                &halo,
+                                params.dt,
+                                params.do_constr_zero_one,
+                                out,
+                                &mut rng,
                             );
                         }
                         Stencil::BiLaplacian => unreachable!("needs HSX=20"),
@@ -341,8 +351,13 @@ mod tests {
             }
         }
         let active = all_active(&g);
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
-        let params = PdeParams { dt: 0.05, iterations: 1, do_constr_zero_one: false };
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let params = PdeParams {
+            dt: 0.05,
+            iterations: 1,
+            do_constr_zero_one: false,
+        };
         sweeper.sweep(&active, Stencil::Laplacian, &params);
 
         // An affine field has zero Laplacian, so interior cells are exact fixed
@@ -376,9 +391,14 @@ mod tests {
             }
         }
         let active = all_active(&g);
-        let params = PdeParams { dt: 0.05, iterations: 2, do_constr_zero_one: false };
+        let params = PdeParams {
+            dt: 0.05,
+            iterations: 2,
+            do_constr_zero_one: false,
+        };
 
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&active, Stencil::MeanCurvature, &params);
         serial_reference(&mut g2, &active, Stencil::MeanCurvature, &params);
 
@@ -402,8 +422,13 @@ mod tests {
         g.set_voxel(16, 16, 16, 0.7); // block 7
         g.set_full_block(g.get_block_id(0, 16, 0)); // block 2 -> dummy full
         let active: Vec<usize> = vec![0, 7, g.get_block_id(0, 16, 0), 5];
-        let params = PdeParams { dt: 0.05, iterations: 1, do_constr_zero_one: true };
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let params = PdeParams {
+            dt: 0.05,
+            iterations: 1,
+            do_constr_zero_one: true,
+        };
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&active, Stencil::Laplacian, &params);
         // Just assert no panic and values remain in [0,1].
         assert!(g.get_voxel(0, 0, 0).is_finite());
@@ -413,8 +438,13 @@ mod tests {
     #[test]
     fn test_solve_04_empty_active_is_noop() {
         let g = grid(32, 32, 32);
-        let params = PdeParams { dt: 0.05, iterations: 2, do_constr_zero_one: true };
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let params = PdeParams {
+            dt: 0.05,
+            iterations: 2,
+            do_constr_zero_one: true,
+        };
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&[], Stencil::Laplacian, &params);
     }
 
@@ -431,8 +461,13 @@ mod tests {
             }
         }
         let active = all_active(&g);
-        let params = PdeParams { dt: 1000.0, iterations: 1, do_constr_zero_one: true };
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let params = PdeParams {
+            dt: 1000.0,
+            iterations: 1,
+            do_constr_zero_one: true,
+        };
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&active, Stencil::MeanCurvature, &params);
         for z in 0..16 {
             for y in 0..16 {
@@ -455,8 +490,13 @@ mod tests {
             }
         }
         let active = all_active(&g);
-        let params = PdeParams { dt: 0.05, iterations: 3, do_constr_zero_one: true };
-        let sweeper = Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
+        let params = PdeParams {
+            dt: 0.05,
+            iterations: 3,
+            do_constr_zero_one: true,
+        };
+        let sweeper =
+            Sweeper::<f32, BSX, N, HSX>::new(&g, rayon::current_num_threads(), Fence::Mfence);
         sweeper.sweep(&active, Stencil::Laplacian, &params);
         for z in 0..16 {
             for y in 0..16 {

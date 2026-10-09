@@ -56,7 +56,12 @@ impl BlockGridDims {
 
     #[inline(always)]
     pub fn in_range(&self, bx: i32, by: i32, bz: i32) -> bool {
-        bx >= 0 && bx < self.nx as i32 && by >= 0 && by < self.ny as i32 && bz >= 0 && bz < self.nz as i32
+        bx >= 0
+            && bx < self.nx as i32
+            && by >= 0
+            && by < self.ny as i32
+            && bz >= 0
+            && bz < self.nz as i32
     }
 }
 
@@ -71,37 +76,36 @@ pub fn regularize_refinement_map(map: &mut [u8], dims: &BlockGridDims, n_levels:
     let mut prev = map.to_vec();
     for ll in 1..=(n_levels - 2) {
         let ll = ll as u8;
-        map.par_iter_mut()
-            .enumerate()
-            .for_each(|(bid, out)| {
-                let level = prev[bid];
-                let mut level_out = level;
-                if level >= ll {
-                    let (bx, by, bz) = dims.coords(bid);
-                    let mut level2 = n_levels as u8 - 1;
-                    for dz in -1i32..=1 {
-                        for dy in -1i32..=1 {
-                            for dx in -1i32..=1 {
-                                if dx == 0 && dy == 0 && dz == 0 {
-                                    continue;
-                                }
-                                let bx2 = bx as i32 + dx;
-                                let by2 = by as i32 + dy;
-                                let bz2 = bz as i32 + dz;
-                                if !dims.in_range(bx2, by2, bz2) {
-                                    continue;
-                                }
-                                let bid2 = bx2 as usize + by2 as usize * dims.nx + bz2 as usize * dims.nxy;
-                                level2 = level2.min(prev[bid2]);
+        map.par_iter_mut().enumerate().for_each(|(bid, out)| {
+            let level = prev[bid];
+            let mut level_out = level;
+            if level >= ll {
+                let (bx, by, bz) = dims.coords(bid);
+                let mut level2 = n_levels as u8 - 1;
+                for dz in -1i32..=1 {
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            if dx == 0 && dy == 0 && dz == 0 {
+                                continue;
                             }
+                            let bx2 = bx as i32 + dx;
+                            let by2 = by as i32 + dy;
+                            let bz2 = bz as i32 + dz;
+                            if !dims.in_range(bx2, by2, bz2) {
+                                continue;
+                            }
+                            let bid2 =
+                                bx2 as usize + by2 as usize * dims.nx + bz2 as usize * dims.nxy;
+                            level2 = level2.min(prev[bid2]);
                         }
                     }
-                    if level2 == ll - 1 {
-                        level_out = ll;
-                    }
                 }
-                *out = level_out;
-            });
+                if level2 == ll - 1 {
+                    level_out = ll;
+                }
+            }
+            *out = level_out;
+        });
         prev.copy_from_slice(map);
     }
 }
@@ -433,7 +437,10 @@ pub fn init_dist_fine_coarse<const BSX: usize, const N: usize>(
                         let i: Simd<i32, W> = unsafe { q.to_int_unchecked() };
                         let u: Simd<u16, W> = i.cast();
                         unsafe {
-                            u.copy_to_slice(std::slice::from_raw_parts_mut(ptr.add(vid) as *mut u16, W));
+                            u.copy_to_slice(std::slice::from_raw_parts_mut(
+                                ptr.add(vid) as *mut u16,
+                                W,
+                            ));
                         }
                         vid += W;
                         px += Simd::splat(W as f32);
@@ -602,7 +609,11 @@ mod tests {
         let mut store = BlockInfoStore::new(d.n_blocks, 3);
         compute_block_topology(&mut store, &RefinementMap::new(map), &d, 3, None);
         assert!(store.flags(0, 0).contains(BlockFlags::DOM_BORDER));
-        assert!(store.flags(d.n_blocks - 1, 0).contains(BlockFlags::DOM_BORDER));
+        assert!(
+            store
+                .flags(d.n_blocks - 1, 0)
+                .contains(BlockFlags::DOM_BORDER)
+        );
         // Interior block (1,1,1) is not on the domain border.
         assert!(!store.flags(21, 0).contains(BlockFlags::DOM_BORDER));
     }

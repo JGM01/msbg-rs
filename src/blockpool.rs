@@ -7,9 +7,8 @@ use std::{
     },
 };
 
-/// 64-byte alignment: keeps every block on an x86 cache-line boundary, so a block
-/// never straddles two lines (no split-line loads at the block edge) and neighboring
-/// blocks can't falsely share a line under concurrent access.
+/// Block storage with 64-byte alignment.
+/// Adjacent blocks do not share a 64-byte cache line.
 #[repr(align(64))]
 #[derive(Clone)]
 pub struct Block<D, const BSX: usize, const N: usize>
@@ -22,11 +21,9 @@ where
     /// Block status metadata.
     pub flags: u16,
 
-    /// Block has to be 64-bytes. Also serves as the **tail padding** contract for
-    /// the SIMD gather (`Dequant::dequant_at`): `flags` + `_pad` are 64 bytes of
-    /// initialized, zeroed memory immediately after `data`, so a 16-byte unaligned
-    /// load of the last voxel reads 4 bytes into this tail instead of out of
-    /// bounds. Keep this field after `data` and ≥ 4 bytes total with `flags`.
+    /// Tail storage reserved for padded SIMD loads.
+    /// Wide loads require initialized bytes after `data`.
+    /// Keep at least four bytes of tail storage, including `flags`.
     _pad: [u8; 62],
 }
 
@@ -55,7 +52,7 @@ where
         let bsx_log2 = BSX.trailing_zeros() as usize;
         let index = vx | (vy << bsx_log2) | (vz << (bsx_log2 * 2));
 
-        // This is safe due to above assert
+        // Requires in-range coordinates; the debug assertion checks this only in debug builds.
         unsafe { *self.data.get_unchecked(index) }
     }
 }
@@ -69,9 +66,10 @@ where
     }
 }
 
-/// Lock-free & monotonic allocator of `T` items.
+/// Segmented monotonic allocator of `T` items.
+/// The allocation cursor is atomic; segment growth uses a mutex.
 pub struct Pool<T> {
-    /// Atomic monotonic pointer for allocation tracking.
+    /// Atomic allocation cursor.
     next_free: AtomicUsize,
 
     /// Number of items per pre-allocated segment.
@@ -83,7 +81,7 @@ pub struct Pool<T> {
     /// Bitmask for offset indexing inside segment.
     blocks_per_seg_mask: usize,
 
-    /// Lock-free atomic segment pointer table.
+    /// Atomic segment-pointer table.
     segments: Vec<AtomicPtr<T>>,
 
     /// Fallback lock for OS heap allocation/extensions.

@@ -1,21 +1,11 @@
-//! Particles-to-grid: the staged 8-color sum-splat of mass + momentum to MAC
-//! faces.
+//! Particles-to-grid transfer of mass and momentum to MAC faces.
 //!
-//! Mirrors the step-9 `splat` architecture — a thread-local `(BSX + 2·margin)³`
-//! staging buffer whose accumulation stays in cache, then a 3×3×3 commit that
-//! writes each touched voxel exactly once per contributing block — but with
-//! three differences that make it the FLIP transfer rather than a min-SDF:
+//! Each worker accumulates values in a staging buffer, then commits to nearby blocks.
+//! Eight colors schedule these commits. The reduction adds mass and momentum.
+//! The weight is `w = max(1 − (d/r_p)², 0)³` (Eq. 6), evaluated at face centers.
+//! Two channels are staged per direction: mass and momentum.
 //!
-//! * **sum** reduction (`+=`, mass and momentum accumulate) instead of `min`;
-//! * a **cubic-falloff** kernel `w = max(1 − (d/r_p)², 0)³` (Eq. 6) instead of
-//!   the `distSq` min-SDF, evaluated at the **face center** `cell + ½·e_a`; and
-//! * **six** channels (3 face masses + 3 face momenta) staged two at a time per
-//!   direction, sharing one weight evaluation.
-//!
-//! The face center is `½` past the cell center along its axis, so for direction
-//! `a` the face distance is `d_face² = d_cell² + d_cell[a] + ¼`, and the face
-//! footprint along axis `a` shifts by one extra half cell — both expressed
-//! directly in the staging loop with no extra buffers.
+//! The face offset gives `d_face² = d_cell² + d_cell[a] + ¼` for direction `a`.
 
 use std::cell::UnsafeCell;
 use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
@@ -34,7 +24,10 @@ use super::{BucketedParticles, Particles};
 /// same-color center blocks (`BSX`).
 #[inline(always)]
 fn check_r_p(r_p: f32, margin: usize) {
-    debug_assert!(r_p <= margin as f32, "r_p ({r_p}) exceeds the staging margin ({margin})");
+    debug_assert!(
+        r_p <= margin as f32,
+        "r_p ({r_p}) exceeds the staging margin ({margin})"
+    );
     debug_assert!(
         r_p + 0.5 < margin as f32 * 2.0,
         "r_p must be < BSX for the 8-color scheme to be race-free"
@@ -88,7 +81,7 @@ unsafe fn commit_sum<const W: usize>(src: *const f32, dst: *mut f32) {
     unsafe { (d + s).copy_to_slice(std::slice::from_raw_parts_mut(dst, W)) };
 }
 
-/// Staging region range along one axis (the step-9 `region_range`).
+/// Staging region range along one axis.
 #[inline(always)]
 fn region_range(d: i32, margin: i32, bsx: i32) -> (i32, i32) {
     match d {
@@ -108,9 +101,12 @@ pub fn active_blocks(positions: &[[f32; 3]], dims: &GridDims, r_p: f32) -> Vec<u
         .par_chunks(4096)
         .fold(BlockSet::new, |mut local, chunk| {
             for p in chunk {
-                let (x1, x2) = crate::particles::footprint_axis(p[0], r_scan_bsx, dims.bsx, dims.nx);
-                let (y1, y2) = crate::particles::footprint_axis(p[1], r_scan_bsx, dims.bsx, dims.ny);
-                let (z1, z2) = crate::particles::footprint_axis(p[2], r_scan_bsx, dims.bsx, dims.nz);
+                let (x1, x2) =
+                    crate::particles::footprint_axis(p[0], r_scan_bsx, dims.bsx, dims.nx);
+                let (y1, y2) =
+                    crate::particles::footprint_axis(p[1], r_scan_bsx, dims.bsx, dims.ny);
+                let (z1, z2) =
+                    crate::particles::footprint_axis(p[2], r_scan_bsx, dims.bsx, dims.nz);
                 for bz in z1..=z2 {
                     for by in y1..=y2 {
                         for bx in x1..=x2 {
@@ -312,19 +308,26 @@ fn stage_and_commit<const BSX: usize, const N: usize, const MSX: usize>(
                     };
                     let dist_face2 = dist_sq + d_a + Simd::splat(0.25);
                     // Cubic-falloff kernel (Eq. 6).
-                    let w = (Simd::splat(1.0) - dist_face2 * Simd::splat(inv_r2)).simd_max(Simd::splat(0.0));
+                    let w = (Simd::splat(1.0) - dist_face2 * Simd::splat(inv_r2))
+                        .simd_max(Simd::splat(0.0));
                     let w = w * w * w;
                     let add_mass = in_run.select(w * Simd::splat(scale_mass), Simd::splat(0.0));
                     let add_mom = in_run.select(w * Simd::splat(scale_mom), Simd::splat(0.0));
 
                     unsafe {
                         let off = row + c;
-                        let old_m =
-                            Simd::<f32, 8>::from_slice(std::slice::from_raw_parts(sm_ptr.add(off), 8));
-                        (old_m + add_mass).copy_to_slice(std::slice::from_raw_parts_mut(sm_ptr.add(off), 8));
-                        let old_v =
-                            Simd::<f32, 8>::from_slice(std::slice::from_raw_parts(sv_ptr.add(off), 8));
-                        (old_v + add_mom).copy_to_slice(std::slice::from_raw_parts_mut(sv_ptr.add(off), 8));
+                        let old_m = Simd::<f32, 8>::from_slice(std::slice::from_raw_parts(
+                            sm_ptr.add(off),
+                            8,
+                        ));
+                        (old_m + add_mass)
+                            .copy_to_slice(std::slice::from_raw_parts_mut(sm_ptr.add(off), 8));
+                        let old_v = Simd::<f32, 8>::from_slice(std::slice::from_raw_parts(
+                            sv_ptr.add(off),
+                            8,
+                        ));
+                        (old_v + add_mom)
+                            .copy_to_slice(std::slice::from_raw_parts_mut(sv_ptr.add(off), 8));
                     }
                     c += 8;
                 }
@@ -411,14 +414,13 @@ fn stage_and_commit<const BSX: usize, const N: usize, const MSX: usize>(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blockpool::BlockPool;
     use crate::channel::Vec3;
     use crate::fluid::mac::{MacGrid, X, Y, Z};
-    use crate::fluid::{g2p::MacSampler, Particles, KIND_LIQUID};
+    use crate::fluid::{KIND_LIQUID, Particles, g2p::MacSampler};
     use crate::math::{BoundaryCondition, Interpolation};
     use std::sync::Arc;
 
@@ -486,7 +488,9 @@ mod tests {
                                 k as usize,
                                 old_m + w * m_p,
                             );
-                            let old_v = mac.velocity(a).get_voxel(i as usize, j as usize, k as usize);
+                            let old_v = mac
+                                .velocity(a)
+                                .get_voxel(i as usize, j as usize, k as usize);
                             mac.velocity_mut(a).set_voxel(
                                 i as usize,
                                 j as usize,
@@ -550,9 +554,24 @@ mod tests {
         let sampler = MacSampler::new(&mac, BoundaryCondition::Clamp);
         for p in ps.positions {
             let got = sampler.sample::<{ Interpolation::Linear }>(Vec3::new(p[0], p[1], p[2]));
-            assert!((got.x() - u.x()).abs() < 1e-4, "x: {} vs {}", got.x(), u.x());
-            assert!((got.y() - u.y()).abs() < 1e-4, "y: {} vs {}", got.y(), u.y());
-            assert!((got.z() - u.z()).abs() < 1e-4, "z: {} vs {}", got.z(), u.z());
+            assert!(
+                (got.x() - u.x()).abs() < 1e-4,
+                "x: {} vs {}",
+                got.x(),
+                u.x()
+            );
+            assert!(
+                (got.y() - u.y()).abs() < 1e-4,
+                "y: {} vs {}",
+                got.y(),
+                u.y()
+            );
+            assert!(
+                (got.z() - u.z()).abs() < 1e-4,
+                "z: {} vs {}",
+                got.z(),
+                u.z()
+            );
         }
     }
 
@@ -598,8 +617,16 @@ mod tests {
     // Overlap: two particles' contributions sum, order-independently.
     #[test]
     fn p2g_06_overlap_sum_order_independent() {
-        let a_ps = particles(&[[8.0, 8.0, 8.0], [9.0, 8.0, 8.0]], &[[1.0, 0.0, 0.0]; 2], &[1.0; 2]);
-        let b_ps = particles(&[[9.0, 8.0, 8.0], [8.0, 8.0, 8.0]], &[[1.0, 0.0, 0.0]; 2], &[1.0; 2]);
+        let a_ps = particles(
+            &[[8.0, 8.0, 8.0], [9.0, 8.0, 8.0]],
+            &[[1.0, 0.0, 0.0]; 2],
+            &[1.0; 2],
+        );
+        let b_ps = particles(
+            &[[9.0, 8.0, 8.0], [8.0, 8.0, 8.0]],
+            &[[1.0, 0.0, 0.0]; 2],
+            &[1.0; 2],
+        );
         let mut a = make_mac(32);
         let mut b = make_mac(32);
         particles_to_grid::<BSX, N, MSX>(&mut a, &a_ps, 2.0);

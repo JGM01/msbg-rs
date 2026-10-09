@@ -12,9 +12,8 @@ use crate::channel::{Density, Density8};
 ///
 /// # Safety
 ///
-/// The caller must ensure `base[off..off + W]` is in-bounds of the halo
-/// buffer. Every kernel proves this up front with `debug_assert_eq!` on the
-/// halo size (`HSX*HSX*HSX`) and on the loop ranges (`BSX % W == 0`).
+/// `base[off..off + W]` must be valid initialized halo data.
+/// Kernels debug-check the halo size and SIMD loop divisibility.
 #[inline(always)]
 pub unsafe fn load<const W: usize>(base: *const f32, off: usize) -> Simd<f32, W> {
     unsafe { Simd::from_slice(std::slice::from_raw_parts(base.add(off), W)) }
@@ -24,8 +23,7 @@ pub unsafe fn load<const W: usize>(base: *const f32, off: usize) -> Simd<f32, W>
 ///
 /// # Safety
 ///
-/// See [`load`]; the output block is a fixed `[f32; N]` array so its bounds
-/// are provable, and the store offset stays within `N`.
+/// `base[off..off + W]` must be writable output storage.
 #[inline(always)]
 pub unsafe fn store<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, W>) {
     unsafe { v.copy_to_slice(std::slice::from_raw_parts_mut(base.add(off), W)) };
@@ -33,18 +31,13 @@ pub unsafe fn store<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, W>)
 
 /// Non-temporal (streaming) store of `W` lanes to `base + off`.
 ///
-/// The C++ smoothing kernels write their destination block with `vstream`
-/// (`_mm256_stream_ps`, see `renderDensFromFloat_storeSimd8` in `sbg.h`), which
-/// bypasses the cache and skips the write-allocate read-for-ownership. On this
-/// machine (single-channel DDR4, ~15 GB/s effective) regular stores make the
-/// parallel kernel bandwidth-bound: 16 KB written + 16 KB RFO read per block.
-/// NT stores halve the traffic and roughly double parallel throughput.
+/// Streaming stores can avoid write-allocation reads on x86.
+/// Other targets use ordinary stores.
 ///
 /// # Safety
 ///
-/// `base + off` must be 16/32/64-byte aligned for W = 4/8/16 respectively
-/// (true: `Block` is 64-byte aligned and `off` is a multiple of `W`) and
-/// in-bounds of the output block.
+/// `base + off` must be aligned to 16, 32, or 64 bytes for `W = 4, 8, or 16`.
+/// The destination must contain at least `W` writable elements.
 #[inline(always)]
 pub unsafe fn store_nt<const W: usize>(base: *mut f32, off: usize, v: Simd<f32, W>) {
     unsafe {

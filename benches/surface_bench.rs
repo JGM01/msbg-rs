@@ -1,24 +1,24 @@
-//! Step-9/12 surface-reconstruction benchmark: the REAL `msbg_test_sparse`
+//! Surface-reconstruction benchmark using the library's
 //! pipeline phases (PLY parse, placement, sparse bucket, 8-color splat,
-//! finalize, and end-to-end with 6 mean-curvature sweeps). Mirrors the C++
-//! `benchmark.cpp` scenario H ("surface") — real library calls on both sides,
-//! no mocks. Reports per-phase throughput + peak RSS (VmHWM).
+//! finalize, and end-to-end with 6 mean-curvature sweeps). Reports per-phase
+//! throughput and Linux process peak RSS (VmHWM). See docs/benchmarks.md for
+//! reference harness availability and historical comparisons.
 //!
 //! Sizes (per machine, `MSBG_BENCH_MACHINE=dell|macbook|aws`):
 //! - small: `bun_zipper_res2.ply`, 256³, 1 instance — identical everywhere.
-//! - dell big:    res2, 512³, 64 instances (~4.2M particles).
+//! - dell big:    res2, 512³, 64 instances (522,944 particles).
 //! - macbook big: res2, 1024³, 8171 instances (~66.8M particles, testCase 1).
 //! - aws big:     `bun_zipper.ply`, 4096³, 35947 instances (~1.29B particles).
 //! - aws xbig:    `bun_zipper.ply`, 8192³, 35947 instances (~1.29B particles).
 //! `MSBG_SURFACE_RES` / `MSBG_SURFACE_NINST` / `MSBG_SURFACE_PLY` override the
-//! defaults (the 32,768³ paper run is `MSBG_SURFACE_RES=32768` on AWS).
+//! defaults (the 32,768³ EC2 run is `MSBG_SURFACE_RES=32768` on AWS).
 
 use msbg_rs::{
     blockpool::BlockPool,
     channel::Density,
     particles::{
-        finalize, reconstruct_and_smooth, sort, splat, DEFAULT_MSX, DomainBounds, GridDims,
-        SurfaceConfig,
+        DEFAULT_MSX, DomainBounds, GridDims, SurfaceConfig, finalize, reconstruct_and_smooth, sort,
+        splat,
     },
     solver::Fence,
     sparse_grid::SparseGrid,
@@ -114,11 +114,7 @@ fn thread_pool() -> &'static msbg_rs::thread_pool::Pool {
 }
 
 fn iters() -> usize {
-    if scale() == "small" {
-        5
-    } else {
-        2
-    }
+    if scale() == "small" { 5 } else { 2 }
 }
 
 /// Peak resident set size in MiB (Linux `/proc/self/status` VmHWM).
@@ -158,11 +154,7 @@ fn main() {
         // ---- PLY parse ----------------------------------------------------
         let t = Instant::now();
         let loaded = msbg_rs::io::ply::load_vertices(&ply).unwrap();
-        report(
-            "surface_parse",
-            loaded.positions.len() as u64,
-            t.elapsed(),
-        );
+        report("surface_parse", loaded.positions.len() as u64, t.elapsed());
         let base = &loaded.positions;
 
         let dims = GridDims::new(cfg.sx, cfg.sy, cfg.sz, BSX);
@@ -247,7 +239,10 @@ fn main() {
             let (_g, _a) = reconstruct_and_smooth::<Density, BSX, N, HSX, DEFAULT_MSX>(
                 &cfg,
                 &ply,
-                Arc::new(BlockPool::new(active.len() / blocks_per_seg + 2, blocks_per_seg)),
+                Arc::new(BlockPool::new(
+                    active.len() / blocks_per_seg + 2,
+                    blocks_per_seg,
+                )),
                 rayon::current_num_threads(),
                 Fence::Sfence,
             )

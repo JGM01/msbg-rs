@@ -1,17 +1,15 @@
-//! End-to-end step-10 demo: reconstruct the bunny density field through the
-//! `msbg_rs` public API, then render orthogonal slices + a perspective
-//! raymarch, writing PNGs.
+//! Reconstruct bunny density, then write orthogonal slices and a raymarch image.
 //!
 //! Usage: render_bunny <ply> <sx> <sy> <sz> <n_inst(0=auto)> <scale_factor> <out_dir>
 
 use std::sync::Arc;
 
 use image::Rgba;
-use msbg_render::{greyscale, raymarch, render_slice, Camera, RenderOptions, SliceAxis, turbo};
+use msbg_render::{Camera, RenderOptions, SliceAxis, greyscale, raymarch, render_slice, turbo};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::{Density, Vec3};
 use msbg_rs::math::{BoundaryCondition, Interpolation};
-use msbg_rs::particles::{reconstruct_and_smooth, DEFAULT_MSX, SurfaceConfig};
+use msbg_rs::particles::{DEFAULT_MSX, SurfaceConfig, reconstruct_and_smooth};
 use msbg_rs::solver::Fence;
 
 const BSX: usize = 16;
@@ -19,7 +17,12 @@ const N: usize = 4096;
 const HSX: usize = 18;
 
 fn arg<T: std::str::FromStr>(i: usize) -> T {
-    std::env::args().nth(i).expect("missing arg").parse().ok().expect("bad arg")
+    std::env::args()
+        .nth(i)
+        .expect("missing arg")
+        .parse()
+        .ok()
+        .expect("bad arg")
 }
 
 fn main() {
@@ -74,7 +77,8 @@ fn main() {
                 BoundaryCondition::Clamp,
                 turbo,
             );
-            img.save(format!("{out_dir}/slice_{axis:?}.png")).expect("save slice");
+            img.save(format!("{out_dir}/slice_{axis:?}.png"))
+                .expect("save slice");
         }
 
         // Perspective raymarch (turntable-ish diagonal view).
@@ -96,7 +100,9 @@ fn main() {
             disable_ess: false,
         };
         let frame = raymarch::<Density, BSX, N>(&grid, &cam, 960, 540, &opts);
-        frame.save(format!("{out_dir}/raymarch.png")).expect("save raymarch");
+        frame
+            .save(format!("{out_dir}/raymarch.png"))
+            .expect("save raymarch");
 
         // A single greyscale Z slice for a quick visual check.
         let grey = render_slice::<Density, BSX, N, { Interpolation::Linear }>(
@@ -108,7 +114,8 @@ fn main() {
             BoundaryCondition::Clamp,
             greyscale,
         );
-        grey.save(format!("{out_dir}/slice_grey.png")).expect("save grey");
+        grey.save(format!("{out_dir}/slice_grey.png"))
+            .expect("save grey");
     });
 
     println!("done: images in {out_dir}");

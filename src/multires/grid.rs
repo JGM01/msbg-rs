@@ -1,9 +1,9 @@
 //! `MultiresGrid`: the multiresolution sparse block grid (C++ `MultiresSparseGrid`).
 
 use crate::multires::blockinfo::BlockInfoStore;
-use crate::multires::level::{level_from_block_size, Level};
+use crate::multires::level::{Level, level_from_block_size};
 use crate::multires::refinement::{
-    compute_block_topology, regularize_refinement_map, BlockGridDims, RefinementMap, Topology,
+    BlockGridDims, RefinementMap, Topology, compute_block_topology, regularize_refinement_map,
 };
 
 /// Maximum number of resolution levels (C++ `MSBG_MAXRESLEVELS`).
@@ -40,11 +40,19 @@ impl MultiresGrid {
         n_levels: usize,
         dtrans_res: usize,
     ) -> Self {
-        assert!(block_size0.is_power_of_two(), "block_size0 must be a power of two");
-        assert!(block_size0 <= 32, "block_size0 must be <= 32");
-        assert!((2..=MAX_LEVELS).contains(&n_levels), "n_levels must be in 2..={MAX_LEVELS}");
         assert!(
-            sx0.is_multiple_of(block_size0) && sy0.is_multiple_of(block_size0) && sz0.is_multiple_of(block_size0),
+            block_size0.is_power_of_two(),
+            "block_size0 must be a power of two"
+        );
+        assert!(block_size0 <= 32, "block_size0 must be <= 32");
+        assert!(
+            (2..=MAX_LEVELS).contains(&n_levels),
+            "n_levels must be in 2..={MAX_LEVELS}"
+        );
+        assert!(
+            sx0.is_multiple_of(block_size0)
+                && sy0.is_multiple_of(block_size0)
+                && sz0.is_multiple_of(block_size0),
             "domain dimensions must be exact multiples of block_size0"
         );
 
@@ -83,14 +91,25 @@ impl MultiresGrid {
     /// cell flags, and fill `CH_DIST_FINECOARSE` (levelMg == 0, no obstacles).
     pub fn set_refinement_map(&mut self, map: &mut RefinementMap) -> Topology {
         regularize_refinement_map(&mut map.levels, &self.dims, self.n_levels);
-        let topo = compute_block_topology(&mut self.block_info, map, &self.dims, self.n_levels, None);
+        let topo =
+            compute_block_topology(&mut self.block_info, map, &self.dims, self.n_levels, None);
 
         for level in 0..self.n_levels {
             self.levels[level].init_cell_flags(level, map, &self.dims, &self.block_info, None);
         }
         for level in 0..self.n_levels {
-            self.levels[level].init_dist_fine_coarse(self.dtrans_res, map, &self.dims, &self.block_info);
-            self.levels[level].propagate_dist_fine_coarse_full(level, self.dtrans_res, &self.dims, &self.block_info);
+            self.levels[level].init_dist_fine_coarse(
+                self.dtrans_res,
+                map,
+                &self.dims,
+                &self.block_info,
+            );
+            self.levels[level].propagate_dist_fine_coarse_full(
+                level,
+                self.dtrans_res,
+                &self.dims,
+                &self.block_info,
+            );
         }
 
         topo
@@ -141,7 +160,11 @@ mod tests {
         map.levels[21] = 0; // block (1,1,1) in 4^3 grid
         g.set_refinement_map(&mut map);
         assert_eq!(g.block_level(21), 0);
-        assert!(g.block_info.flags(21, 0).contains(crate::multires::blockinfo::BlockFlags::FINE_COARSE));
+        assert!(
+            g.block_info
+                .flags(21, 0)
+                .contains(crate::multires::blockinfo::BlockFlags::FINE_COARSE)
+        );
     }
 
     #[test]

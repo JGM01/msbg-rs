@@ -1,9 +1,7 @@
-//! O(N²) orthogonal slice extraction.
+//! Orthogonal slice extraction.
 //!
-//! Unlike the C++ `getSlices2D` — which scans every voxel in the domain and
-//! tests membership against the three slice planes — this iterates directly
-//! over the output pixels and samples the field once per pixel (Rayon over
-//! rows). A `512³` slice costs `512²` samples instead of `512³` scans.
+//! Sample each output pixel once, with Rayon parallelism over rows.
+//! An N×N slice requires N² samples.
 
 use image::{ImageBuffer, Rgba};
 use msbg_rs::channel::Vec3;

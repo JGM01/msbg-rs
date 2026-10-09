@@ -1,24 +1,13 @@
-//! 8-color lock-free particle splatting with thread-local staging.
+//! Eight-color particle splatting with per-worker buffers.
 //!
-//! The naive scatter (the C++ `msbg_test_sparse` path) does a per-voxel
-//! `min`-RMW directly into the grid for every overlapping particle. For a
-//! dense point cloud each voxel is touched by many particles, so the same
-//! grid cache lines are read-modify-written dozens of times and the splat
-//! becomes DRAM-latency bound (measured ~17 min for 16.7M particles on this
-//! machine vs ~0.2 s for the staged path).
-//!
-//! Instead, each block's particle chunk is staged into a thread-local
-//! `(BSX + 2·margin)³` buffer (`margin = ceil(rScan)`), where the min
-//! accumulation runs in L1. The commit then writes each *touched* voxel to
-//! the grid exactly once per contributing block. Voxels near block boundaries
-//! are staged in up to 8 blocks' buffers (their margins) and committed in the
-//! *other* blocks' color passes — the 8-coloring makes the whole thing
-//! race-free with `rScan < BSX`, exactly as the direct scatter, but with the
-//! RMW count reduced from `#overlapping particles` to `#contributing blocks`.
+//! Each worker accumulates minimum distances in a `(BSX + 2·margin)³` buffer.
+//! The commit writes each touched voxel once per contributing block.
+//! This reduces repeated grid writes from overlapping particles.
+//! Eight-color scheduling requires the footprint limits checked by this module.
 
 use std::cell::UnsafeCell;
-use std::simd::cmp::SimdPartialOrd;
 use std::simd::Simd;
+use std::simd::cmp::SimdPartialOrd;
 
 use rayon::prelude::*;
 
@@ -69,9 +58,11 @@ unsafe impl<D, const MSX: usize> Sync for SplatPool<D, MSX> {}
 impl<D: Copy + Default, const MSX: usize> SplatPool<D, MSX> {
     fn new(num_threads: usize) -> Self {
         let slots = (0..=num_threads)
-            .map(|_| UnsafeCell::new(SplatSlot {
-                staging: vec![D::default(); MSX * MSX * MSX].into_boxed_slice(),
-            }))
+            .map(|_| {
+                UnsafeCell::new(SplatSlot {
+                    staging: vec![D::default(); MSX * MSX * MSX].into_boxed_slice(),
+                })
+            })
             .collect();
         Self { slots }
     }
@@ -331,7 +322,15 @@ mod tests {
 
     fn setup(sx: usize, sy: usize, sz: usize) -> SparseGrid<Density, BSX, N> {
         let pool = Arc::new(BlockPool::<Density, BSX, N>::new(64, 64));
-        SparseGrid::new("splat".into(), sx, sy, sz, Density(0), Density(u16::MAX), pool)
+        SparseGrid::new(
+            "splat".into(),
+            sx,
+            sy,
+            sz,
+            Density(0),
+            Density(u16::MAX),
+            pool,
+        )
     }
 
     fn cfg() -> SurfaceConfig {
@@ -362,8 +361,7 @@ mod tests {
     }
 
     fn do_splat(grid: &SparseGrid<Density, BSX, N>, pts: &[[f32; 3]], bids: Vec<usize>) {
-        let bucketed =
-            crate::particles::sort::bucket_by_block(pts.to_vec(), bids);
+        let bucketed = crate::particles::sort::bucket_by_block(pts.to_vec(), bids);
         splat::<Density, BSX, N, MSX>(grid, &bucketed, &cfg());
     }
 
@@ -372,7 +370,8 @@ mod tests {
     fn splat_01_single_particle_shape() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[8.0f32, 8.0, 8.0]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![0]);
 
@@ -388,7 +387,8 @@ mod tests {
     fn splat_02_boundary_crossing_particle() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[15.5f32, 8.0, 8.0]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         assert!(active.contains(&1));
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![0]);
@@ -403,7 +403,8 @@ mod tests {
     fn splat_03_overlap_min() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[10.0f32, 8.0, 8.0], [12.0, 8.0, 8.0]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![0, 0]);
         let forward = get(&grid, 10, 8, 8);
@@ -426,7 +427,8 @@ mod tests {
     fn splat_04_domain_corner_clip() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[0.1f32, 0.1, 0.1]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![0]);
         assert_ne!(get(&grid, 0, 0, 0), Density(u16::MAX));
@@ -437,7 +439,8 @@ mod tests {
     fn splat_05_radius_cull() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[16.0f32, 16.0, 16.0]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![grid.get_block_id(16, 16, 16)]);
         assert_eq!(get(&grid, 21, 16, 16), Density(u16::MAX));
@@ -449,7 +452,8 @@ mod tests {
     fn splat_06_quantize_endpoints() {
         let mut grid = setup(32, 32, 32);
         let pts = vec![[8.0f32, 8.0, 8.0]];
-        let active = crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
+        let active =
+            crate::particles::active::active_blocks(&pts, &GridDims::new(32, 32, 32, BSX), &cfg());
         fill_active(&mut grid, &active);
         do_splat(&grid, &pts, vec![0]);
         assert_eq!(get(&grid, 8, 8, 8), Density(3072));

@@ -1,11 +1,7 @@
 //! Surface reconstruction from a particle point cloud.
 //!
-//! The pipeline mirrors the C++ demo's `msbg_test_sparse` (bunny-of-bunnies):
-//! load a `.ply`, instantiate the base mesh at `n_instances` origins, bucket the
-//! placed particles by their block, splat them into a `SparseGrid` density
-//! channel with an 8-color race-free scatter, and convert the per-voxel
-//! squared-distance field into a `[0, 1]` density ready for the step-8
-//! [`Sweeper`](crate::solver::Sweeper).
+//! Load PLY positions, place instances, bucket particles, and splat distances.
+//! Convert the distance field to density, then optionally smooth it with [`Sweeper`].
 //!
 //! ```
 //! use msbg_rs::blockpool::BlockPool;
@@ -227,7 +223,10 @@ where
 {
     let loaded = crate::io::ply::load_vertices(ply)?;
     if loaded.positions.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "PLY has no vertices"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PLY has no vertices",
+        ));
     }
 
     let dims = GridDims::new(cfg.sx, cfg.sy, cfg.sz, BSX);
@@ -273,10 +272,15 @@ where
     Ok((grid, active))
 }
 
-/// `reconstruct_surface` plus the demo's mean-curvature smoothing phase (step 8
-/// [`Sweeper`]), producing the final surface density. `HSX` must be `BSX + 2`
-/// for the mean-curvature halo; `MSX` is the splat staging extent.
-pub fn reconstruct_and_smooth<D, const BSX: usize, const N: usize, const HSX: usize, const MSX: usize>(
+/// Reconstruct a surface and apply mean-curvature smoothing with [`Sweeper`].
+/// `HSX` must equal `BSX + 2`. `MSX` is the splat staging extent.
+pub fn reconstruct_and_smooth<
+    D,
+    const BSX: usize,
+    const N: usize,
+    const HSX: usize,
+    const MSX: usize,
+>(
     cfg: &SurfaceConfig,
     ply: &[u8],
     pool: Arc<BlockPool<D, BSX, N>>,

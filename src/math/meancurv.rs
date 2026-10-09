@@ -6,13 +6,11 @@ use std::simd::cmp::SimdPartialOrd;
 use std::simd::num::SimdFloat;
 use std::simd::{Select, Simd, StdFloat};
 
-/// Full-update mean-curvature smoothing over a pre-staged full halo, writing
-/// the smoothed chunk back through the storage's [`StoreBack`].
-///
-/// Update `H = Hnum / gradMagSq` (guarded at `gradMagSq > 1e-7`),
-/// `D = clamp(dt * H, ±0.1)`, `new = F0 + D`. Mixed partials are factored as
-/// `0.25*(a-b-c+d)` — fewer FLOPs than the two-stage `0.5` form. No fluid mask
-/// (every voxel is smoothed); `clamp01` is the `doConstrZeroOne` `[0, 1]` clamp.
+/// Apply mean-curvature smoothing and write through [`StoreBack`].
+/// Use `H = Hnum / gradMagSq` when `gradMagSq > 1e-7`.
+/// Then compute `D = clamp(dt * H, ±0.1)` and `new = F0 + D`.
+/// Mixed partials use `0.25*(a-b-c+d)`.
+/// All voxels are processed. `clamp01` limits output to `[0, 1]`.
 #[inline(always)]
 pub fn kernel_meancurv<const W: usize, const BSX: usize, const HSX: usize, D>(
     halo: &HaloBlock<BSX, HSX>,
@@ -83,10 +81,8 @@ pub fn kernel_meancurv<const W: usize, const BSX: usize, const HSX: usize, D>(
                     let cross = fx * (fy * fyx) + fx * (fz * fzx) + fy * (fz * fzy);
                     let hnum = (fy * fy + fz * fz).mul_add(
                         fxx,
-                        (fx * fx + fz * fz).mul_add(
-                            fyy,
-                            (fx * fx + fy * fy).mul_add(fzz, -two * cross),
-                        ),
+                        (fx * fx + fz * fz)
+                            .mul_add(fyy, (fx * fx + fy * fy).mul_add(fzz, -two * cross)),
                     );
 
                     let grad = fx.mul_add(fx, fy.mul_add(fy, fz * fz));
@@ -95,7 +91,11 @@ pub fn kernel_meancurv<const W: usize, const BSX: usize, const HSX: usize, D>(
                     let d = (dtv * h).simd_clamp(lo, hi);
 
                     let new = f0 + d;
-                    let new = if clamp01 { new.simd_clamp(zero, one) } else { new };
+                    let new = if clamp01 {
+                        new.simd_clamp(zero, one)
+                    } else {
+                        new
+                    };
 
                     D::store_chunk(out, out_idx, new, rng);
                 }
@@ -148,16 +148,11 @@ mod tests {
         let fyx = 0.25 * (d1 - d2 - d3 + d4);
         let fzx = 0.25 * (d5 - d6 - d7 + d8);
         let fzy = 0.25 * (d9 - d10 - d11 + d12);
-        let hnum = (fy * fy + fz * fz) * fxx
-            + (fx * fx + fz * fz) * fyy
-            + (fx * fx + fy * fy) * fzz
-            - 2.0 * (fx * fy * fyx + fx * fz * fzx + fy * fz * fzy);
+        let hnum =
+            (fy * fy + fz * fz) * fxx + (fx * fx + fz * fz) * fyy + (fx * fx + fy * fy) * fzz
+                - 2.0 * (fx * fy * fyx + fx * fz * fzx + fy * fz * fzy);
         let grad = fx * fx + fy * fy + fz * fz;
-        if grad > 1e-7 {
-            hnum / grad
-        } else {
-            0.0
-        }
+        if grad > 1e-7 { hnum / grad } else { 0.0 }
     }
 
     /// Scalar full-update reference.
@@ -221,7 +216,12 @@ mod tests {
 
         for i in 0..N {
             let d = (out.data[i] - ref_out[i]).abs();
-            assert!(d < 1e-4, "mismatch at {i}: simd={} scalar={}", out.data[i], ref_out[i]);
+            assert!(
+                d < 1e-4,
+                "mismatch at {i}: simd={} scalar={}",
+                out.data[i],
+                ref_out[i]
+            );
         }
     }
 
@@ -247,8 +247,8 @@ mod tests {
         for z in 1..=16 {
             for y in 1..=16 {
                 for x in 1..=16 {
-                    let expected =
-                        2.0 * (x as i32 - 1) as f32 + 3.0 * (y as i32 - 1) as f32 - (z as i32 - 1) as f32;
+                    let expected = 2.0 * (x as i32 - 1) as f32 + 3.0 * (y as i32 - 1) as f32
+                        - (z as i32 - 1) as f32;
                     assert!((out.data[out_idx] - expected).abs() < 1e-5);
                     out_idx += 1;
                 }
@@ -274,7 +274,13 @@ mod tests {
 
         let mut out = Block::<f32, BSX, N>::new();
         let mut rng = SimdRng::<LANES>::seed(3);
-        kernel_meancurv::<LANES, BSX, HSX, f32>(&halo, 100.0, false, out.data.as_mut_ptr(), &mut rng);
+        kernel_meancurv::<LANES, BSX, HSX, f32>(
+            &halo,
+            100.0,
+            false,
+            out.data.as_mut_ptr(),
+            &mut rng,
+        );
 
         // Cell at relative (10,8,8): r=2, curvature ~=1, D = +100*1 -> clamped +0.1.
         let idx = 10 + 8 * 16 + 8 * 256;

@@ -1,5 +1,4 @@
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-06-18"
 profile = "minimal"
-# miri (UB detection) + rust-src (miri builds std from source) for `cargo miri`.
-components = ["miri", "rust-src"]
+components = ["rustfmt"]

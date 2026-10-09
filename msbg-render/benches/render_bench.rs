@@ -1,24 +1,19 @@
-//! Step-10 rendering benchmark: REAL `msbg-rs` reconstruction → REAL renderer
-//! (`msbg-render`) on both the Rust side and the C++ `rendertest.cpp` harness.
-//! No mocks — the density field is produced by the step-9 pipeline, and the
-//! render consumes only the public `Sampler`/`SparseGrid` API.
+//! Rendering benchmark on a reconstructed density field.
 //!
-//! Sizes:
-//! - small: `bun_zipper_res2.ply`, 256³, 1 instance, 640×480 frame.
-//! - big:   `bun_zipper_res2.ply`, 512³, 64 instances, 1280×720 frame.
-//!
-//! Output lines are `[Rust] render_* ...` for side-by-side comparison with the
-//! `[C++]` lines from `../MSBG/build/rendertest`.
+//! Small: 256³, one bunny instance, 640×480 output.
+//! Big: 512³, 64 instances, 1280×720 output.
+//! Both use `bun_zipper_res2.ply`.
+//! See docs/benchmarks.md for the historical C++ comparison and its limits.
 
 use std::sync::Arc;
 use std::time::Instant;
 use std::{env, hint::black_box};
 
-use msbg_render::{greyscale, raymarch, render_slice, Camera, RenderOptions, SliceAxis, turbo};
+use msbg_render::{Camera, RenderOptions, SliceAxis, greyscale, raymarch, render_slice, turbo};
 use msbg_rs::blockpool::BlockPool;
 use msbg_rs::channel::{Density, Vec3};
 use msbg_rs::math::Interpolation;
-use msbg_rs::particles::{reconstruct_and_smooth, DEFAULT_MSX, SurfaceConfig};
+use msbg_rs::particles::{DEFAULT_MSX, SurfaceConfig, reconstruct_and_smooth};
 use msbg_rs::solver::Fence;
 
 const BSX: usize = 16;
@@ -82,7 +77,7 @@ fn report(name: &str, n_units: u64, dur: std::time::Duration) {
 
 fn main() {
     println!("============================================================");
-    println!(" msbg-render Step-10 Rendering Benchmark (scale={})", scale());
+    println!(" msbg-render Rendering Benchmark (scale={})", scale());
     println!("============================================================\n");
 
     let cfg = config();
@@ -98,7 +93,10 @@ fn main() {
             Fence::Sfence,
         )
         .unwrap();
-        println!("    (reconstruction {:.3} ms)\n", t0.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "    (reconstruction {:.3} ms)\n",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
 
         // ---- O(N²) slices (3 planes, like the C++ getSlices2D) ------------
         {
@@ -107,16 +105,31 @@ fn main() {
             let sz = grid.sz as f32;
             let t = Instant::now();
             let a = render_slice::<Density, BSX, N, { Interpolation::Linear }>(
-                &grid, SliceAxis::X, sx * 0.5, grid.sz, grid.sy,
-                msbg_rs::math::BoundaryCondition::Clamp, greyscale,
+                &grid,
+                SliceAxis::X,
+                sx * 0.5,
+                grid.sz,
+                grid.sy,
+                msbg_rs::math::BoundaryCondition::Clamp,
+                greyscale,
             );
             let b = render_slice::<Density, BSX, N, { Interpolation::Linear }>(
-                &grid, SliceAxis::Y, sy * 0.5, grid.sx, grid.sz,
-                msbg_rs::math::BoundaryCondition::Clamp, turbo,
+                &grid,
+                SliceAxis::Y,
+                sy * 0.5,
+                grid.sx,
+                grid.sz,
+                msbg_rs::math::BoundaryCondition::Clamp,
+                turbo,
             );
             let c = render_slice::<Density, BSX, N, { Interpolation::Linear }>(
-                &grid, SliceAxis::Z, sz * 0.5, grid.sx, grid.sy,
-                msbg_rs::math::BoundaryCondition::Clamp, greyscale,
+                &grid,
+                SliceAxis::Z,
+                sz * 0.5,
+                grid.sx,
+                grid.sy,
+                msbg_rs::math::BoundaryCondition::Clamp,
+                greyscale,
             );
             black_box((&a, &b, &c));
             let px = (grid.sz * grid.sy + grid.sx * grid.sz + grid.sx * grid.sy) as u64;
@@ -152,7 +165,10 @@ fn main() {
             black_box(&img);
             report("render_raymarch", (w * h) as u64, t.elapsed());
 
-            let opts_off = RenderOptions { disable_ess: true, ..opts };
+            let opts_off = RenderOptions {
+                disable_ess: true,
+                ..opts
+            };
             let t = Instant::now();
             let img_off = raymarch::<Density, BSX, N>(&grid, &cam, w, h, &opts_off);
             black_box(&img_off);

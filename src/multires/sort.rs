@@ -24,14 +24,9 @@ pub fn morton3(x: usize, y: usize, z: usize) -> u64 {
 /// Sort a block list by a level-scaled Morton key so a coarse block and its
 /// finer descendants are contiguous.
 ///
-/// The key is computed on the coarsest lattice: every block shares the Morton
-/// code of its coarsest-level ancestor, with coarser levels ordered first and
-/// the fine offset (Morton-ordered) last. This makes the coarse block appear
-/// directly before its ≤8 finer children — the index-space interleaving that a
-/// cache-friendly sweep (and, later, temporal blocking) needs, without touching
-/// physical block allocation.
-///
-/// C++ has the same idea (`sortBlockListMorton`) but it is `#ifdef`'d out.
+/// The key combines the coarsest ancestor, resolution level, and fine offset.
+/// Coarser blocks sort before their finer descendants.
+/// Sorting changes iteration order without moving block allocations.
 pub fn sort_block_list_morton(
     blocks: &mut [usize],
     dims: &BlockGridDims,
@@ -91,7 +86,12 @@ mod tests {
     fn test_morton_03b_bijective_wide() {
         // Above the old 10-bit-per-axis limit (which overflowed u32): a
         // 12-bit coordinate must still interleave bijectively in 64 bits.
-        for (x, y, z) in [(0usize, 0, 2047), (2047, 0, 0), (1024, 1024, 1024), (2047, 2047, 2047)] {
+        for (x, y, z) in [
+            (0usize, 0, 2047),
+            (2047, 0, 0),
+            (1024, 1024, 1024),
+            (2047, 2047, 2047),
+        ] {
             let code = morton3(x, y, z);
             assert!(code != 0 || (x, y, z) == (0, 0, 0), "wide morton collided");
             // 63-bit code fits.
@@ -119,6 +119,9 @@ mod tests {
         }
         sort_block_list_morton(&mut blocks, &dims, &levels, 2);
         // The coarse block must come first.
-        assert_eq!(blocks[0], 21, "coarse block should precede its fine children");
+        assert_eq!(
+            blocks[0], 21,
+            "coarse block should precede its fine children"
+        );
     }
 }

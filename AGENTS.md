@@ -1,232 +1,58 @@
-# AGENTS.md — msbg-rs (Rust port)
+# Working on msbg-rs
 
-Rust port of *Multiresolution Sparse Block Grids* (SIGGRAPH 2025 phase-field
-FLIP paper). The reference C++ implementation lives in `../MSBG` and is the
-baseline for benchmarks and the differential test.
+This is a Rust implementation of the SIGGRAPH 2025 MSBG grid method.
+The companion C++ reference is `../MSBG`. It is optional for Rust builds.
+Read `README.md` and the relevant source before editing.
 
-## Toolchain
+## Build and test
 
-**Nightly Rust is required** — `src/lib.rs` uses `#![feature(portable_simd)]`
-and `#![feature(adt_const_params)]`.
+Use rustup and the toolchain in `rust-toolchain.toml`.
+Stable Rust cannot build the SIMD and const-generic code.
+Nix is optional and Linux-specific.
 
-```bash
-cd /home/jacob/programming/msbg-rs
-nix-shell   # provides rustup + gcc; rust-toolchain.toml pins `nightly`
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --lib --locked
+cargo test -p msbg-render --test render_tests --locked
+cargo test --workspace --doc --locked
 ```
 
-`rustup` auto-installs/selects the pinned nightly the first time `cargo` runs.
-All `rustc`/`cargo` invocations below assume this shell.
+The full suite also needs `../MSBG/data/bun_zipper_res2.ply`.
+Use `MSBG_DATA_DIR` for another data directory.
+Live C++ tests return early when their binary variables are absent.
+Do not count those returns as executed C++ comparisons.
+See `docs/development.md` for details.
 
-**Platform: portable.** Unlike the C++ baseline (`../MSBG`), this crate compiles
-and runs on macOS (including arm64/Apple Silicon) as well as Linux x86-64, since
-it uses `std::simd` (`portable_simd`) rather than x86-only intrinsics. The `nix`
-shell here is Linux-specific, but `cargo build`/`test`/`bench` work on macOS with
-a plain nightly toolchain.
+## Code map
 
-## Layout
+- `src/blockpool.rs`, `src/blockmap.rs`, `src/sparse_grid.rs`: storage.
+- `src/channel.rs`: channels and quantization.
+- `src/math/`: sampling and SIMD kernels.
+- `src/multires/`: topology, halos, levels, and restriction.
+- `src/solver.rs`: single-resolution smoothing.
+- `src/particles/`: placement, bucketing, and reconstruction.
+- `src/fluid/`: MAC transfer and divergence.
+- `msbg-render/`: rendering through the public core API.
 
-- `src/blockpool.rs` — aligned `Block` + lock-free monotonic `Pool<T>` (`BlockPool` = `Pool<Block>`)
-- `src/blockmap.rs` — sparse block-id-keyed open-addressing `BlockMap<V>`
-- `src/sparse_grid.rs` — single-level `SparseGrid<T>`
-- `src/multires/` — `halo.rs` (18³ gather), `iterator.rs`
-- `src/math/` — `sample.rs` (interpolation), `bspline.rs`, `gather.rs`,
-  `boundary.rs`, `laplacian.rs` (SIMD kernels)
-- `src/particles/` — step-9 surface reconstruction (`sort` placement + bucket,
-  `splat` staged 8-color scatter, `finalize`, `active`)
-- `src/io/` — PLY loading
-- `src/thread_pool.rs` — rayon pool with FTZ/DAZ workers
-- `benches/allocator_benches.rs` — criterion benches (scenarios A–E)
-- `benches/interp_bench.rs` — field-sampling benches (scenario G)
-- `benches/surface_bench.rs` — step-9 surface benches (scenario H)
-- `benches/multires_scale_bench.rs` — multires memory-bound stress (M3 Pro 36 GB):
-  self-sizes the fine-shell density to `MSBG_STRESS_GB` (default 28 GB) and times
-  `set_refinement_map` + `fill_multires` halo + downsample at a working set that
-  cannot fit in cache. `MSBG_BENCH_SCALE=small` clamps to 0.5 GB (validates on
-  the Dell 5500U). Run the real thing on the MacBook with
-  `cargo bench --bench multires_scale_bench`.
-- `tests/difftest_cpp.rs` — differential test against the C++ baseline
-- `tests/difftest_interp.rs` — interpolation difftest vs `../MSBG/interptest.cpp`
-- `msbg-render/` — step-10 rendering **workspace crate** (camera, colormap,
-  `slice` O(N²) slicer, `raymarch` ESS-DDA isosurface raymarcher, `render_elem`),
-  `examples/render_bunny.rs`, `benches/render_bench.rs`, `tests/render_tests.rs`.
-  Depends only on `msbg-rs`'s `pub` API + `image`/`rayon`.
-- `docs/roadmap.md` — feature-parity plan; `docs/refactor.md` — design notes
+## Code and prose
 
-## Build & test
-
-```bash
-cargo build
-cargo test                      # unit tests + the difftest hash check
-cargo bench --bench allocator_benches
-cargo bench --bench interp_bench
-```
+- Justify unsafe operations and state their invariants beside the code.
+- Enforce safety-critical preconditions in release builds of safe public APIs.
+- Review initialization, aliasing, lifetimes, alignment, padding, and parallel ownership.
+- Do not use `std::thread_local!` inside Rayon closures.
+- Choose explicit chunks, worker buffers, or fold/reduce to suit the workload.
+  A fold accumulator can be created more than once per worker.
+- Use `thread_pool::Pool` when x86 FTZ/DAZ settings matter.
+- Comments should explain invariants and decisions.
 
 ## Benchmarks
 
-Two knobs: `MSBG_BENCH_MACHINE` (auto-detected: `macos` → `macbook`, else
-`dell`) and `MSBG_BENCH_SCALE` (`small|big|xbig`, default `big`; `full` is an
-alias for `big`).
+Start with `MSBG_BENCH_SCALE=small`. Stress workloads can need hundreds of gigabytes.
+Check output before timing.
+Match hardware, data, precision, block size, scheduling, compiler features, and thread counts.
+Some later C++ harnesses are absent from the current checkout.
+Recover them before attempting those comparisons.
 
-```bash
-MSBG_BENCH_SCALE=small cargo bench --bench allocator_benches   # fast, identical on every machine
-cargo bench --bench allocator_benches                          # big = per-machine full stress
-MSBG_BENCH_SCALE=xbig cargo bench --bench allocator_benches    # MacBook-only aggressive (>=32GB)
-```
-
-- `small` is the same on every machine — use it to compare the Dell (5500U)
-  against the MacBook (M3 Pro).
-- `big` is per-machine: Dell `[10k,100k,250k]` blocks / `[10k,50k,100k]` active;
-  MacBook `[100k,500k,1M]` blocks / `[50k,250k,500k]` active (~20 GB peak).
-- `xbig` (MacBook) pushes to `[100k,1M,1.5M]` blocks / `[50k,250k,750k]` active
-  (~30 GB peak). On Dell it errors out.
-
-A banner (`machine / arch / os / cores / threads`) is printed before each run.
-The C++ baseline (`../MSBG/benchmark.cpp` scenarios A–E, G) only builds on Linux;
-on macOS the benches are **Rust-only** — compare against the Dell Rust numbers,
-not C++. See `docs/refactor.md` for the aarch64 caveats (128-bit NEON vs 256-bit
-AVX2, FTZ/DAZ no-op, P/E-core asymmetry).
-
-`benches/interp_bench.rs` (field-sampling throughput) mirrors scenario G
-(`../MSBG/benchmark.cpp interp`); see `docs/refactor.md` §7 for the
-interpolation design notes and how the numbers compare.
-
-## Differential test vs C++
-
-`tests/difftest_cpp.rs` runs the same fixed write/read script as the C++
-`difftest.cpp` and folds every voxel's f32 bits into an FNV-1a hash.
-
-1. Build the C++ side (in the MSBG shell):
-   ```bash
-   cd ../MSBG && nix-shell && ./build_difftest.sh && exit
-   ```
-2. Run the live comparison (in this shell):
-   ```bash
-   MSBG_CPP_DIFFTEST_BIN="$PWD/../MSBG/build/difftest" cargo test --test difftest_cpp
-   ```
-
-Two tests run:
-- `difftest_matches_cpp_hash` — compares the native hash to the hardcoded
-  `CPP_HASH` (no C++ binary needed).
-- `difftest_against_cpp_binary_if_available` — skipped unless
-  `MSBG_CPP_DIFFTEST_BIN` is set; runs the binary and compares its output.
-
-### Regenerating `CPP_HASH`
-
-If the C++ grid layout changes, rebuild `difftest`, capture its output, and
-paste it into the `CPP_HASH` const in `tests/difftest_cpp.rs`:
-
-```bash
-cd ../MSBG && nix-shell --run './build_difftest.sh && ./build/difftest'
-```
-
-### Interpolation difftest (`tests/difftest_interp.rs`)
-
-Compares sampled value/gradient/Hessian against `../MSBG/interptest.cpp`
-within 1e-4 (tolerance-based; not bit-exact). Golden values are hardcoded, so
-no C++ binary is needed unless you want the live check:
-
-```bash
-cd ../MSBG && nix-shell && ./build_interptest.sh && exit
-MSBG_CPP_INTERTEST_BIN="$PWD/../MSBG/build/interptest" cargo test --test difftest_interp
-```
-
-### Solver difftest (`tests/difftest_smoother.rs`)
-
-Compares the 8-color in-place `Sweeper` (4 iterations) against
-`../MSBG/smoothertest.cpp` — the REAL `applyChannelPdeFast` in its live path
-(`-(laplTyp + OPT_8_COLOR_SCHEME)`). Golden samples are hardcoded (Laplacian
-1e-4, mean-curvature 1e-3; see `docs/refactor.md` §8); the live check runs the
-C++ binary if `MSBG_CPP_SMOOTHERTEST_BIN` is set:
-
-```bash
-cd ../MSBG && nix-shell && ./build_smoothertest.sh && exit
-MSBG_CPP_SMOOTHERTEST_BIN="$PWD/../MSBG/build/smoothertest" cargo test --test difftest_smoother
-```
-
-### Surface difftest (`tests/difftest_splat.rs`)
-
-Compares the step-9 surface-reconstruction pipeline (PLY load, placement, staged
-8-color splat, finalize, 6 mean-curvature sweeps) against
-`../MSBG/splattest.cpp`. Golden samples are hardcoded; the live check runs the
-C++ binary if `MSBG_CPP_SPLATTEST_BIN` is set and compares the two full u16
-fields within a budget (L-inf ≤ 2 ulps, ≤0.1% off by 1 ulp — the finalize sqrt
-near particle centers amplifies 1-ulp ratio differences):
-
-```bash
-cd ../MSBG && nix-shell && ./build_splattest.sh && exit
-MSBG_CPP_SPLATTEST_BIN="$PWD/../MSBG/build/splattest" cargo test --test difftest_splat
-```
-
-### Render benchmark (step 10)
-
-The `msbg-render` bench runs the REAL reconstruction then the REAL renderers
-(`slice` + `raymarch`); the C++ side (`../MSBG/rendertest.cpp`) runs the real
-`getSlices2D` + `RaymarchRenderer`. Compare the `[Rust]` / `[C++]` lines:
-
-```bash
-cd ../MSBG && nix-shell && ./build_rendertest.sh && exit
-./build/rendertest data/bun_zipper_res2.ply 512 512 512 64 0.01 2.0 2.0 6 0.05 960 540
-
-cd ../msbg-rs && nix-shell
-MSBG_BENCH_SCALE=big MSBG_RENDER_W=960 MSBG_RENDER_H=540 cargo bench -p msbg-render --bench render_bench
-```
-
-### Surface reconstruction benchmark (step 12) + AWS
-
-`benches/surface_bench.rs` times each phase of the REAL `msbg_test_sparse`
-pipeline (parse / place / sparse bucket / 8-color splat / finalize / e2e) and
-reports peak RSS (VmHWM) per phase. Mirrors C++ `benchmark.cpp surface`:
-
-```bash
-# side-by-side (Dell, 512^3 / 64 instances)
-cd ../MSBG && nix-shell && MSBG_BENCH_SCALE=big ./build/bench_executable surface && exit
-cd ../msbg-rs && nix-shell
-MSBG_BENCH_SCALE=big cargo bench --bench surface_bench
-```
-
-`MSBG_BENCH_MACHINE=dell|macbook|aws` picks the default sizes (`surface_bench`
-and `allocator_benches` both honor it); `MSBG_BENCH_SCALE=small|big|xbig` picks
-the scale. `MSBG_SURFACE_RES` / `MSBG_SURFACE_NINST` / `MSBG_SURFACE_SCALE` /
-`MSBG_SURFACE_PLY` override the per-phase defaults. The `aws` machine defaults
-to `bun_zipper.ply` (35,947 verts) — `big` = 4096³/35,947 (~1.29B particles),
-`xbig` = 8192³/35,947.
-
-The paper-scale showcase (reconstruct **and** write the teaser image in one
-process, with per-phase throughput + RSS) is the `bunny_of_bunnies` example:
-
-```bash
-# testCase 2 at 32,768³ (~1.29B particles, ~100B active voxels, ~200 GB) on the 256 GB AWS box:
-cargo run -p msbg-render --release --example bunny_of_bunnies -- \
-    ../MSBG/data/bun_zipper.ply 32768 32768 32768 35947 0.005 out_msbg_aws 3840 2160
-```
-
-It writes `out_msbg_aws/bunny_of_bunnies.png` (ESS-DDA raymarch) + `slice_z.png`
-(whole-domain downsampled slice) and prints `[Rust] <phase>: …ms (…/s, rss=… MiB)`
-for parse/place/bucket/splat/finalize/mean_curvature/render — the throughput /
-memory / wall-clock numbers to compare against the paper's ~10B unknowns/s.
-
-## Debugging
-
-
-The shell ships both Rust-specific tooling (`cargo miri`, `cargo asm`,
-`cargo bloat`, `cargo llvm-lines`, `cargo flamegraph`, `cargo geiger`,
-`cargo nextest`) and the ELF-level tools (`gdb`, `perf`, `llvm-mca`, `pahole`,
-`valgrind`, `rr`, `heaptrack`, `strace`) — the latter also work on the C++
-binaries in `../MSBG`. See `.agents/skills/debugging/SKILL.md` for what each is
-for and example invocations, and `.agents/skills/compare-cpp-rust/SKILL.md` for
-the side-by-side C++-vs-Rust comparison workflow (spawn a subagent per repo,
-aggregate IPC/cache/code-size/layout).
-- `./profile-linux.sh <bench-group>` (Linux) / `./profile-macos.sh <bench-group>`
-  profile one benchmark and write `target/profile/profile.txt` (flat top-N
-  self-time) + `flamegraph.svg`.
-
-## Conventions
-
-- Unsafe is only acceptable when performance parity or improvement depends on it. Additionally,
-  You must `debug_assert` the conditions that prove the Unsafe is fine.
-- Don't use `std::thread_local!` inside rayon closures (use `.fold().reduce()`).
-- FTZ/DAZ is enabled per-worker via `thread_pool::Pool` (see `docs/refactor.md`).
-- No comments unless they explain *why*; keep names self-documenting.
-- `//!` doc comments are API docs: state purpose and show a usage example —
-  no roadmap status, C++-internal names, or "what we dropped/rejected" notes
-  (that belongs in `docs/refactor.md` or `docs/roadmap.md`).
+Retain raw results and the run configuration.
+Separate memory estimates from RSS, and Rust measurements from paper results.
+See `docs/benchmarks.md` for commands and recorded results.

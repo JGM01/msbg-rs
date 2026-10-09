@@ -1,16 +1,10 @@
-//! Empty-space-skipping isosurface raymarcher.
+//! Isosurface raymarching with empty-space skipping.
 //!
-//! The C++ `RaymarchRenderer` marches every ray with a fixed step and does a
-//! per-sample `isEmptyBlock` early-out that returns `0` *without advancing* —
-//! so an empty region is still micro-stepped one voxel at a time. This renderer
-//! instead walks the `BSX³` block lattice with an Amanatides–Woo DDA and skips
-//! an empty block in O(1) by jumping to the ray's exit plane of that block,
-//! only fine-stepping inside value blocks (where the iso surface lives).
-//!
-//! Iso detection and shading use a unified linear sample + linear gradient
-//! (the C++ splits trilinear detection vs cubic shading — a wart, not a
-//! feature). Samples are taken in *physical* density space (`RenderElem`), so
-//! `Density8`'s sqrt compression is undone before the `iso_level` comparison.
+//! A block-level DDA advances across empty blocks in one step.
+//! Within allocated blocks, the renderer samples at the configured step size.
+//! Detection and shading use linear interpolation and linear gradients.
+//! The C++ reference uses cubic shading, which affects image and timing comparisons.
+//! `Density8` samples are squared before comparison with `iso_level`.
 
 use image::{ImageBuffer, Rgba};
 use msbg_rs::channel::Vec3;
@@ -18,7 +12,7 @@ use msbg_rs::math::{BoundaryCondition, GridAlignment, Interpolation, Sampler};
 use msbg_rs::sparse_grid::SparseGrid;
 use rayon::prelude::*;
 
-use crate::camera::{normalize, Camera, Ray};
+use crate::camera::{Camera, Ray, normalize};
 use crate::render_elem::RenderElem;
 
 #[derive(Clone, Copy, Debug)]
@@ -94,15 +88,7 @@ struct BlockDda {
 }
 
 impl BlockDda {
-    fn new(
-        o: [f32; 3],
-        d: [f32; 3],
-        t0: f32,
-        nx: usize,
-        ny: usize,
-        nz: usize,
-        bsx: usize,
-    ) -> Self {
+    fn new(o: [f32; 3], d: [f32; 3], t0: f32, nx: usize, ny: usize, nz: usize, bsx: usize) -> Self {
         let bsxf = bsx as f32;
         let mut p = [0.0f32; 3];
         for i in 0..3 {
@@ -228,14 +214,22 @@ where
             // block with no `t` change rather than stalling or dying.
             dda.advance();
             prev_d = 0.0;
-            prev_p = [o[0] + d[0] * dda.t, o[1] + d[1] * dda.t, o[2] + d[2] * dda.t];
+            prev_p = [
+                o[0] + d[0] * dda.t,
+                o[1] + d[1] * dda.t,
+                o[2] + d[2] * dda.t,
+            ];
             continue;
         }
 
         let texit = fmin(dda.exit_t(), t_limit);
         while dda.t < texit {
             let tnext = fmin(dda.t + opts.step_size, texit);
-            let pn = [o[0] + d[0] * tnext, o[1] + d[1] * tnext, o[2] + d[2] * tnext];
+            let pn = [
+                o[0] + d[0] * tnext,
+                o[1] + d[1] * tnext,
+                o[2] + d[2] * tnext,
+            ];
             let dn = sample_physical(sampler, pn);
             if prev_d < opts.iso_level && dn >= opts.iso_level {
                 let alpha = (opts.iso_level - prev_d) / (dn - prev_d);

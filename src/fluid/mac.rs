@@ -1,17 +1,10 @@
-//! The staggered MAC grid: three face-velocity and three face-mass scalar
-//! channels over [`SparseGrid<f32>`].
+//! Staggered MAC grid with three velocity and three mass channels.
 //!
-//! Convention: face-component `a`'s voxel `(i,j,k)` stores the face value of the
-//! **right** face of cell `(i,j,k)`, located at the cell center
-//! `(i+½, j+½, k+½) + ½·e_a`. So the face-a grid is the cell-centered grid
-//! shifted by half a cell along axis `a`; the half-cell shift lives in the
-//! sampling/staging coordinates, not the storage, keeping every grid cell-sized.
-//! The right-most faces (`i = sx`, etc.) lie on the domain boundary and are the
-//! caller's boundary condition (treated as 0 by [`MacGrid::divergence`]).
-//!
-//! Six scalar `f32` channels (not three `Vec3`) so the P2G splat and the
-//! step-14 Poisson stencil both stream pure scalar lanes — the C++ `Vec3Float`
-//! AoS layout forces 3-wide loads that block its own SIMD.
+//! Component `a` at `(i, j, k)` stores the right face of that cell.
+//! Its position is `(i+½, j+½, k+½) + ½·e_a`.
+//! Sampling and splatting apply the half-cell offset.
+//! `MacGrid::divergence` treats missing domain-boundary faces as zero.
+//! Separate scalar channels keep each component contiguous.
 
 use std::sync::Arc;
 
@@ -89,9 +82,8 @@ impl<const BSX: usize, const N: usize> MacGrid<BSX, N> {
         &mut self.mass[a]
     }
 
-    /// Materialize (once) and zero every channel over `active` blocks. The P2G
-    /// splat `+=` into these, so they must start zeroed (unlike the step-9
-    /// density splat, which starts at `full()` and takes the `min`).
+    /// Allocate and zero all channels over `active` blocks.
+    /// Sum splatting requires zero initial mass and momentum.
     pub fn zero_blocks(&mut self, active: &[usize]) {
         for a in 0..3 {
             self.velocity[a].ensure_blocks_parallel(active);
@@ -131,14 +123,9 @@ impl<const BSX: usize, const N: usize> MacGrid<BSX, N> {
         }
     }
 
-    /// Cell-centered divergence `∇·u* = Σ_a (u_a(right) − u_a(left))`. The
-    /// leftmost faces (`i = 0` per axis) read 0 (the domain boundary); boundary
-    /// conditions are a step-18 concern.
-    pub fn divergence(
-        &self,
-        dst: &mut SparseGrid<f32, BSX, N>,
-        active: &[usize],
-    ) {
+    /// Cell-centered divergence `∇·u* = Σ_a (u_a(right) − u_a(left))`.
+    /// Missing boundary faces read as zero.
+    pub fn divergence(&self, dst: &mut SparseGrid<f32, BSX, N>, active: &[usize]) {
         dst.ensure_blocks_parallel(active);
         let (u, v, w) = (&self.velocity[X], &self.velocity[Y], &self.velocity[Z]);
         let sx = self.sx();
@@ -149,19 +136,39 @@ impl<const BSX: usize, const N: usize> MacGrid<BSX, N> {
             if dp.is_null() {
                 return;
             }
-            let (bx, by, bz) = (bid % self.nx(), (bid / self.nx()) % self.ny(), bid / self.nxy());
+            let (bx, by, bz) = (
+                bid % self.nx(),
+                (bid / self.nx()) % self.ny(),
+                bid / self.nxy(),
+            );
             let (gx0, gy0, gz0) = (bx * BSX, by * BSX, bz * BSX);
-            let (gx1, gy1, gz1) = ((gx0 + BSX).min(sx), (gy0 + BSX).min(sy), (gz0 + BSX).min(sz));
+            let (gx1, gy1, gz1) = (
+                (gx0 + BSX).min(sx),
+                (gy0 + BSX).min(sy),
+                (gz0 + BSX).min(sz),
+            );
             let mut vid = 0usize;
             for z in gz0..gz1 {
                 for y in gy0..gy1 {
                     for x in gx0..gx1 {
                         let ux1 = u.get_voxel(x, y, z);
-                        let ux0 = if x == 0 { 0.0 } else { u.get_voxel(x - 1, y, z) };
+                        let ux0 = if x == 0 {
+                            0.0
+                        } else {
+                            u.get_voxel(x - 1, y, z)
+                        };
                         let vy1 = v.get_voxel(x, y, z);
-                        let vy0 = if y == 0 { 0.0 } else { v.get_voxel(x, y - 1, z) };
+                        let vy0 = if y == 0 {
+                            0.0
+                        } else {
+                            v.get_voxel(x, y - 1, z)
+                        };
                         let wz1 = w.get_voxel(x, y, z);
-                        let wz0 = if z == 0 { 0.0 } else { w.get_voxel(x, y, z - 1) };
+                        let wz0 = if z == 0 {
+                            0.0
+                        } else {
+                            w.get_voxel(x, y, z - 1)
+                        };
                         unsafe { *dp.add(vid) = (ux1 - ux0) + (vy1 - vy0) + (wz1 - wz0) };
                         vid += 1;
                     }

@@ -1,4 +1,4 @@
-//! Field sampling over a [`SparseGrid`](crate::sparse_grid::SparseGrid):
+//! Field sampling over a [`SparseGrid`]:
 //! trilinear and cubic B-spline interpolation with analytic gradient (and
 //! Hessian), plus a vector-field sampler.
 //!
@@ -23,18 +23,18 @@
 //! # Dequantization
 //!
 //! Samples are linearized to `f32` before interpolation (`u16` -> `[0, 1]`,
-//! `u8` -> `[0, 1]`). [`Density8`](crate::channel::Density8) is stored
+//! `u8` -> `[0, 1]`). [`Density8`] is stored
 //! sqrt-compressed, so sampling it returns the interpolated sqrt-space value;
 //! square it to recover a physical density.
 
+use std::simd::StdFloat;
 use std::simd::f32x4;
 use std::simd::num::SimdFloat;
-use std::simd::StdFloat;
 
 use crate::channel::{Density, Density8, FaceDensity, Vec3, Velocity};
 use crate::math::boundary::{BoundaryCondition, GridAlignment, Interpolation};
-use crate::math::bspline::{cubic_deriv2_weights, cubic_deriv_weights, cubic_weights};
-use crate::math::gather::{gather_map, Dequant};
+use crate::math::bspline::{cubic_deriv_weights, cubic_deriv2_weights, cubic_weights};
+use crate::math::gather::{Dequant, gather_map};
 use crate::sparse_grid::SparseGrid;
 
 /// Element type of a scalar channel: dequantizes to `f32`.
@@ -85,7 +85,11 @@ impl Dequant<Vec3> for FaceDensity {
     #[inline(always)]
     fn dequant(self) -> Vec3 {
         let inv = 1.0 / u16::MAX as f32;
-        Vec3([self.0[0] as f32 * inv, self.0[1] as f32 * inv, self.0[2] as f32 * inv])
+        Vec3([
+            self.0[0] as f32 * inv,
+            self.0[1] as f32 * inv,
+            self.0[2] as f32 * inv,
+        ])
     }
 }
 
@@ -99,29 +103,13 @@ impl Dequant<f32x4> for Velocity {
         pack3(self.0)
     }
 
-    /// `Velocity` is `#[repr(transparent)]` over `[f32; 3]` (12 bytes); issue a
-    /// single 16-byte load whose 4th lane reads the *next* 4 bytes — for every
-    /// element except the last that's the successor element's first float, and
-    /// for the last it's the block's zeroed `flags`/`_pad` tail. Either way the
-    /// 4th lane is discarded by the trilinear, so the value is irrelevant. This
-    /// matches C++ `Vec4f::load` on the 12-byte `Vec3Float` and removes the
-    /// 3× `movss`+insert of `pack3`.
+    /// Read a 12-byte velocity with one 16-byte load. Discard the fourth lane.
     ///
     /// # Safety
     ///
-    /// Unconditional: every `src` passed here is the `data` field of a
-    /// `Block<Velocity, BSX, N>`, which is *immediately followed* by `flags:
-    /// u16` + `_pad: [u8; 62]` — 64 bytes of initialized tail. A 16-byte load at
-    /// `3*idx` reads bytes `[12*idx, 12*idx+16)`; for the last element
-    /// (`idx = len-1`) the upper bound is `12*(len-1)+16 = 12*len + 4`, which is
-    /// ≤ `12*len + 64` — in-bounds for every `idx < len`. No branch needed.
-    ///
-    /// The `debug_assert!(idx < len)` bounds the *index*; it does **not** verify
-    /// the tail exists. The tail is guaranteed by construction of the sole
-    /// caller, `gather_map`, which only receives `SparseGrid::block_data_ptr`
-    /// output (a `Block::data` pointer for real, full, and empty blocks alike).
-    /// A caller handing this an unpadded `[Velocity; N]` slice would be unsound
-    /// here — see `Dequant::dequant_at`'s contract.
+    /// `src` must point to `len` initialized velocity elements, and `idx < len`.
+    /// The final element requires four additional initialized bytes.
+    /// An unpadded slice does not satisfy this requirement.
     #[inline(always)]
     unsafe fn dequant_at(src: *const Velocity, idx: usize, len: usize) -> f32x4 {
         debug_assert!(idx < len);
@@ -284,12 +272,7 @@ fn cubic_value_grad(win: &[f32; 64], tx: f32, ty: f32, tz: f32) -> (f32, [f32; 3
     (val, [gx, gy, gz])
 }
 
-fn cubic_value_grad_hess(
-    win: &[f32; 64],
-    tx: f32,
-    ty: f32,
-    tz: f32,
-) -> (f32, [f32; 3], Hessian) {
+fn cubic_value_grad_hess(win: &[f32; 64], tx: f32, ty: f32, tz: f32) -> (f32, [f32; 3], Hessian) {
     let wx = f32x4::from_array(cubic_weights(tx));
     let wpx = f32x4::from_array(cubic_deriv_weights(tx));
     let wppx = f32x4::from_array(cubic_deriv2_weights(tx));
@@ -473,15 +456,12 @@ fn cubic_base(x: f32) -> (f32, i32) {
     (x - xf, floor_to_i32(xf) - 1)
 }
 
-/// Floored grid coordinate to `i32`, unchecked. The saturating `as i32` cast
-/// adds a NaN/overflow branch per axis (visible as `vucomiss`/`cmov` chains in
-/// the hot loop); grid coordinates are finite and far below `i32` range, so the
-/// unchecked conversion matches C++ `(int)floorf(x)`.
+/// Convert a floored coordinate to `i32` without saturation.
+/// The caller must supply a finite value within the `i32` range.
 #[inline(always)]
 fn floor_to_i32(f: f32) -> i32 {
-    // SAFETY: `f` is a floored, finite grid coordinate (bounded by the grid
-    // extent, ~2^21 per axis at paper scale); `float_to_int_unchecked` is UB
-    // only for NaN or out-of-range values, neither of which occurs here.
+    // Requires a finite, floored coordinate within the i32 range.
+    // Public sampling entry points still need to enforce this condition.
     unsafe { std::intrinsics::float_to_int_unchecked(f) }
 }
 
@@ -504,7 +484,13 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 trilinear_value(
-                    &gather_linear_f32::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
+                    &gather_linear_f32::<T, BSX, N>(
+                        self,
+                        floor_to_i32(ix),
+                        floor_to_i32(iy),
+                        floor_to_i32(iz),
+                        bc,
+                    ),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -539,7 +525,13 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 let (_, g) = trilinear_value_grad(
-                    &gather_linear_f32::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
+                    &gather_linear_f32::<T, BSX, N>(
+                        self,
+                        floor_to_i32(ix),
+                        floor_to_i32(iy),
+                        floor_to_i32(iz),
+                        bc,
+                    ),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -597,7 +589,13 @@ where
                 let iy = y.floor();
                 let iz = z.floor();
                 trilinear_value_vec3(
-                    &gather_linear_vec3::<T, BSX, N>(self, floor_to_i32(ix), floor_to_i32(iy), floor_to_i32(iz), bc),
+                    &gather_linear_vec3::<T, BSX, N>(
+                        self,
+                        floor_to_i32(ix),
+                        floor_to_i32(iy),
+                        floor_to_i32(iz),
+                        bc,
+                    ),
                     x - ix,
                     y - iy,
                     z - iz,
@@ -620,7 +618,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Stateful samplers (cache hook reserved for step 10)
+// Samplers with fixed alignment and boundary conditions.
 // ---------------------------------------------------------------------------
 
 /// A stateful scalar sampler binding a grid to a fixed alignment + BC.
@@ -729,14 +727,18 @@ mod tests {
     fn sample_at(g: &SparseGrid<f32, BSX, N>, ip: Interpolation, pos: Vec3) -> f32 {
         match ip {
             Interpolation::Linear => g.sample::<{ Interpolation::Linear }>(pos, CORNER, CLAMP),
-            Interpolation::CubicBSpline => g.sample::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP),
+            Interpolation::CubicBSpline => {
+                g.sample::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP)
+            }
         }
     }
 
     fn grad_at(g: &SparseGrid<f32, BSX, N>, ip: Interpolation, pos: Vec3) -> Vec3 {
         match ip {
             Interpolation::Linear => g.gradient::<{ Interpolation::Linear }>(pos, CORNER, CLAMP),
-            Interpolation::CubicBSpline => g.gradient::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP),
+            Interpolation::CubicBSpline => {
+                g.gradient::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP)
+            }
         }
     }
 
@@ -744,7 +746,9 @@ mod tests {
     #[test]
     fn test_sample_affine_exact() {
         let mut g = grid(48, 48, 48, 0.0f32, 1.0);
-        fill(&mut g, |x, y, z| 2.0 * x as f32 + 3.0 * y as f32 + 4.0 * z as f32 + 5.0);
+        fill(&mut g, |x, y, z| {
+            2.0 * x as f32 + 3.0 * y as f32 + 4.0 * z as f32 + 5.0
+        });
 
         for &(px, py, pz) in &[(10.3, 7.7, 3.2), (20.5, 21.25, 40.75), (5.1, 30.9, 10.4)] {
             let pos = v(px, py, pz);
@@ -752,13 +756,25 @@ mod tests {
             let expect_linear = 2.0 * px + 3.0 * py + 4.0 * pz + 5.0;
             let expect_cubic = 2.0 * (px - 0.5) + 3.0 * (py - 0.5) + 4.0 * (pz - 0.5) + 5.0;
 
-            assert!(close(g.sample::<{ Interpolation::Linear }>(pos, CORNER, CLAMP), expect_linear, 1e-3));
-            assert!(close(g.sample::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP), expect_cubic, 1e-3));
+            assert!(close(
+                g.sample::<{ Interpolation::Linear }>(pos, CORNER, CLAMP),
+                expect_linear,
+                1e-3
+            ));
+            assert!(close(
+                g.sample::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP),
+                expect_cubic,
+                1e-3
+            ));
 
             let gl = g.gradient::<{ Interpolation::Linear }>(pos, CORNER, CLAMP);
             let gc = g.gradient::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP);
-            assert!(close(gl.x(), 2.0, 1e-3) && close(gl.y(), 3.0, 1e-3) && close(gl.z(), 4.0, 1e-3));
-            assert!(close(gc.x(), 2.0, 1e-3) && close(gc.y(), 3.0, 1e-3) && close(gc.z(), 4.0, 1e-3));
+            assert!(
+                close(gl.x(), 2.0, 1e-3) && close(gl.y(), 3.0, 1e-3) && close(gl.z(), 4.0, 1e-3)
+            );
+            assert!(
+                close(gc.x(), 2.0, 1e-3) && close(gc.y(), 3.0, 1e-3) && close(gc.z(), 4.0, 1e-3)
+            );
         }
     }
 
@@ -769,9 +785,17 @@ mod tests {
         fill(&mut g, |x, _, _| x as f32);
 
         // x = 15.9 -> floor 15, u = 0.9, both stencil indices clamp to 15.
-        assert!(close(g.sample::<{ Interpolation::Linear }>(v(15.9, 4.0, 4.0), CORNER, CLAMP), 15.0, 1e-6));
+        assert!(close(
+            g.sample::<{ Interpolation::Linear }>(v(15.9, 4.0, 4.0), CORNER, CLAMP),
+            15.0,
+            1e-6
+        ));
         // x = -0.1 -> floor -1, both indices clamp to 0.
-        assert!(close(g.sample::<{ Interpolation::Linear }>(v(-0.1, 4.0, 4.0), CORNER, CLAMP), 0.0, 1e-6));
+        assert!(close(
+            g.sample::<{ Interpolation::Linear }>(v(-0.1, 4.0, 4.0), CORNER, CLAMP),
+            0.0,
+            1e-6
+        ));
     }
 
     // Dirichlet reads the empty sentinel out-of-domain (not the edge).
@@ -780,10 +804,18 @@ mod tests {
         let mut g = grid(16, 16, 16, 100.0f32, 1.0);
         fill(&mut g, |x, _, _| x as f32);
 
-        let inside = g.sample::<{ Interpolation::Linear }>(v(5.0, 4.0, 4.0), CORNER, BoundaryCondition::Dirichlet);
+        let inside = g.sample::<{ Interpolation::Linear }>(
+            v(5.0, 4.0, 4.0),
+            CORNER,
+            BoundaryCondition::Dirichlet,
+        );
         // x = -1.2 -> floor -2; both stencil indices are out-of-domain, so the
         // whole sample reads the empty sentinel.
-        let outside = g.sample::<{ Interpolation::Linear }>(v(-1.2, 4.0, 4.0), CORNER, BoundaryCondition::Dirichlet);
+        let outside = g.sample::<{ Interpolation::Linear }>(
+            v(-1.2, 4.0, 4.0),
+            CORNER,
+            BoundaryCondition::Dirichlet,
+        );
         assert!(close(inside, 5.0, 1e-6));
         assert!(close(outside, 100.0, 1e-6));
     }
@@ -795,7 +827,11 @@ mod tests {
         fill(&mut g, |x, _, _| x as f32);
 
         // x = -1.7 -> floor -2, u = 0.3, indices -2,-1 mirror to 1,0 -> 0.7.
-        let got = g.sample::<{ Interpolation::Linear }>(v(-1.7, 4.0, 4.0), CORNER, BoundaryCondition::Neumann);
+        let got = g.sample::<{ Interpolation::Linear }>(
+            v(-1.7, 4.0, 4.0),
+            CORNER,
+            BoundaryCondition::Neumann,
+        );
         assert!(close(got, 0.7, 1e-6), "got {got}");
     }
 
@@ -863,7 +899,9 @@ mod tests {
     #[test]
     fn test_density_dequant() {
         let mut g = grid(32, 16, 16, Density(0), Density(u16::MAX));
-        fill(&mut g, |x, _, _| Density(((x as f32 / 31.0) * u16::MAX as f32).round() as u16));
+        fill(&mut g, |x, _, _| {
+            Density(((x as f32 / 31.0) * u16::MAX as f32).round() as u16)
+        });
 
         let val = g.sample::<{ Interpolation::Linear }>(v(15.5, 4.0, 4.0), CORNER, CLAMP);
         assert!(close(val, 0.5, 1e-3), "got {val}");
@@ -882,9 +920,15 @@ mod tests {
         for &(px, py, pz) in &[(11.3, 12.7, 13.2), (20.5, 21.25, 30.75), (8.1, 25.9, 40.4)] {
             for ip in [Interpolation::Linear, Interpolation::CubicBSpline] {
                 let gr = grad_at(&g, ip, v(px, py, pz));
-                let fdx = (sample_at(&g, ip, v(px + h, py, pz)) - sample_at(&g, ip, v(px - h, py, pz))) / (2.0 * h);
-                let fdy = (sample_at(&g, ip, v(px, py + h, pz)) - sample_at(&g, ip, v(px, py - h, pz))) / (2.0 * h);
-                let fdz = (sample_at(&g, ip, v(px, py, pz + h)) - sample_at(&g, ip, v(px, py, pz - h))) / (2.0 * h);
+                let fdx = (sample_at(&g, ip, v(px + h, py, pz))
+                    - sample_at(&g, ip, v(px - h, py, pz)))
+                    / (2.0 * h);
+                let fdy = (sample_at(&g, ip, v(px, py + h, pz))
+                    - sample_at(&g, ip, v(px, py - h, pz)))
+                    / (2.0 * h);
+                let fdz = (sample_at(&g, ip, v(px, py, pz + h))
+                    - sample_at(&g, ip, v(px, py, pz - h)))
+                    / (2.0 * h);
                 assert!(close(gr.x(), fdx, 2e-3), "gx {ip:?}: {} vs {fdx}", gr.x());
                 assert!(close(gr.y(), fdy, 2e-3), "gy {ip:?}");
                 assert!(close(gr.z(), fdz, 2e-3), "gz {ip:?}");
@@ -911,36 +955,84 @@ mod tests {
             let gzp = grad_at(&g, Interpolation::CubicBSpline, v(px, py, pz + h));
             let gzm = grad_at(&g, Interpolation::CubicBSpline, v(px, py, pz - h));
 
-            assert!(close(hess.fxx, (gxp.x() - gxm.x()) / (2.0 * h), 2e-2), "fxx {}", hess.fxx);
-            assert!(close(hess.fyy, (gyp.y() - gym.y()) / (2.0 * h), 2e-2), "fyy {}", hess.fyy);
-            assert!(close(hess.fzz, (gzp.z() - gzm.z()) / (2.0 * h), 2e-2), "fzz {}", hess.fzz);
-            assert!(close(hess.fxy, (gyp.x() - gym.x()) / (2.0 * h), 2e-2), "fxy {}", hess.fxy);
-            assert!(close(hess.fxz, (gzp.x() - gzm.x()) / (2.0 * h), 2e-2), "fxz {}", hess.fxz);
-            assert!(close(hess.fyz, (gzp.y() - gzm.y()) / (2.0 * h), 2e-2), "fyz {}", hess.fyz);
+            assert!(
+                close(hess.fxx, (gxp.x() - gxm.x()) / (2.0 * h), 2e-2),
+                "fxx {}",
+                hess.fxx
+            );
+            assert!(
+                close(hess.fyy, (gyp.y() - gym.y()) / (2.0 * h), 2e-2),
+                "fyy {}",
+                hess.fyy
+            );
+            assert!(
+                close(hess.fzz, (gzp.z() - gzm.z()) / (2.0 * h), 2e-2),
+                "fzz {}",
+                hess.fzz
+            );
+            assert!(
+                close(hess.fxy, (gyp.x() - gym.x()) / (2.0 * h), 2e-2),
+                "fxy {}",
+                hess.fxy
+            );
+            assert!(
+                close(hess.fxz, (gzp.x() - gzm.x()) / (2.0 * h), 2e-2),
+                "fxz {}",
+                hess.fxz
+            );
+            assert!(
+                close(hess.fyz, (gzp.y() - gzm.y()) / (2.0 * h), 2e-2),
+                "fyz {}",
+                hess.fyz
+            );
         }
     }
 
     // affine velocity field.
     #[test]
     fn test_vec3_affine_exact() {
-        let mut g = grid(48, 48, 48, Velocity(Vec3::default()), Velocity(Vec3::default()));
-        fill(&mut g, |x, y, z| Velocity(Vec3::new(x as f32, 2.0 * y as f32, 3.0 * z as f32)));
+        let mut g = grid(
+            48,
+            48,
+            48,
+            Velocity(Vec3::default()),
+            Velocity(Vec3::default()),
+        );
+        fill(&mut g, |x, y, z| {
+            Velocity(Vec3::new(x as f32, 2.0 * y as f32, 3.0 * z as f32))
+        });
 
         let pos = v(10.5, 20.25, 30.75);
         let out = g.sample_vec3::<{ Interpolation::Linear }>(pos, CORNER, CLAMP);
-        assert!(close(out.x(), 10.5, 1e-3) && close(out.y(), 40.5, 1e-3) && close(out.z(), 92.25, 1e-3));
+        assert!(
+            close(out.x(), 10.5, 1e-3) && close(out.y(), 40.5, 1e-3) && close(out.z(), 92.25, 1e-3)
+        );
         // Cubic is cell-centered: reconstructs at (10.0, 39.75, 90.25).
         let outc = g.sample_vec3::<{ Interpolation::CubicBSpline }>(pos, CORNER, CLAMP);
-        assert!(close(outc.x(), 10.0, 1e-3) && close(outc.y(), 39.5, 1e-3) && close(outc.z(), 90.75, 1e-3));
+        assert!(
+            close(outc.x(), 10.0, 1e-3)
+                && close(outc.y(), 39.5, 1e-3)
+                && close(outc.z(), 90.75, 1e-3)
+        );
     }
 
     // clamp past the edge.
     #[test]
     fn test_vec3_clamp() {
-        let mut g = grid(16, 16, 16, Velocity(Vec3::default()), Velocity(Vec3::default()));
-        fill(&mut g, |x, y, z| Velocity(Vec3::new(x as f32, y as f32, z as f32)));
+        let mut g = grid(
+            16,
+            16,
+            16,
+            Velocity(Vec3::default()),
+            Velocity(Vec3::default()),
+        );
+        fill(&mut g, |x, y, z| {
+            Velocity(Vec3::new(x as f32, y as f32, z as f32))
+        });
 
         let out = g.sample_vec3::<{ Interpolation::Linear }>(v(15.9, 15.9, 15.9), CORNER, CLAMP);
-        assert!(close(out.x(), 15.0, 1e-6) && close(out.y(), 15.0, 1e-6) && close(out.z(), 15.0, 1e-6));
+        assert!(
+            close(out.x(), 15.0, 1e-6) && close(out.y(), 15.0, 1e-6) && close(out.z(), 15.0, 1e-6)
+        );
     }
 }
