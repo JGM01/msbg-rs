@@ -38,7 +38,7 @@ fn field(x: f32, y: f32, z: f32) -> Vec3 {
     )
 }
 
-/// Deterministic interior positions (LCG), identical to `../MSBG/velocitytest.cpp`.
+/// Deterministic interior positions (LCG), identical to the C++ `velocitytest.cpp`.
 fn positions(n: usize, res: usize) -> Vec<Vec3> {
     let mut seed: u32 = 12_345;
     let mut rng = move || {

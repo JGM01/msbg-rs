@@ -21,7 +21,8 @@ MSBG_BENCH_SCALE=small cargo bench --bench multires_bench
 MSBG_BENCH_SCALE=small cargo bench --bench surface_bench
 ```
 
-The surface benchmark needs the bunny data. See [development.md](development.md).
+The surface and rendering benchmarks use the included PLY files in `data/`.
+Set `MSBG_DATA_DIR` to use another fixture directory.
 In PowerShell, set `$env:MSBG_BENCH_SCALE = 'small'` before running Cargo.
 
 | Target | Operation | Configuration |
@@ -43,11 +44,10 @@ Machine presets select workload sizes.
 Set `MSBG_BENCH_MACHINE` to override the default.
 Only the allocator benchmark also accepts `--scale` and `--machine` arguments.
 
-Run the rendering benchmark from its crate directory to resolve the default data path:
+Run the rendering benchmark from the repository root:
 
 ```sh
-cd msbg-render
-MSBG_BENCH_SCALE=small cargo bench --bench render_bench
+MSBG_BENCH_SCALE=small cargo bench -p msbg-render --bench render_bench
 ```
 
 ## Recorded results
@@ -114,7 +114,8 @@ Rust empty-space skipping on/off gave an 18.5× raymarching ratio for that workl
 
 ## Reference harnesses
 
-The current local C++ checkout has allocator, halo, density, interpolation, and smoothing benchmarks.
+[The C++ development fork](https://github.com/JGM01/MSBG) has allocator, halo, density, interpolation, and smoothing benchmarks.
+Clone it separately to run reference benchmarks.
 It lacks later surface, multiresolution, rendering, and velocity harness additions.
 Its smoothing benchmark also uses a different schedule from the later eight-color comparison.
 Recover matching harnesses before reproducing those ratios.

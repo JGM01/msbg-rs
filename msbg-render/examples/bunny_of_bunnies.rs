@@ -7,7 +7,7 @@
 //!
 //! Large EC2 configuration (requires hundreds of gigabytes):
 //!   cargo run -p msbg-render --release --example bunny_of_bunnies -- \
-//!       ../MSBG/data/bun_zipper.ply 32768 32768 32768 35947 0.005 \
+//!       data/bun_zipper.ply 32768 32768 32768 35947 0.005 \
 //!       out_msbg_aws 3840 2160 32
 
 use std::sync::Arc;

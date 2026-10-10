@@ -1,7 +1,7 @@
 # Working on msbg-rs
 
 This is a Rust implementation of the SIGGRAPH 2025 MSBG grid method.
-The companion C++ reference is `../MSBG`. It is optional for Rust builds.
+The C++ reference is optional. Rust builds and tests use the included fixtures.
 Read `README.md` and the relevant source before editing.
 
 ## Build and test
@@ -17,8 +17,9 @@ cargo test -p msbg-render --test render_tests --locked
 cargo test --workspace --doc --locked
 ```
 
-The full suite also needs `../MSBG/data/bun_zipper_res2.ply`.
-Use `MSBG_DATA_DIR` for another data directory.
+The full suite uses the PLY fixtures in `data/`.
+Tests and benchmarks resolve fixture paths from the crate location.
+Use `MSBG_DATA_DIR` to override the fixture directory.
 Live C++ tests return early when their binary variables are absent.
 Do not count those returns as executed C++ comparisons.
 See `docs/development.md` for details.

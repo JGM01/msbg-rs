@@ -24,7 +24,7 @@ pkgs.mkShell {
     cargo-flamegraph   # perf-based flame graphs
     cargo-geiger       # unsafe-code audit
   ]; # NOTE: do NOT add `glibc` here. It breaks the C++ include order when
-     # building the ../MSBG difftest baseline (see ../MSBG/AGENTS.md).
+     # building optional C++ comparison harnesses (see docs/development.md).
 
   shellHook = ''
     # rustup shims (rustc/cargo) live in ~/.cargo/bin, not in the nix store.

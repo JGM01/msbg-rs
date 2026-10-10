@@ -1,5 +1,5 @@
 //! Differential test against the C++ interpolation baseline
-//! (`../MSBG/interptest.cpp`): golden values are compared within 1e-4
+//! (the C++ `interptest.cpp`): golden values are compared within 1e-4
 //! tolerance (the Rust port uses f32 + FMA, so it is not bit-exact).
 
 use msbg_rs::blockpool::BlockPool;

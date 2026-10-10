@@ -67,7 +67,7 @@ fn run_solver(grid: &SparseGrid<f32, BSX, N>, stencil: Stencil) -> Vec<f32> {
 }
 
 /// Golden sample values (indices into the 262144-voxel level-0 field), produced
-/// by `../MSBG/build/smoothertest`.
+/// by the C++ `smoothertest`.
 const SAMPLE_IDX: [usize; 12] = [
     0, 1, 15, 16, 255, 256, 272, 4095, 100_000, 200_000, 262_143, 131_072,
 ];

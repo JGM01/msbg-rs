@@ -34,32 +34,25 @@ Install [Rust through rustup](https://rustup.rs/). The repository selects
 Development and benchmarks have used Linux x86-64, macOS ARM64, and Windows x86-64.
 
 ```sh
-cargo run --release --example sparse_field
-cargo test --workspace --lib
-cargo test -p msbg-render --test render_tests
-cargo test --workspace --doc
-```
-
-These commands need no external data. The example constructs and samples a sparse field.
-
-The full test suite also needs the reference bunny data:
-
-```sh
-git clone https://github.com/tum-pbs/MSBG.git ../MSBG
 cargo test --workspace --locked
+cargo run --release --example sparse_field
 ```
 
-Set `MSBG_DATA_DIR` if the data is in another directory.
-Live C++ comparisons also need compiled reference binaries.
-See [development.md](docs/development.md) for details.
+The clone includes the PLY fixtures in `data/` and the recorded C++ golden values.
+The test suite needs no C++ checkout or reference binary.
+The example constructs and samples a sparse field.
+
+Live comparisons are optional. To compare with a running C++ implementation,
+clone and build the reference separately, then set the test binary variables.
+See [development.md](docs/development.md) for instructions.
 
 ## Render the bunny
 
-After obtaining the data:
+Run from the repository root:
 
 ```sh
 cargo run -p msbg-render --release --example render_bunny -- \
-  ../MSBG/data/bun_zipper_res2.ply 256 256 256 1 0.25 target/render-bunny
+  data/bun_zipper_res2.ply 256 256 256 1 0.25 target/render-bunny
 ```
 
 This writes `raymarch.png` and orthogonal slices to `target/render-bunny`.
@@ -102,4 +95,5 @@ Storage and parallel kernels use `unsafe`; API safety needs further review.
 
 The grid method, eight-color scheme, and reconstruction reference come from the MSBG authors.
 This repository contains the Rust implementation and its storage and scheduling changes.
-Bunny data comes from the Stanford dataset included in MSBG.
+Bunny data comes from the Stanford University Computer Graphics Laboratory.
+See [data/README.md](data/README.md) for provenance and data-use terms.

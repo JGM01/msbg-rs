@@ -97,7 +97,7 @@ fn config() -> SurfaceConfig {
     }
 }
 
-fn ply_path() -> String {
+fn ply_path() -> std::path::PathBuf {
     let name = env::var("MSBG_SURFACE_PLY").unwrap_or_else(|_| {
         if machine() == Machine::Aws && scale() != "small" {
             "bun_zipper.ply".to_string()
@@ -105,7 +105,10 @@ fn ply_path() -> String {
             "bun_zipper_res2.ply".to_string()
         }
     });
-    env::var("MSBG_DATA_DIR").unwrap_or_else(|_| "../MSBG/data".to_string()) + "/" + &name
+    std::env::var_os("MSBG_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data"))
+        .join(name)
 }
 
 fn thread_pool() -> &'static msbg_rs::thread_pool::Pool {

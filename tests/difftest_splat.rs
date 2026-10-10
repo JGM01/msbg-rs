@@ -49,7 +49,7 @@ const COORDS: [(usize, usize, usize); 15] = [
     (255, 255, 255),
 ];
 
-/// Field values at `COORDS`, produced by `../MSBG/build/splattest`.
+/// Field values at `COORDS`, produced by the C++ `splattest`.
 const GOLDEN_A: [u16; 15] = [
     35775, 37972, 39126, 37459, 37071, 35845, 33105, 33327, 34642, 34692, 33286, 32815, 0, 0, 0,
 ];
@@ -60,9 +60,11 @@ const GOLDEN_B: [u16; 15] = [
 const N_ACTIVE_GOLDEN: usize = 91;
 const N_PARTICLES_GOLDEN: usize = 8171;
 
-fn ply_path() -> String {
-    std::env::var("MSBG_DATA_DIR").unwrap_or_else(|_| "../MSBG/data".to_string())
-        + "/bun_zipper_res2.ply"
+fn ply_path() -> std::path::PathBuf {
+    std::env::var_os("MSBG_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data"))
+        .join("bun_zipper_res2.ply")
 }
 
 fn load_ply() -> Vec<u8> {
@@ -160,18 +162,8 @@ fn splat_against_cpp_binary_if_available() {
         return;
     };
     let out = std::process::Command::new(&bin)
-        .args([
-            ply_path().as_str(),
-            "256",
-            "256",
-            "256",
-            "1",
-            "0.25",
-            "2.0",
-            "2.0",
-            "6",
-            "0.05",
-        ])
+        .arg(ply_path())
+        .args(["256", "256", "256", "1", "0.25", "2.0", "2.0", "6", "0.05"])
         .output()
         .expect("failed to run C++ splattest");
     assert!(

@@ -86,7 +86,7 @@ fn run_kernel(grid: &SparseGrid<f32, BSX, N>, lapl_typ: u8) -> Block<f32, BSX, N
 
 const SAMPLE_IDX: [usize; 10] = [0, 1, 2, 3, 15, 16, 255, 256, 272, 4095];
 
-// Golden sample values produced by ../MSBG/build/meancurvtest.
+// Golden sample values produced by the C++ meancurvtest.
 const GOLDEN: [[f32; 10]; 3] = [
     // laplTyp 1
     [
